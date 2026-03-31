@@ -205,8 +205,17 @@ output/<project>/data/
 
 | 文件 | 字段 |
 |------|------|
-| `*_competitive_data.csv` | date, site, category, brand, model, asin, title, price, rating, review_count, bought_past_month, bsr, available, url |
+| `*_competitive_data.csv` | date, site, category, brand, model, asin, title, price, rating, review_count, bought_past_month, bsr, available, url, **stock_status, stock_count, sold_by, other_offers** |
 | `*_price_history.csv` | date, site, category, brand, model, asin, buybox_current/lowest/highest/avg90, amz_current/lowest/highest/avg90, new_current/lowest/highest/avg90, sales_rank |
+
+**库存字段说明：**
+
+| 字段 | 示例 | 说明 |
+|------|------|------|
+| `stock_status` | "In stock" / "Only 2 left in stock." | 库存状态原始文本 |
+| `stock_count` | "2" / "" | "Only X left" 的具体数字，充足时为空 |
+| `sold_by` | "GL.iNet Technologie" / "Amazon Resale" | Buy Box 卖家名称 |
+| `other_offers` | "New & Used (26) from £81.78" | 其他卖家报价摘要 |
 
 ## 添加新产品
 
