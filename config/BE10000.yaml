@@ -173,6 +173,8 @@ products:
       note: AU ASIN is a USB adapter, needs manual verification
     US:
       asin: B0DVBP5L6Y
+    UK:
+      asin: B0DSJRDLGP
 - category: Home Router
   brand: GL.iNet
   model: Flint3e (GL-BE6500)

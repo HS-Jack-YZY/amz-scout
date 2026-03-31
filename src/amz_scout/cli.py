@@ -17,7 +17,12 @@ from amz_scout.config import (
     load_project_config,
     validate_config,
 )
-from amz_scout.csv_io import write_competitive_data, write_price_history
+from amz_scout.csv_io import (
+    read_competitive_data,
+    read_price_history,
+    write_competitive_data,
+    write_price_history,
+)
 from amz_scout.marketplace import setup_marketplace
 from amz_scout.models import CompetitiveData, PriceHistory, Product
 from amz_scout.scraper.amazon import scrape_product_page
@@ -56,6 +61,7 @@ def scrape(
     product: str | None = typer.Option(None, "-p", "--product", help="Single product model"),
     data_only: bool = typer.Option(False, help="Skip Keepa price history"),
     history_only: bool = typer.Option(False, help="Only fetch Keepa price history"),
+    detailed: bool = typer.Option(False, help="Keepa detailed mode: include seller data (~5 tokens/product vs 1)"),
     headed: bool = typer.Option(False, help="Show browser window"),
     verbose: bool = typer.Option(False, "-v", "--verbose"),
 ) -> None:
@@ -85,10 +91,11 @@ def scrape(
     output_base = Path(proj.project.output_dir)
     output_base.mkdir(parents=True, exist_ok=True)
 
-    # ── Price history (Keepa → CamelCamelCamel fallback) ──
+    # ── Price history (Keepa) ──
     if not data_only:
         _scrape_price_history(
             proj, products, target_sites, marketplaces, output_base, headed_mode,
+            detailed=detailed,
         )
 
     # ── Amazon product pages (browser needed) ──
@@ -112,9 +119,11 @@ def _scrape_price_history(
     marketplaces: dict[str, MarketplaceConfig],
     output_base: Path,
     headed: bool = False,
+    detailed: bool = False,
 ) -> None:
-    """Fetch price history: Keepa first, CamelCamelCamel as fallback."""
-    console.print("\n[bold]── Price History ──[/]")
+    """Fetch Keepa price history."""
+    mode_label = "detailed ~5 tok/product" if detailed else "basic 1 tok/product"
+    console.print(f"\n[bold]── Price History ({mode_label}) ──[/]")
 
     # Try Keepa first
     keepa: KeepaClient | None = None
@@ -142,13 +151,20 @@ def _scrape_price_history(
         histories = keepa.fetch_price_history(
             products, site, mp_config.keepa_domain,
             keepa_domain_code=mp_config.keepa_domain_code,
+            detailed=detailed,
         )
 
         if histories:
             has_data = sum(1 for h in histories if h.buybox_current is not None)
             console.print(f"  [cyan]{site}[/]: {has_data}/{len(histories)} with price")
             data_dir = output_base / "data" / mp_config.region
-            write_price_history(histories, data_dir / f"{site.lower()}_price_history.csv")
+            csv_path = data_dir / f"{site.lower()}_price_history.csv"
+            # Merge with existing
+            existing = read_price_history(csv_path)
+            existing_keys = {(r.date, r.site, r.model) for r in histories}
+            merged = [r for r in existing if (r.date, r.site, r.model) not in existing_keys]
+            merged.extend(histories)
+            write_price_history(merged, csv_path)
 
     if keepa:
         console.print(f"  Keepa tokens remaining: {keepa.tokens_left}")
@@ -251,9 +267,16 @@ def _save_competitive(
     mp_config: MarketplaceConfig,
     site: str,
 ) -> None:
-    """Save competitive data CSV (used for both normal and crash-recovery writes)."""
+    """Save competitive data CSV, merging with existing data if present."""
     data_dir = output_base / "data" / mp_config.region
-    write_competitive_data(results, data_dir / f"{site.lower()}_competitive_data.csv")
+    csv_path = data_dir / f"{site.lower()}_competitive_data.csv"
+
+    # Merge: new results replace existing rows with same (date, site, model)
+    existing = read_competitive_data(csv_path)
+    existing_keys = {(r.date, r.site, r.model) for r in results}
+    merged = [r for r in existing if (r.date, r.site, r.model) not in existing_keys]
+    merged.extend(results)
+    write_competitive_data(merged, csv_path)
 
 
 @app.command()

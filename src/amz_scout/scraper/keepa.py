@@ -1,9 +1,10 @@
 """Keepa API integration for price history data.
 
-Uses direct HTTP requests instead of the keepa Python library because:
-1. The library doesn't support AU (domain=10)
-2. The library tries to pass parameters not available on all API plans
-3. Direct requests give us full control over the API call
+Strategy:
+- Default mode (1 token/product): basic query → csv[] + monthlySoldHistory + buyBoxSellerIdHistory
+  All stats (min/max/avg/current) computed locally from the raw csv arrays.
+- Detailed mode (--detailed, ~5 tokens/product): adds offers + stats + buybox parameters
+  for seller count, FBA breakdown, and pre-computed stats.
 """
 
 import logging
@@ -19,9 +20,6 @@ from amz_scout.utils import cents_to_price, today_iso
 logger = logging.getLogger(__name__)
 
 API_BASE = "https://api.keepa.com"
-
-# Keepa epoch: minutes offset from Unix epoch
-_KEEPA_EPOCH_OFFSET = 21564000
 
 
 def _load_dotenv() -> None:
@@ -49,7 +47,7 @@ class KeepaClient:
                 "or set the KEEPA_API_KEY environment variable."
             )
         self._tokens_left = -1
-        self._refill_rate = 1  # tokens per minute
+        self._refill_rate = 1
         logger.info("Keepa API initialized (direct HTTP mode)")
 
     @property
@@ -65,7 +63,6 @@ class KeepaClient:
         self._refill_rate = data.get("refillRate", 1)
 
     def _wait_for_tokens(self, needed: int) -> None:
-        """Wait if we don't have enough tokens."""
         if self._tokens_left >= needed:
             return
         wait_mins = (needed - self._tokens_left) / max(self._refill_rate, 1)
@@ -81,10 +78,13 @@ class KeepaClient:
         site: str,
         keepa_domain: str,
         keepa_domain_code: int | None = None,
+        detailed: bool = False,
     ) -> list[PriceHistory]:
-        """Fetch price history for products via Keepa API.
+        """Fetch price history for products.
 
-        Products are queried individually (1 token each) to maximize reliability.
+        Args:
+            detailed: If True, request offers+stats+buybox (~5 tokens/product).
+                      If False, basic query only (1 token/product).
         """
         domain_code = keepa_domain_code
         if domain_code is None:
@@ -98,15 +98,17 @@ class KeepaClient:
         if not valid_pairs:
             return []
 
-        logger.info("[%s] Fetching Keepa data for %d products (domain=%d)",
-                     site, len(valid_pairs), domain_code)
+        mode = "detailed (~5 tok/product)" if detailed else "basic (1 tok/product)"
+        logger.info("[%s] Fetching Keepa data for %d products [%s]",
+                     site, len(valid_pairs), mode)
 
         self._check_tokens()
-        self._wait_for_tokens(len(valid_pairs))
+        tokens_per = 5 if detailed else 1
+        self._wait_for_tokens(len(valid_pairs) * tokens_per)
 
         results = []
         for asin, product in valid_pairs:
-            history = self._fetch_one(asin, product, site, domain_code)
+            history = self._fetch_one(asin, product, site, domain_code, detailed)
             results.append(history)
             time.sleep(0.5)
 
@@ -114,28 +116,26 @@ class KeepaClient:
         return results
 
     def _fetch_one(
-        self, asin: str, product: Product, site: str, domain_code: int, max_retries: int = 2
+        self,
+        asin: str,
+        product: Product,
+        site: str,
+        domain_code: int,
+        detailed: bool = False,
+        max_retries: int = 2,
     ) -> PriceHistory:
-        """Fetch one product with retry on 429 and JSON parse protection."""
+        """Fetch one product with retry on 429."""
+        params: dict = {"key": self._key, "domain": domain_code, "asin": asin}
+        if detailed:
+            params.update({"stats": 90, "offers": 20, "buybox": 1})
+
         for attempt in range(max_retries + 1):
             try:
-                resp = requests.get(
-                    f"{API_BASE}/product",
-                    params={
-                        "key": self._key,
-                        "domain": domain_code,
-                        "asin": asin,
-                        "stats": 90,
-                        "offers": 20,
-                        "buybox": 1,
-                    },
-                    timeout=30,
-                )
+                resp = requests.get(f"{API_BASE}/product", params=params, timeout=30)
 
-                # Handle 429 — wait for refill and retry
                 if resp.status_code == 429:
                     if attempt < max_retries:
-                        refill_in = 65  # Default wait
+                        refill_in = 65
                         try:
                             refill_in = resp.json().get("refillIn", 65000) // 1000 + 5
                         except (ValueError, KeyError):
@@ -144,15 +144,12 @@ class KeepaClient:
                                      site, asin, refill_in, attempt + 1, max_retries)
                         time.sleep(refill_in)
                         continue
-                    logger.warning("[%s] 429 for %s after %d retries", site, asin, max_retries)
                     return _empty_history(product, site)
 
-                # Parse JSON safely
                 try:
                     data = resp.json()
                 except (ValueError, requests.exceptions.JSONDecodeError):
-                    logger.warning("[%s] Non-JSON response for %s (status=%d)",
-                                    site, asin, resp.status_code)
+                    logger.warning("[%s] Non-JSON response for %s", site, asin)
                     return _empty_history(product, site)
 
                 self._tokens_left = data.get("tokensLeft", self._tokens_left)
@@ -166,9 +163,10 @@ class KeepaClient:
                 if not raw_products:
                     return _empty_history(product, site)
 
-                history = _parse_product(product, site, raw_products[0])
-                logger.debug("[%s] %s: buybox=%s, amz=%s",
-                              site, product.model, history.buybox_current, history.amz_current)
+                history = _parse_product(product, site, raw_products[0], detailed)
+                logger.debug("[%s] %s: bb=%s amz=%s new=%s sold=%s",
+                              site, product.model, history.buybox_current,
+                              history.amz_current, history.new_current, history.monthly_sold)
                 return history
 
             except requests.exceptions.RequestException as e:
@@ -181,66 +179,60 @@ class KeepaClient:
         return _empty_history(product, site)
 
 
-def _parse_product(product: Product, site: str, raw: dict) -> PriceHistory:
-    """Parse Keepa product response using pre-computed stats (Pro plan).
+# ─── Parsing ────────────────────────────────────────────────────────────
 
-    Uses stats=90 for min/max/avg, offers for seller count,
-    buybox for Buy Box info, and monthlySoldHistory for sales volume.
+
+def _parse_product(product: Product, site: str, raw: dict, detailed: bool) -> PriceHistory:
+    """Parse Keepa product response into PriceHistory.
+
+    In basic mode: compute stats from csv[] arrays.
+    In detailed mode: use pre-computed stats from API + offers data.
     """
-    stats = raw.get("stats", {})
     csv_data = raw.get("csv", [])
 
-    # ─── Price stats (pre-computed by Keepa, much more reliable than manual calc) ───
-    cur = stats.get("current", [])
-    avg90 = stats.get("avg90", [])
-    mn = stats.get("min", [])
-    mx = stats.get("max", [])
+    # ─── Price data ───
+    if detailed and raw.get("stats"):
+        amazon, new_3p = _prices_from_stats(raw["stats"])
+    else:
+        amazon, new_3p = _prices_from_csv(csv_data)
 
-    def s_cur(idx: int) -> float | None:
-        return cents_to_price(cur[idx]) if len(cur) > idx else None
+    # Buy Box = Amazon if available, else New 3P
+    bb = {
+        "current": amazon["current"] or new_3p["current"],
+        "lowest": amazon["lowest"] or new_3p["lowest"],
+        "highest": amazon["highest"] or new_3p["highest"],
+        "avg90": amazon["avg90"] or new_3p["avg90"],
+    }
 
-    def s_avg(idx: int) -> float | None:
-        return cents_to_price(avg90[idx]) if len(avg90) > idx else None
+    # ─── Sales rank from csv[3] ───
+    sales_rank = _latest_value(csv_data, 3, as_int=True)
 
-    def s_min(idx: int) -> float | None:
-        if len(mn) > idx and mn[idx]:
-            v = mn[idx]
-            return cents_to_price(v[1]) if isinstance(v, (list, tuple)) and len(v) >= 2 else cents_to_price(v)
-        return None
-
-    def s_max(idx: int) -> float | None:
-        if len(mx) > idx and mx[idx]:
-            v = mx[idx]
-            return cents_to_price(v[1]) if isinstance(v, (list, tuple)) and len(v) >= 2 else cents_to_price(v)
-        return None
-
-    # Index: 0=Amazon, 1=New3P, 3=SalesRank (not a price)
-    # Buy Box: derive from Amazon or New 3P
-    amz_cur, new_cur = s_cur(0), s_cur(1)
-    bb_cur = amz_cur or new_cur
-
-    # ─── Sales rank from csv[3] (more current than stats) ───
-    sales_rank = None
-    if len(csv_data) > 3 and csv_data[3]:
-        rank_arr = csv_data[3]
-        if len(rank_arr) >= 2 and rank_arr[-1] != -1:
-            sales_rank = int(rank_arr[-1])
-
-    # ─── Monthly sold (Keepa exclusive — precise unit count) ───
+    # ─── Monthly sold (always available in basic query) ───
     monthly_sold = None
     msh = raw.get("monthlySoldHistory", [])
     if msh and len(msh) >= 2 and msh[-1] != -1:
         monthly_sold = int(msh[-1])
 
-    # ─── Buy Box info (from stats + buybox=1) ───
-    bb_is_amazon = str(stats.get("buyBoxIsAmazon", ""))
-    bb_is_fba = str(stats.get("buyBoxIsFBA", ""))
-    bb_seller = stats.get("buyBoxSellerId", "")
+    # ─── Buy Box info ───
+    stats = raw.get("stats", {})
+    bb_is_amazon = str(stats.get("buyBoxIsAmazon", "")) if stats else ""
+    bb_is_fba = str(stats.get("buyBoxIsFBA", "")) if stats else ""
+    bb_seller = stats.get("buyBoxSellerId", "") if stats else ""
 
-    # ─── Seller count (from offers) ───
-    offers = raw.get("offers", [])
-    seller_count = len(offers) if offers else None
-    fba_count = sum(1 for o in offers if o.get("isFBA")) if offers else None
+    # Fallback: extract from buyBoxSellerIdHistory if stats not available
+    if not bb_seller:
+        bbh = raw.get("buyBoxSellerIdHistory", [])
+        if bbh and len(bbh) >= 2:
+            bb_seller = bbh[-1] if isinstance(bbh[-1], str) else ""
+
+    # ─── Seller count (detailed mode only, from offers) ───
+    seller_count = None
+    fba_count = None
+    if detailed:
+        offers = raw.get("offers", [])
+        if offers:
+            seller_count = len(offers)
+            fba_count = sum(1 for o in offers if o.get("isFBA"))
 
     return PriceHistory(
         date=today_iso(),
@@ -249,18 +241,18 @@ def _parse_product(product: Product, site: str, raw: dict) -> PriceHistory:
         brand=product.brand,
         model=product.model,
         asin=product.asin_for(site),
-        buybox_current=bb_cur,
-        buybox_lowest=s_min(0) if s_min(0) else s_min(1),
-        buybox_highest=s_max(0) if s_max(0) else s_max(1),
-        buybox_avg90=s_avg(0) if s_avg(0) else s_avg(1),
-        amz_current=amz_cur,
-        amz_lowest=s_min(0),
-        amz_highest=s_max(0),
-        amz_avg90=s_avg(0),
-        new_current=new_cur,
-        new_lowest=s_min(1),
-        new_highest=s_max(1),
-        new_avg90=s_avg(1),
+        buybox_current=bb["current"],
+        buybox_lowest=bb["lowest"],
+        buybox_highest=bb["highest"],
+        buybox_avg90=bb["avg90"],
+        amz_current=amazon["current"],
+        amz_lowest=amazon["lowest"],
+        amz_highest=amazon["highest"],
+        amz_avg90=amazon["avg90"],
+        new_current=new_3p["current"],
+        new_lowest=new_3p["lowest"],
+        new_highest=new_3p["highest"],
+        new_avg90=new_3p["avg90"],
         sales_rank=sales_rank,
         monthly_sold=monthly_sold,
         buybox_is_amazon=bb_is_amazon,
@@ -269,6 +261,74 @@ def _parse_product(product: Product, site: str, raw: dict) -> PriceHistory:
         seller_count=seller_count,
         fba_seller_count=fba_count,
     )
+
+
+def _prices_from_csv(csv_data: list) -> tuple[dict, dict]:
+    """Compute current/lowest/highest/avg90 from raw csv arrays (basic mode)."""
+    return _summarize_csv(csv_data, 0), _summarize_csv(csv_data, 1)
+
+
+def _prices_from_stats(stats: dict) -> tuple[dict, dict]:
+    """Extract prices from pre-computed stats (detailed mode)."""
+    cur = stats.get("current", [])
+    avg90 = stats.get("avg90", [])
+    mn = stats.get("min", [])
+    mx = stats.get("max", [])
+
+    def extract(idx: int) -> dict[str, float | None]:
+        return {
+            "current": cents_to_price(cur[idx]) if len(cur) > idx else None,
+            "lowest": _stat_price(mn, idx),
+            "highest": _stat_price(mx, idx),
+            "avg90": cents_to_price(avg90[idx]) if len(avg90) > idx else None,
+        }
+
+    return extract(0), extract(1)
+
+
+def _summarize_csv(csv_data: list, type_index: int) -> dict[str, float | None]:
+    """Compute stats from a single csv price type array."""
+    empty = {"current": None, "lowest": None, "highest": None, "avg90": None}
+    if type_index >= len(csv_data) or not csv_data[type_index]:
+        return empty
+
+    arr = csv_data[type_index]
+    prices = [arr[i + 1] for i in range(0, len(arr) - 1, 2) if arr[i + 1] != -1]
+    if not prices:
+        return empty
+
+    # Filter outliers: keep within 0.2x–5x of median
+    sorted_p = sorted(prices)
+    median = sorted_p[len(sorted_p) // 2]
+    filtered = [p for p in prices if median * 0.2 <= p <= median * 5] or prices
+
+    current_cents = arr[-1] if arr[-1] != -1 else None
+    return {
+        "current": cents_to_price(current_cents),
+        "lowest": cents_to_price(min(filtered)),
+        "highest": cents_to_price(max(filtered)),
+        "avg90": cents_to_price(int(sum(filtered) / len(filtered))),
+    }
+
+
+def _stat_price(stat_array: list, idx: int) -> float | None:
+    """Extract price from stats min/max arrays (can be [ts, price] or just price)."""
+    if len(stat_array) > idx and stat_array[idx]:
+        v = stat_array[idx]
+        if isinstance(v, (list, tuple)) and len(v) >= 2:
+            return cents_to_price(v[1])
+        return cents_to_price(v)
+    return None
+
+
+def _latest_value(csv_data: list, type_index: int, as_int: bool = False):
+    """Get the latest value from a csv array."""
+    if type_index >= len(csv_data) or not csv_data[type_index]:
+        return None
+    arr = csv_data[type_index]
+    if len(arr) >= 2 and arr[-1] != -1:
+        return int(arr[-1]) if as_int else arr[-1]
+    return None
 
 
 def _empty_history(product: Product, site: str) -> PriceHistory:
