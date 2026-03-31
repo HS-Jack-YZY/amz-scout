@@ -23,7 +23,7 @@ class TestMarketplaceConfig:
 
     def test_all_sites(self):
         mp = load_marketplace_config(CONFIG_DIR / "marketplaces.yaml")
-        assert set(mp.keys()) == {"UK", "DE", "FR", "IT", "ES", "NL", "CA", "AU"}
+        assert set(mp.keys()) == {"UK", "DE", "FR", "IT", "ES", "NL", "US", "CA", "MX", "JP", "AU"}
 
 
 class TestProjectConfig:
@@ -55,6 +55,6 @@ class TestValidation:
     def test_invalid_marketplace(self):
         proj = load_project_config(CONFIG_DIR / "BE10000.yaml")
         mp = load_marketplace_config(CONFIG_DIR / "marketplaces.yaml")
-        proj = proj.model_copy(update={"target_marketplaces": ["UK", "JP"]})
+        proj = proj.model_copy(update={"target_marketplaces": ["UK", "KR"]})
         errors = validate_config(proj, mp)
-        assert any("JP" in e for e in errors)
+        assert any("KR" in e for e in errors)

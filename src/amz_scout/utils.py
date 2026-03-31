@@ -19,7 +19,7 @@ def parse_price(s: str) -> float | None:
     """Extract numeric price from strings like '£104.50', '€94,99', '$129.99', '83,99€'."""
     if not s or s == "N/A" or s.strip() == "-" or "unavailable" in s.lower():
         return None
-    cleaned = re.sub(r"(?:CAD|AUD|USD|EUR|CA\$|C\$|A\$|US\$|[£€$\s])", "", s.strip())
+    cleaned = re.sub(r"(?:CAD|AUD|USD|EUR|MXN|JPY|CA\$|C\$|A\$|US\$|MX\$|[£€$¥\s])", "", s.strip())
     if not cleaned or cleaned == "-":
         return None
     if "," in cleaned and "." in cleaned:

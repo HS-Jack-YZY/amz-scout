@@ -151,7 +151,10 @@ amz-scout status config/BE10000.yaml
 | IT | amazon.it | EUR (€) | eu |
 | ES | amazon.es | EUR (€) | eu |
 | NL | amazon.nl | EUR (€) | eu |
+| US | amazon.com | USD (\$) | na |
 | CA | amazon.ca | CAD (\$) | na |
+| MX | amazon.com.mx | MXN (\$) | na |
+| JP | amazon.co.jp | JPY (¥) | apac |
 | AU | amazon.com.au | AUD (\$) | apac |
 
 ### `config/<project>.yaml`

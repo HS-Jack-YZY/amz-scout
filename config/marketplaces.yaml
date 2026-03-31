@@ -61,6 +61,16 @@ marketplaces:
     delivery_postcode: "1012"
 
   # ─── North America ────────────────────────
+  US:
+    amazon_domain: "amazon.com"
+    keepa_domain: "US"
+    keepa_domain_code: 1
+    currency_code: "USD"
+    currency_symbol: "$"
+    price_format: "standard"
+    region: "na"
+    delivery_postcode: "10001"
+
   CA:
     amazon_domain: "amazon.ca"
     keepa_domain: "CA"
@@ -71,7 +81,27 @@ marketplaces:
     region: "na"
     delivery_postcode: "M5V 3L9"
 
+  MX:
+    amazon_domain: "amazon.com.mx"
+    keepa_domain: "MX"
+    keepa_domain_code: 11
+    currency_code: "MXN"
+    currency_symbol: "$"
+    price_format: "standard"
+    region: "na"
+    delivery_postcode: "06600"
+
   # ─── Asia Pacific ─────────────────────────
+  JP:
+    amazon_domain: "amazon.co.jp"
+    keepa_domain: "JP"
+    keepa_domain_code: 5
+    currency_code: "JPY"
+    currency_symbol: "¥"
+    price_format: "standard"
+    region: "apac"
+    delivery_postcode: "100-0001"
+
   AU:
     amazon_domain: "amazon.com.au"
     keepa_domain: "AU"
