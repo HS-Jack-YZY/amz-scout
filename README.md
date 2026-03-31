@@ -45,44 +45,97 @@ amz-scout status config/BE10000.yaml
 
 ### `amz-scout scrape`
 
-采集 Amazon 竞品数据 + Keepa 价格走势。
+采集 Amazon 竞品数据 + Keepa 价格走势。**核心命令，完成全部数据采集工作。**
+
+**参数：**
+
+| 参数 | 说明 |
+|------|------|
+| `PROJECT_CONFIG` | 项目配置文件路径（必填） |
+| `-m, --marketplace` | 只采集指定站点（如 `-m UK`） |
+| `-p, --product` | 只采集指定产品（模糊匹配，如 `-p "RT-BE58"`） |
+| `--data-only` | 仅采集 Amazon 产品页当前数据，跳过 Keepa 价格走势。不需要 Keepa API Key |
+| `--history-only` | 仅获取 Keepa 价格走势。不需要浏览器，纯 API 调用 |
+| `--headed` | 显示浏览器窗口（Debug 用，可观察页面操作过程） |
+| `-v, --verbose` | 显示详细日志（含每个 browser-use 命令） |
+
+**使用示例：**
 
 ```bash
-# 全量采集（8 站点 × 17 产品）
+# 全量采集（8 站点 × 17 产品，约 30 分钟 + Keepa 等待时间）
 amz-scout scrape config/BE10000.yaml
 
-# 单站点
+# 只跑 UK 站
 amz-scout scrape config/BE10000.yaml -m UK
 
-# 单产品（跨所有站点）
+# 只跑某个产品（跨所有站点）
 amz-scout scrape config/BE10000.yaml -p "RT-BE58"
 
-# 仅当前价格（跳过 Keepa，不需要 API Key）
+# 仅当前价格（最常用，不消耗 Keepa token）
 amz-scout scrape config/BE10000.yaml --data-only
 
-# 仅价格走势（仅 Keepa API，不需要浏览器）
+# 仅价格走势（后台跑，自动等待 token refill）
 amz-scout scrape config/BE10000.yaml --history-only
 
-# Debug 模式（可视化浏览器 + 详细日志）
+# Debug：单站单产品 + 可视化浏览器 + 详细日志
 amz-scout scrape config/BE10000.yaml -m UK -p "RT-BE58" --headed -v
 ```
 
 ### `amz-scout discover`
 
-扫描各站点 ASIN，自动填充配置中的 `marketplace_overrides`。首次添加新产品后运行一次即可。
+扫描各站点 ASIN，自动填充配置中的 `marketplace_overrides`。**首次添加新产品后运行一次即可，后续 scrape 也会自动发现并回写。**
+
+**参数：**
+
+| 参数 | 说明 |
+|------|------|
+| `PROJECT_CONFIG` | 项目配置文件路径（必填） |
+| `-m, --marketplace` | 只扫描指定站点 |
+| `--headed` | 显示浏览器窗口 |
+| `-v, --verbose` | 详细日志 |
+
+**使用示例：**
 
 ```bash
+# 扫描所有站点（添加新产品后运行）
 amz-scout discover config/BE10000.yaml
-amz-scout discover config/BE10000.yaml -m DE   # 仅扫描 DE
+
+# 仅扫描 DE 站
+amz-scout discover config/BE10000.yaml -m DE
+
+# 可视化模式（观察搜索过程）
+amz-scout discover config/BE10000.yaml --headed
 ```
 
 ### `amz-scout validate`
 
-校验 YAML 配置文件（ASIN 格式、站点定义等）。
+校验 YAML 配置文件，检查 ASIN 格式、站点定义是否完整、产品列表是否有效。**建议在每次修改配置后运行。**
+
+```bash
+amz-scout validate config/BE10000.yaml
+# 输出示例：
+# Config valid!
+#   Project: BE10000
+#   Markets: UK, DE, FR, IT, ES, NL, CA, AU
+#   Products: 17
+```
 
 ### `amz-scout status`
 
-检查各站点数据完整性。
+检查各站点数据完整性，显示已采集的行数和缺失的数据文件。**用于快速了解哪些站点已跑完、哪些还需要补跑。**
+
+```bash
+amz-scout status config/BE10000.yaml
+# 输出示例：
+#        Data Status
+# ┌──────┬──────────────────┬──────────────────┐
+# │ Site │ Competitive Data │ Price History     │
+# ├──────┼──────────────────┼──────────────────┤
+# │ UK   │ 17 rows          │ 17 rows          │
+# │ DE   │ 17 rows          │ missing          │
+# │ ...  │ ...              │ ...              │
+# └──────┴──────────────────┴──────────────────┘
+```
 
 ## 配置文件
 
