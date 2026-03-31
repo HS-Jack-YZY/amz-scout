@@ -3,8 +3,8 @@
 Strategy:
 - Default mode (1 token/product): basic query → csv[] + monthlySoldHistory + buyBoxSellerIdHistory
   All stats (min/max/avg/current) computed locally from the raw csv arrays.
-- Detailed mode (--detailed, ~5 tokens/product): adds offers + stats + buybox parameters
-  for seller count, FBA breakdown, and pre-computed stats.
+- Detailed mode (--detailed, ~6 tokens/product): adds offers + stats + buybox + rating
+  for seller count, FBA breakdown, pre-computed stats, rating and review count history.
 """
 
 import json as json
@@ -85,7 +85,7 @@ class KeepaClient:
         """Fetch price history for products.
 
         Args:
-            detailed: If True, request offers+stats+buybox (~5 tokens/product).
+            detailed: If True, request offers+stats+buybox+rating (~6 tokens/product).
             raw_dir: If provided, save raw Keepa JSON responses to this directory.
         """
         domain_code = keepa_domain_code
@@ -100,12 +100,12 @@ class KeepaClient:
         if not valid_pairs:
             return []
 
-        mode = "detailed (~5 tok/product)" if detailed else "basic (1 tok/product)"
+        mode = "detailed (~6 tok/product)" if detailed else "basic (1 tok/product)"
         logger.info("[%s] Fetching Keepa data for %d products [%s]",
                      site, len(valid_pairs), mode)
 
         self._check_tokens()
-        tokens_per = 5 if detailed else 1
+        tokens_per = 6 if detailed else 1
         self._wait_for_tokens(len(valid_pairs) * tokens_per)
 
         results = []
@@ -130,7 +130,7 @@ class KeepaClient:
         """Fetch one product with retry on 429."""
         params: dict = {"key": self._key, "domain": domain_code, "asin": asin}
         if detailed:
-            params.update({"stats": 90, "offers": 20, "buybox": 1})
+            params.update({"stats": 90, "offers": 20, "buybox": 1, "rating": 1})
 
         for attempt in range(max_retries + 1):
             try:
@@ -307,7 +307,7 @@ def _prices_from_stats(stats: dict) -> tuple[dict, dict]:
 
 def _summarize_csv(csv_data: list, type_index: int) -> dict[str, float | None]:
     """Compute stats from a single csv price type array."""
-    empty = {"current": None, "lowest": None, "highest": None, "avg90": None}
+    empty: dict[str, float | None] = {"current": None, "lowest": None, "highest": None, "avg90": None}
     if type_index >= len(csv_data) or not csv_data[type_index]:
         return empty
 
@@ -336,7 +336,8 @@ def _stat_price(stat_array: list, idx: int) -> float | None:
         v = stat_array[idx]
         if isinstance(v, (list, tuple)) and len(v) >= 2:
             return cents_to_price(v[1])
-        return cents_to_price(v)
+        if isinstance(v, int):
+            return cents_to_price(v)
     return None
 
 
