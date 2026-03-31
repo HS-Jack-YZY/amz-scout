@@ -1,0 +1,84 @@
+marketplaces:
+  # ─── Europe ───────────────────────────────
+  UK:
+    amazon_domain: "amazon.co.uk"
+    keepa_domain: "GB"
+    keepa_domain_code: 2
+    currency_code: "GBP"
+    currency_symbol: "£"
+    price_format: "standard"
+    region: "eu"
+    delivery_postcode: "SW1A 1AA"
+
+  DE:
+    amazon_domain: "amazon.de"
+    keepa_domain: "DE"
+    keepa_domain_code: 3
+    currency_code: "EUR"
+    currency_symbol: "€"
+    price_format: "european"
+    region: "eu"
+    delivery_postcode: "10115"
+
+  FR:
+    amazon_domain: "amazon.fr"
+    keepa_domain: "FR"
+    keepa_domain_code: 4
+    currency_code: "EUR"
+    currency_symbol: "€"
+    price_format: "european"
+    region: "eu"
+    delivery_postcode: "75001"
+
+  IT:
+    amazon_domain: "amazon.it"
+    keepa_domain: "IT"
+    keepa_domain_code: 8
+    currency_code: "EUR"
+    currency_symbol: "€"
+    price_format: "european"
+    region: "eu"
+    delivery_postcode: "00100"
+
+  ES:
+    amazon_domain: "amazon.es"
+    keepa_domain: "ES"
+    keepa_domain_code: 9
+    currency_code: "EUR"
+    currency_symbol: "€"
+    price_format: "european"
+    region: "eu"
+    delivery_postcode: "28001"
+
+  NL:
+    amazon_domain: "amazon.nl"
+    keepa_domain: "NL"
+    keepa_domain_code: 14
+    currency_code: "EUR"
+    currency_symbol: "€"
+    price_format: "european"
+    region: "eu"
+    delivery_postcode: "1012"
+
+  # ─── North America ────────────────────────
+  CA:
+    amazon_domain: "amazon.ca"
+    keepa_domain: "CA"
+    keepa_domain_code: 6
+    currency_code: "CAD"
+    currency_symbol: "$"
+    price_format: "standard"
+    region: "na"
+    delivery_postcode: "M5V 3L9"
+
+  # ─── Asia Pacific ─────────────────────────
+  AU:
+    amazon_domain: "amazon.com.au"
+    keepa_domain: "AU"
+    keepa_domain_code: 10
+    currency_code: "AUD"
+    currency_symbol: "$"
+    price_format: "standard"
+    region: "apac"
+    delivery_postcode: "2000"
+    delivery_city: "SYDNEY"
