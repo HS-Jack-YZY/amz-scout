@@ -248,6 +248,18 @@ output/<project>/data/
 2. 在项目 YAML 的 `target_marketplaces` 中添加站点代码
 3. 运行 `amz-scout discover` 扫描 ASIN
 
+## Roadmap
+
+- [ ] 关键词搜索排名 — 指定关键词，追踪各产品在搜索结果中的排名位置
+- [ ] 广告位检测 — 检测竞品是否在投 Sponsored Ads
+- [ ] 差评关键词提取 — 提取 1-2 星评论的高频关键词，发现竞品弱点
+- [ ] 评论增长速度 — 追踪每月新增评论数，判断销售趋势
+- [ ] 报告生成集成 — 将 `generate_report.py` 迁移为 `amz-scout report` 命令
+- [ ] Settings 配置项生效 — retry_count, page_load_wait, screenshot_on_error 等
+- [ ] CamelCamelCamel fallback — Cloudflare 绕过后恢复 CCC 价格走势备用方案
+- [ ] 定时任务支持 — cron / schedule 定期自动采集
+- [ ] 数据版本管理 — 按日期归档历史数据，支持时间序列分析
+
 ## Keepa API 说明
 
 - 免费 plan：60 tokens，1 token/min refill
