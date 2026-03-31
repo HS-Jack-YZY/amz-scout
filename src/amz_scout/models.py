@@ -42,6 +42,11 @@ class CompetitiveData:
     bsr: str
     available: str
     url: str
+    # Inventory fields
+    stock_status: str = ""        # "In stock", "Only 2 left in stock", "Currently unavailable"
+    stock_count: str = ""         # "2", "6", "" (empty = plenty or unavailable)
+    sold_by: str = ""             # Seller name
+    other_offers: str = ""        # "New & Used (26) from £81.78"
 
 
 @dataclass(frozen=True)

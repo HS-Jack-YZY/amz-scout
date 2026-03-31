@@ -78,6 +78,29 @@ EXTRACT_JS = r"""(function() {
     var m = window.location.href.match(/\/dp\/([A-Z0-9]{10})/);
     r.asin = m ? m[1] : '';
 
+    // ─── Inventory data ───
+    var availEl = document.querySelector('#availability span, #availability');
+    r.stockStatus = availEl ? availEl.innerText.trim() : '';
+    var stockMatch = (r.stockStatus || '').match(/(\d+)\s+left/i);
+    r.stockCount = stockMatch ? stockMatch[1] : '';
+
+    // Sold by
+    var soldByEl = document.querySelector('#tabular-buybox-truncate-0 span, #merchant-info a, #sellerProfileTriggerId');
+    r.soldBy = soldByEl ? soldByEl.innerText.trim() : '';
+
+    // Other offers — clean up price formatting artifacts
+    var offersEl = document.querySelector('#olpLinkWidget_feature_div a, #mbc-action-panel-wrapper a');
+    if (offersEl) {
+        var rawOffers = offersEl.innerText.trim().replace(/\n/g, ' ').replace(/\s+/g, ' ');
+        // Remove duplicated price like "£81.78 £81 . 78" → "£81.78"
+        rawOffers = rawOffers.replace(/([£€$¥]\d[\d,.]+)\s+[£€$¥]?\d+\s*\.\s*\d+/g, '$1');
+        // Remove "& FREE Delivery ."
+        rawOffers = rawOffers.replace(/\s*&\s*FREE\s+Delivery\s*\.?/gi, '').trim();
+        r.otherOffers = rawOffers;
+    } else {
+        r.otherOffers = '';
+    }
+
     return JSON.stringify(r);
 })()"""
 
@@ -133,6 +156,10 @@ def scrape_product_page(
             bsr=result.get("bsr", "N/A"),
             available=available,
             url=url,
+            stock_status=result.get("stockStatus", ""),
+            stock_count=result.get("stockCount", ""),
+            sold_by=result.get("soldBy", ""),
+            other_offers=result.get("otherOffers", ""),
         )
 
     except BrowserError as e:
