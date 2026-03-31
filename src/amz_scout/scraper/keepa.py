@@ -7,6 +7,7 @@ Strategy:
   for seller count, FBA breakdown, and pre-computed stats.
 """
 
+import json as json_mod
 import logging
 import os
 import time
@@ -79,12 +80,13 @@ class KeepaClient:
         keepa_domain: str,
         keepa_domain_code: int | None = None,
         detailed: bool = False,
+        raw_dir: Path | None = None,
     ) -> list[PriceHistory]:
         """Fetch price history for products.
 
         Args:
             detailed: If True, request offers+stats+buybox (~5 tokens/product).
-                      If False, basic query only (1 token/product).
+            raw_dir: If provided, save raw Keepa JSON responses to this directory.
         """
         domain_code = keepa_domain_code
         if domain_code is None:
@@ -108,7 +110,7 @@ class KeepaClient:
 
         results = []
         for asin, product in valid_pairs:
-            history = self._fetch_one(asin, product, site, domain_code, detailed)
+            history = self._fetch_one(asin, product, site, domain_code, detailed, raw_dir)
             results.append(history)
             time.sleep(0.5)
 
@@ -122,6 +124,7 @@ class KeepaClient:
         site: str,
         domain_code: int,
         detailed: bool = False,
+        raw_dir: Path | None = None,
         max_retries: int = 2,
     ) -> PriceHistory:
         """Fetch one product with retry on 429."""
@@ -163,6 +166,10 @@ class KeepaClient:
                 if not raw_products:
                     return _empty_history(product, site)
 
+                # Save raw JSON
+                if raw_dir:
+                    _save_raw(raw_dir, site, asin, raw_products[0])
+
                 history = _parse_product(product, site, raw_products[0], detailed)
                 logger.debug("[%s] %s: bb=%s amz=%s new=%s sold=%s",
                               site, product.model, history.buybox_current,
@@ -177,6 +184,18 @@ class KeepaClient:
                 return _empty_history(product, site)
 
         return _empty_history(product, site)
+
+
+# ─── Raw data storage ───────────────────────────────────────────────────
+
+
+def _save_raw(raw_dir: Path, site: str, asin: str, product_data: dict) -> None:
+    """Save raw Keepa product JSON for future re-analysis."""
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    path = raw_dir / f"{site.lower()}_{asin}.json"
+    with open(path, "w", encoding="utf-8") as f:
+        json_mod.dump(product_data, f, ensure_ascii=False, separators=(",", ":"))
+    logger.debug("Saved raw JSON: %s", path)
 
 
 # ─── Parsing ────────────────────────────────────────────────────────────

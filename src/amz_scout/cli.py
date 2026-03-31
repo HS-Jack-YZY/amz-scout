@@ -148,10 +148,12 @@ def _scrape_price_history(
                 f"({keepa.tokens_left} < {len(products)})[/]"
             )
 
+        raw_dir = output_base / "data" / mp_config.region / "raw"
         histories = keepa.fetch_price_history(
             products, site, mp_config.keepa_domain,
             keepa_domain_code=mp_config.keepa_domain_code,
             detailed=detailed,
+            raw_dir=raw_dir,
         )
 
         if histories:
