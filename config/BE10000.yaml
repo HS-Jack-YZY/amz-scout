@@ -114,6 +114,9 @@ products:
   model: Nighthawk RS300 (BE9300)
   default_asin: B0D5F75828
   search_keywords: NETGEAR Nighthawk RS300 WiFi 7
+  marketplace_overrides:
+    US:
+      asin: B0D4JBGPH4
 - category: Home Router
   brand: NETGEAR
   model: Nighthawk RS600 (BE6500)
@@ -124,6 +127,9 @@ products:
   model: Nighthawk RS100
   default_asin: B0DY1S42MV
   search_keywords: NETGEAR Nighthawk RS100 WiFi 7
+  marketplace_overrides:
+    US:
+      asin: B0DWQK25DW
 - category: Home Router
   brand: NETGEAR
   model: Nighthawk RS200
