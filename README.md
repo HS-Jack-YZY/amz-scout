@@ -203,12 +203,12 @@ output/<project>/data/
 
 **数据字段说明：**
 
-| 文件 | 字段 |
-|------|------|
-| `*_competitive_data.csv` | date, site, category, brand, model, asin, title, price, rating, review_count, bought_past_month, bsr, available, url, **stock_status, stock_count, sold_by, other_offers** |
+| 文件 | 主要字段 |
+|------|---------|
+| `*_competitive_data.csv` | date, site, category, brand, model, asin, title, price, rating, review_count, bought_past_month, bsr, available, url + 库存字段 + Listing 质量字段 |
 | `*_price_history.csv` | date, site, category, brand, model, asin, buybox_current/lowest/highest/avg90, amz_current/lowest/highest/avg90, new_current/lowest/highest/avg90, sales_rank |
 
-**库存字段说明：**
+**库存字段：**
 
 | 字段 | 示例 | 说明 |
 |------|------|------|
@@ -216,6 +216,17 @@ output/<project>/data/
 | `stock_count` | "2" / "" | "Only X left" 的具体数字，充足时为空 |
 | `sold_by` | "GL.iNet Technologie" / "Amazon Resale" | Buy Box 卖家名称 |
 | `other_offers` | "New & Used (26) from £81.78" | 其他卖家报价摘要 |
+
+**Listing 质量字段：**
+
+| 字段 | 示例 | 说明 |
+|------|------|------|
+| `coupon` | "Save 5% with coupon" / "" | 优惠券信息 |
+| `is_prime` | "True" / "False" | 是否有 Prime 标志 |
+| `star_distribution` | `{"5_star":"50%","4_star":"17%",...}` | 评分分布（JSON） |
+| `image_count` | "14" | 产品图片数量 |
+| `qa_count` | "24 answered questions" | Q&A 数量 |
+| `fulfillment` | "FBA" / "FBM" / "" | 配送方式（Amazon 发货 / 卖家自发） |
 
 ## 添加新产品
 
