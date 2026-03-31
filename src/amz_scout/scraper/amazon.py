@@ -170,6 +170,7 @@ def scrape_product_page(
     product: Product,
     site: str,
     config: MarketplaceConfig,
+    page_load_wait: int = 3,
 ) -> CompetitiveData | None:
     """Extract competitive data from an Amazon product page.
 
@@ -181,7 +182,7 @@ def scrape_product_page(
 
     try:
         browser.open(url)
-        time.sleep(3)
+        time.sleep(page_load_wait)
 
         # Handle Amazon bot detection ("Continue shopping" interstitial)
         _dismiss_interstitials(browser)

@@ -61,6 +61,7 @@ def scrape(
     project_config: str = typer.Argument(help="Path to project YAML config"),
     marketplace: str | None = typer.Option(None, "-m", "--marketplace", help="Single marketplace"),
     product: str | None = typer.Option(None, "-p", "--product", help="Single product model"),
+    exclude: str | None = typer.Option(None, "-x", "--exclude", help="Exclude product (substring match)"),
     data_only: bool = typer.Option(False, help="Skip Keepa price history"),
     history_only: bool = typer.Option(False, help="Only fetch Keepa price history"),
     detailed: bool = typer.Option(False, help="Keepa detailed mode: include seller data (~5 tokens/product vs 1)"),
@@ -87,6 +88,11 @@ def scrape(
         products = [p for p in products if product.lower() in p.model.lower()]
         if not products:
             console.print(f"[red]No product matching '{product}'[/]")
+            raise typer.Exit(1)
+    if exclude:
+        products = [p for p in products if exclude.lower() not in p.model.lower()]
+        if not products:
+            console.print(f"[red]All products excluded by '{exclude}'[/]")
             raise typer.Exit(1)
 
     headed_mode = headed or proj.settings.headed_mode
@@ -167,7 +173,14 @@ def _scrape_price_history(
             write_price_history(merged, csv_path)
 
     if keepa:
-        console.print(f"  Keepa tokens remaining: {keepa.tokens_left}")
+        remaining = keepa.tokens_left
+        total_products = len(products) * len(target_sites)
+        tok_per = 5 if detailed else 1
+        tokens_used = total_products * tok_per
+        console.print(f"  Keepa: ~{tokens_used} tokens used, {remaining} remaining")
+        if remaining < total_products * tok_per:
+            refill_mins = (total_products * tok_per - remaining)
+            console.print(f"  [dim]Next full run needs ~{refill_mins} min refill[/]")
 
 
 def _scrape_amazon(
@@ -208,7 +221,17 @@ def _scrape_amazon(
                     ))
                     continue
 
-                data = scrape_product_page(browser, prod, site, mp_config)
+                # Scrape with retry
+                data = None
+                for attempt in range(proj.settings.retry_count):
+                    data = scrape_product_page(
+                        browser, prod, site, mp_config,
+                        page_load_wait=proj.settings.page_load_wait,
+                    )
+                    if data is not None:
+                        break
+                    if attempt < proj.settings.retry_count - 1:
+                        time.sleep(2)
 
                 if data is None:
                     # Try search fallback
@@ -224,7 +247,10 @@ def _scrape_amazon(
                             default_asin=found_asin, search_keywords=prod.search_keywords,
                             marketplace_overrides=prod.marketplace_overrides,
                         )
-                        data = scrape_product_page(browser, updated, site, mp_config)
+                        data = scrape_product_page(
+                            browser, updated, site, mp_config,
+                            page_load_wait=proj.settings.page_load_wait,
+                        )
 
                 if data is None:
                     console.print(f"  [{i}/{len(products)}] {prod.brand} {prod.model}: [red]Not found[/]")
@@ -245,10 +271,13 @@ def _scrape_amazon(
                 if i < len(products):
                     time.sleep(proj.settings.inter_product_delay)
 
-            # Final write (also written incrementally below)
+            # Final write
             _save_competitive(results, output_base, mp_config, site)
             has_price = sum(1 for r in results if r.price not in ("N/A", "", "Currently unavailable"))
             console.print(f"  [green]{site}: {has_price}/{len(results)} with price[/]")
+
+            # Data validation
+            _validate_results(results, site)
 
         except Exception as e:
             # Save whatever we have so far on unexpected crash
@@ -426,6 +455,79 @@ def status(
         table.add_row(site, comp_status, hist_status)
 
     console.print(table)
+
+
+def _validate_results(results: list[CompetitiveData], site: str) -> None:
+    """Validate scraped data and warn about anomalies."""
+    from amz_scout.utils import parse_price, parse_rating
+
+    warnings = []
+    for r in results:
+        if r.price in ("N/A", "", "Currently unavailable"):
+            continue
+        price = parse_price(r.price)
+        if price is not None and (price < 1 or price > 5000):
+            warnings.append(f"{r.brand} {r.model}: suspicious price {r.price}")
+        rating = parse_rating(r.rating)
+        if rating is not None and (rating < 1 or rating > 5):
+            warnings.append(f"{r.brand} {r.model}: invalid rating {r.rating}")
+        if r.title and len(r.title) < 10:
+            warnings.append(f"{r.brand} {r.model}: suspiciously short title")
+
+    if warnings:
+        console.print(f"  [yellow]Warnings ({site}):[/]")
+        for w in warnings:
+            console.print(f"    [yellow]! {w}[/]")
+
+
+@app.command()
+def reparse(
+    project_config: str = typer.Argument(help="Path to project YAML config"),
+    marketplace: str | None = typer.Option(None, "-m", "--marketplace"),
+) -> None:
+    """Regenerate price history CSVs from saved raw JSON (zero token cost)."""
+    _setup_logging()
+    project_path, mp_path = _resolve_config_paths(project_config)
+    proj = load_project_config(project_path)
+    marketplaces = load_marketplace_config(mp_path)
+    products = [p.to_product() for p in proj.products]
+    target_sites = [marketplace] if marketplace else proj.target_marketplaces
+    output_base = Path(proj.project.output_dir)
+
+    from amz_scout.scraper.keepa import _parse_product, _empty_history
+    import json as json_mod
+
+    console.print("[bold]── Reparse from raw JSON ──[/]")
+
+    for site in target_sites:
+        mp_config = marketplaces.get(site)
+        if not mp_config:
+            continue
+
+        raw_dir = output_base / "data" / mp_config.region / "raw"
+        if not raw_dir.exists():
+            console.print(f"  [cyan]{site}[/]: [yellow]no raw/ directory[/]")
+            continue
+
+        histories = []
+        for prod in products:
+            asin = prod.asin_for(site)
+            json_path = raw_dir / f"{site.lower()}_{asin}.json"
+            if json_path.exists():
+                with open(json_path) as f:
+                    raw = json_mod.load(f)
+                histories.append(_parse_product(prod, site, raw, detailed=False))
+            else:
+                histories.append(_empty_history(prod, site))
+
+        has_data = sum(1 for h in histories if h.buybox_current is not None)
+        console.print(f"  [cyan]{site}[/]: {has_data}/{len(histories)} reparsed from raw JSON")
+
+        data_dir = output_base / "data" / mp_config.region
+        csv_path = data_dir / f"{site.lower()}_price_history.csv"
+        write_price_history(histories, csv_path)
+
+    console.print("[green bold]Done![/]")
 
 
 def _count_lines(path: Path) -> int:

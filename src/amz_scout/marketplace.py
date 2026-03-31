@@ -1,7 +1,6 @@
 """Per-marketplace browser setup: delivery address, currency, cookie consent."""
 
 import logging
-import re
 import time
 
 from amz_scout.browser import BrowserError, BrowserSession
@@ -93,46 +92,37 @@ def _set_delivery_address(
 
 
 def _set_standard_address(browser: BrowserSession, config: MarketplaceConfig) -> bool:
-    """Set address for UK/DE (single postcode input).
+    """Set address for UK/DE/US etc. (single postcode input). Pure JS approach."""
+    result = browser.evaluate(f"""(function() {{
+        var input = document.querySelector('#GLUXZipUpdateInput');
+        if (!input) return JSON.stringify({{ok: false, reason: 'no input'}});
+        // Focus, clear, type via native setter + input event
+        input.focus();
+        var setter = Object.getOwnPropertyDescriptor(
+            window.HTMLInputElement.prototype, 'value').set;
+        setter.call(input, '{config.delivery_postcode}');
+        input.dispatchEvent(new Event('input', {{bubbles: true}}));
+        input.dispatchEvent(new Event('change', {{bubbles: true}}));
+        // Click Apply — find submit button near the zip input
+        var apply = input.closest('.a-popover-inner, .a-section')
+            ?.querySelector('input[type=submit]');
+        if (!apply) {{
+            // Broader search
+            var allSubmits = document.querySelectorAll('.a-popover input[type=submit]');
+            for (var i = 0; i < allSubmits.length; i++) {{
+                var parent = allSubmits[i].closest('[id*=GLUX]');
+                if (parent) {{ apply = allSubmits[i]; break; }}
+            }}
+        }}
+        if (apply) apply.click();
+        return JSON.stringify({{ok: true}});
+    }})()""")
 
-    Uses browser state + element index clicking (proven in manual workflow)
-    instead of JavaScript value setting which Amazon doesn't reliably detect.
-    """
-    # Find the postcode input element index from state
-    state = browser.state()
-    raw_text = state.get("data", {}).get("_raw_text", "")
-
-    # Look for GLUXZipUpdateInput element index
-    match = re.search(r"\[(\d+)\]<input[^>]*id=GLUXZipUpdateInput", raw_text)
-    if not match:
-        logger.warning("Postcode input not found in page state")
+    if not result.get("ok"):
+        logger.warning("Postcode input not found: %s", result.get("reason"))
         return False
 
-    input_idx = int(match.group(1))
-    logger.debug("Found postcode input at index %d", input_idx)
-
-    # Use browser-use input command (simulates real click + type)
-    browser.input_to(input_idx, config.delivery_postcode)
-    time.sleep(0.5)
-
-    # Find and click Apply button
-    apply_match = re.search(
-        r"\[(\d+)\]<input[^>]*type=submit[^>]*>\s*(?:\n\s*)?(?:\[.*?\]\s*)?Apply",
-        raw_text,
-    )
-    if not apply_match:
-        # Fallback: find any submit button near GLUXZip
-        apply_match = re.search(
-            r"GLUXZipUpdateInput.*?\[(\d+)\]<input[^>]*type=submit",
-            raw_text, re.DOTALL,
-        )
-
-    if apply_match:
-        browser.click(int(apply_match.group(1)))
-        time.sleep(2)
-    else:
-        logger.warning("Apply button not found")
-
+    time.sleep(2)
     # Click Continue/Done if present
     browser.evaluate("""
         var btns = document.querySelectorAll(

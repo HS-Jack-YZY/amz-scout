@@ -54,6 +54,7 @@ amz-scout status config/BE10000.yaml
 | `PROJECT_CONFIG` | 项目配置文件路径（必填） |
 | `-m, --marketplace` | 只采集指定站点（如 `-m UK`） |
 | `-p, --product` | 只采集指定产品（模糊匹配，如 `-p "RT-BE58"`） |
+| `-x, --exclude` | 排除指定产品（如 `-x "RS500"` 跳过 NETGEAR RS500） |
 | `--data-only` | 仅采集 Amazon 产品页当前数据，跳过 Keepa 价格走势。不需要 Keepa API Key |
 | `--history-only` | 仅获取 Keepa 价格走势。不需要浏览器，纯 API 调用 |
 | `--headed` | 显示浏览器窗口（Debug 用，可观察页面操作过程） |
@@ -105,6 +106,15 @@ amz-scout discover config/BE10000.yaml -m DE
 
 # 可视化模式（观察搜索过程）
 amz-scout discover config/BE10000.yaml --headed
+```
+
+### `amz-scout reparse`
+
+从已保存的 raw JSON 重新生成价格走势 CSV。**修改了解析逻辑后使用，不消耗任何 Keepa token。**
+
+```bash
+amz-scout reparse config/BE10000.yaml
+amz-scout reparse config/BE10000.yaml -m UK   # 仅重新解析 UK
 ```
 
 ### `amz-scout validate`
@@ -266,13 +276,15 @@ output/<project>/data/
 
 ## Roadmap
 
+- [x] ~~Settings 配置项生效~~ — retry_count, page_load_wait 已生效
+- [x] ~~reparse 命令~~ — 从 raw JSON 重新生成 CSV，零 token 成本
+- [x] ~~数据校验~~ — 采集后自动检查价格/评分异常
+- [x] ~~Amazon 产品页重试~~ — 失败时自动重试 N 次
 - [ ] 关键词搜索排名 — 指定关键词，追踪各产品在搜索结果中的排名位置
 - [ ] 广告位检测 — 检测竞品是否在投 Sponsored Ads
 - [ ] 差评关键词提取 — 提取 1-2 星评论的高频关键词，发现竞品弱点
 - [ ] 评论增长速度 — 追踪每月新增评论数，判断销售趋势
 - [ ] 报告生成集成 — 将 `generate_report.py` 迁移为 `amz-scout report` 命令
-- [ ] Settings 配置项生效 — retry_count, page_load_wait, screenshot_on_error 等
-- [ ] CamelCamelCamel fallback — Cloudflare 绕过后恢复 CCC 价格走势备用方案
 - [ ] 定时任务支持 — cron / schedule 定期自动采集
 - [ ] 数据版本管理 — 按日期归档历史数据，支持时间序列分析
 
