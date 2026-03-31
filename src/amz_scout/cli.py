@@ -280,11 +280,19 @@ def discover(
                 browser.open(url)
                 time.sleep(2)
 
-                # Check if product exists
+                # Check if product exists (must have title OR price to be valid)
                 result = browser.evaluate("""(function() {
                     var title = document.getElementById('productTitle')?.innerText?.trim();
-                    if (!title && (document.body.innerText.includes('not a functioning page')
-                        || document.body.innerText.includes('nicht funktionierend'))) {
+                    var price = document.querySelector('.a-price .a-offscreen')?.innerText?.trim();
+                    var bodyText = document.body.innerText || '';
+                    var notFound = bodyText.includes('not a functioning page')
+                        || bodyText.includes('nicht funktionierend')
+                        || bodyText.includes('looking for')
+                        || bodyText.length < 500;
+                    if (!title && !price && notFound) {
+                        return JSON.stringify({exists: false});
+                    }
+                    if (!title && !price) {
                         return JSON.stringify({exists: false});
                     }
                     return JSON.stringify({exists: true, title: (title || '').substring(0, 60)});

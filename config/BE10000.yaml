@@ -29,6 +29,8 @@ products:
       asin: B0FSPQSJGF
     UK:
       asin: B0FGDRP3VZ
+    US:
+      asin: B0FSPQSJGF
 - category: Travel Router
   brand: TP-Link
   model: TL-WR3602BE (BE3600)
@@ -39,6 +41,8 @@ products:
       asin: B0FHZGXZH7
     DE:
       asin: B0FQV6J9DB
+    US:
+      asin: B0FHZGXZH7
 - category: Travel Router
   brand: GL.iNet
   model: GL-Beryl 7 (GL-MT3600BE)
@@ -63,6 +67,8 @@ products:
       note: Not listed on AU
     NL:
       asin: B07MP95PXF
+    US:
+      asin: B0D55SWRSM
 - category: Home Router
   brand: ASUS
   model: RT-BE92U
@@ -77,6 +83,8 @@ products:
       asin: B09T9BMKR3
     NL:
       asin: B09T9BMKR3
+    US:
+      asin: B0DHWCQ3FP
 - category: Home Router
   brand: ASUS
   model: RT-BE82U
@@ -84,6 +92,8 @@ products:
   search_keywords: ASUS RT-BE82U WiFi 7 router
   marketplace_overrides:
     CA:
+      asin: B0D48GS6KB
+    US:
       asin: B0D48GS6KB
 - category: Home Router
   brand: ASUS
@@ -97,6 +107,8 @@ products:
       asin: B09T9D5DVK
     AU:
       note: Not listed on AU
+    US:
+      asin: B0DGZZJ996
 - category: Home Router
   brand: NETGEAR
   model: Nighthawk RS300 (BE9300)
@@ -120,6 +132,8 @@ products:
   marketplace_overrides:
     CA:
       asin: B0DGB52L2Q
+    US:
+      asin: B0DG6DNF94
 - category: Home Router
   brand: NETGEAR
   model: Nighthawk RS500 (BE12000)
@@ -136,6 +150,8 @@ products:
     AU:
       asin: B0FSKQXJWV
       note: AU listing is a bundle (router + extender), not standalone
+    US:
+      asin: B0CJSNSVMR
 - category: Home Router
   brand: TP-Link
   model: Archer BE400 (BE6500)
@@ -149,6 +165,8 @@ products:
     AU:
       asin: B0F19KCGPK
       note: AU ASIN is a USB adapter, needs manual verification
+    US:
+      asin: B0DVBP5L6Y
 - category: Home Router
   brand: GL.iNet
   model: Flint3e (GL-BE6500)
