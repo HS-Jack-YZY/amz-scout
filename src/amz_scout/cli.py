@@ -9,7 +9,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from amz_scout.browser import BrowserSession, check_browser_use_installed
+from amz_scout.browser import BrowserError, BrowserSession, check_browser_use_installed
 from amz_scout.config import (
     MarketplaceConfig,
     ProjectConfig,
@@ -229,14 +229,31 @@ def _scrape_amazon(
                 if i < len(products):
                     time.sleep(proj.settings.inter_product_delay)
 
-            # Write CSV
-            data_dir = output_base / "data" / mp_config.region
-            write_competitive_data(results, data_dir / f"{site.lower()}_competitive_data.csv")
+            # Final write (also written incrementally below)
+            _save_competitive(results, output_base, mp_config, site)
             has_price = sum(1 for r in results if r.price not in ("N/A", "", "Currently unavailable"))
             console.print(f"  [green]{site}: {has_price}/{len(results)} with price[/]")
 
+        except Exception as e:
+            # Save whatever we have so far on unexpected crash
+            if results:
+                _save_competitive(results, output_base, mp_config, site)
+                console.print(f"  [yellow]{site}: saved {len(results)} partial results before error[/]")
+            console.print(f"  [red]{site}: {e}[/]")
+
         finally:
             browser.close()
+
+
+def _save_competitive(
+    results: list[CompetitiveData],
+    output_base: Path,
+    mp_config: MarketplaceConfig,
+    site: str,
+) -> None:
+    """Save competitive data CSV (used for both normal and crash-recovery writes)."""
+    data_dir = output_base / "data" / mp_config.region
+    write_competitive_data(results, data_dir / f"{site.lower()}_competitive_data.csv")
 
 
 @app.command()
@@ -275,41 +292,58 @@ def discover(
             found_count = 0
 
             for prod in products:
-                asin = prod.asin_for(site)
-                url = f"https://www.{mp_config.amazon_domain}/dp/{asin}"
-                browser.open(url)
-                time.sleep(2)
+                try:
+                    asin = prod.asin_for(site)
+                    url = f"https://www.{mp_config.amazon_domain}/dp/{asin}"
+                    browser.open(url)
+                    time.sleep(2)
 
-                # Check if product exists (must have title OR price to be valid)
-                result = browser.evaluate("""(function() {
-                    var title = document.getElementById('productTitle')?.innerText?.trim();
-                    var price = document.querySelector('.a-price .a-offscreen')?.innerText?.trim();
-                    var bodyText = document.body.innerText || '';
-                    var notFound = bodyText.includes('not a functioning page')
-                        || bodyText.includes('nicht funktionierend')
-                        || bodyText.includes('looking for')
-                        || bodyText.length < 500;
-                    if (!title && !price && notFound) {
-                        return JSON.stringify({exists: false});
-                    }
-                    if (!title && !price) {
-                        return JSON.stringify({exists: false});
-                    }
-                    return JSON.stringify({exists: true, title: (title || '').substring(0, 60)});
-                })()""")
+                    # Check if product truly exists with an active offer
+                    result = browser.evaluate("""(function() {
+                        var title = document.getElementById('productTitle')?.innerText?.trim();
+                        var price = document.querySelector('.a-price .a-offscreen')?.innerText?.trim();
+                        var bodyText = document.body.innerText || '';
 
-                if result.get("exists"):
-                    console.print(f"  {prod.model}: [green]OK[/] ({asin})")
-                else:
-                    # Search fallback
-                    found = resolve_asin_via_search(
-                        browser, prod, site, mp_config, config_path=project_path,
-                    )
-                    if found:
-                        console.print(f"  {prod.model}: [yellow]Found[/] {found} (saved to config)")
-                        found_count += 1
+                        // Page doesn't exist at all
+                        if (!title && !price) return JSON.stringify({exists: false, reason: 'no_page'});
+
+                        // Page exists but has no active offer (title present, no price)
+                        var noOffer = bodyText.includes('No featured offers')
+                            || bodyText.includes('Currently unavailable')
+                            || bodyText.includes('Derzeit nicht verfügbar')
+                            || bodyText.includes('Momentan nicht verfügbar')
+                            || bodyText.includes('cannot be dispatched');
+                        if (title && !price && noOffer) {
+                            return JSON.stringify({exists: false, reason: 'no_offer', title: title.substring(0, 60)});
+                        }
+
+                        // Has title + price = valid product
+                        if (title && price) return JSON.stringify({exists: true, title: title.substring(0, 60)});
+
+                        // Has title but no price and no known error — treat as suspicious
+                        if (title && !price) return JSON.stringify({exists: false, reason: 'no_price'});
+
+                        return JSON.stringify({exists: false, reason: 'unknown'});
+                    })()""")
+
+                    if result.get("exists"):
+                        console.print(f"  {prod.model}: [green]OK[/] ({asin})")
                     else:
-                        console.print(f"  {prod.model}: [red]Not found[/]")
+                        reason = result.get("reason", "unknown")
+                        console.print(
+                            f"  {prod.model}: [yellow]{reason}[/] — searching..."
+                        )
+                        found = resolve_asin_via_search(
+                            browser, prod, site, mp_config, config_path=project_path,
+                        )
+                        if found:
+                            console.print(f"  {prod.model}: [green]Found[/] {found} (saved)")
+                            found_count += 1
+                        else:
+                            console.print(f"  {prod.model}: [red]Not found[/]")
+
+                except BrowserError as e:
+                    console.print(f"  {prod.model}: [red]Error: {e}[/]")
 
                 time.sleep(1)
 

@@ -14,13 +14,17 @@ logger = logging.getLogger(__name__)
 EXTRACT_JS = r"""(function() {
     var r = {};
     r.title = (document.getElementById('productTitle') || {}).innerText?.trim() || '';
+    var body = document.body.innerText || '';
+
+    // Detect non-product pages (404, blank, CAPTCHA, new US layout with no content)
     if (!r.title) {
-        var body = document.body.innerText;
-        if (body.indexOf('not a functioning page') !== -1
+        var isNotFound = body.indexOf('not a functioning page') !== -1
             || body.indexOf('nicht funktionierend') !== -1
-            || body.indexOf('looking for') !== -1) {
-            return JSON.stringify({error: 'not_found'});
-        }
+            || body.indexOf('looking for') !== -1
+            || body.indexOf('robot') !== -1
+            || body.indexOf('CAPTCHA') !== -1
+            || body.length < 500;
+        if (isNotFound) return JSON.stringify({error: 'not_found'});
     }
 
     // Price — multiple selectors in priority order

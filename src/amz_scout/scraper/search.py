@@ -1,6 +1,7 @@
 """Amazon search for cross-marketplace ASIN resolution + auto-writeback."""
 
 import logging
+import re
 import time
 from pathlib import Path
 
@@ -89,8 +90,6 @@ def _extract_model_key(model: str) -> str:
     'GL-Beryl 7 (GL-MT3600BE)' → 'MT3600BE'
     """
     # If parenthesized part contains a model number, prefer it
-    import re
-
     paren = re.search(r"\(([^)]+)\)", model)
     if paren:
         inner = paren.group(1)

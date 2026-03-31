@@ -1,6 +1,7 @@
 """Per-marketplace browser setup: delivery address, currency, cookie consent."""
 
 import logging
+import re
 import time
 
 from amz_scout.browser import BrowserError, BrowserSession
@@ -102,7 +103,6 @@ def _set_standard_address(browser: BrowserSession, config: MarketplaceConfig) ->
     raw_text = state.get("data", {}).get("_raw_text", "")
 
     # Look for GLUXZipUpdateInput element index
-    import re
     match = re.search(r"\[(\d+)\]<input[^>]*id=GLUXZipUpdateInput", raw_text)
     if not match:
         logger.warning("Postcode input not found in page state")
@@ -196,14 +196,18 @@ def _set_ca_address(browser: BrowserSession, config: MarketplaceConfig) -> bool:
 def _set_au_address(browser: BrowserSession, config: MarketplaceConfig) -> bool:
     """Set address for AU (postcode + city dropdown)."""
     # Type postcode
-    js = f"""(function() {{
+    result = browser.evaluate(f"""(function() {{
         var input = document.querySelector('#GLUXPostalCodeWithCity_PostalCodeInput');
         if (!input) return JSON.stringify({{error: 'AU input not found'}});
         input.focus();
         input.value = '';
         return JSON.stringify({{ok: true}});
-    }})()"""
-    browser.evaluate(js)
+    }})()""")
+
+    if "error" in str(result):
+        logger.warning("AU postcode input not found")
+        return False
+
     time.sleep(0.3)
     browser.type_text(config.delivery_postcode)
     time.sleep(0.5)
@@ -218,16 +222,21 @@ def _set_au_address(browser: BrowserSession, config: MarketplaceConfig) -> bool:
 
     # Select city
     city = config.delivery_city or "SYDNEY"
-    browser.evaluate(f"""(function() {{
+    city_result = browser.evaluate(f"""(function() {{
         var options = document.querySelectorAll('a[role=option]');
         for (var i = 0; i < options.length; i++) {{
             if (options[i].innerText.trim() === '{city}') {{
                 options[i].click();
-                return 'selected {city}';
+                return JSON.stringify({{selected: true}});
             }}
         }}
-        return 'city not found';
+        return JSON.stringify({{selected: false}});
     }})()""")
+
+    if not city_result.get("selected"):
+        logger.warning("AU city '%s' not found in dropdown", city)
+        return False
+
     time.sleep(1)
 
     # Click Apply

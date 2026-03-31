@@ -106,41 +106,72 @@ class KeepaClient:
 
         results = []
         for asin, product in valid_pairs:
+            history = self._fetch_one(asin, product, site, domain_code)
+            results.append(history)
+            time.sleep(0.5)
+
+        logger.info("[%s] Keepa tokens remaining: %d", site, self._tokens_left)
+        return results
+
+    def _fetch_one(
+        self, asin: str, product: Product, site: str, domain_code: int, max_retries: int = 2
+    ) -> PriceHistory:
+        """Fetch one product with retry on 429 and JSON parse protection."""
+        for attempt in range(max_retries + 1):
             try:
                 resp = requests.get(
                     f"{API_BASE}/product",
                     params={"key": self._key, "domain": domain_code, "asin": asin},
                     timeout=30,
                 )
-                data = resp.json()
+
+                # Handle 429 — wait for refill and retry
+                if resp.status_code == 429:
+                    if attempt < max_retries:
+                        refill_in = 65  # Default wait
+                        try:
+                            refill_in = resp.json().get("refillIn", 65000) // 1000 + 5
+                        except (ValueError, KeyError):
+                            pass
+                        logger.info("[%s] 429 for %s, waiting %ds (attempt %d/%d)",
+                                     site, asin, refill_in, attempt + 1, max_retries)
+                        time.sleep(refill_in)
+                        continue
+                    logger.warning("[%s] 429 for %s after %d retries", site, asin, max_retries)
+                    return _empty_history(product, site)
+
+                # Parse JSON safely
+                try:
+                    data = resp.json()
+                except (ValueError, requests.exceptions.JSONDecodeError):
+                    logger.warning("[%s] Non-JSON response for %s (status=%d)",
+                                    site, asin, resp.status_code)
+                    return _empty_history(product, site)
+
                 self._tokens_left = data.get("tokensLeft", self._tokens_left)
 
                 if resp.status_code != 200 or "error" in data:
                     logger.warning("[%s] Keepa error for %s: %s",
                                     site, asin, data.get("error", resp.status_code))
-                    results.append(_empty_history(product, site))
-                    continue
+                    return _empty_history(product, site)
 
                 raw_products = data.get("products", [])
                 if not raw_products:
-                    results.append(_empty_history(product, site))
-                    continue
+                    return _empty_history(product, site)
 
                 history = _parse_from_csv(product, site, raw_products[0])
-                results.append(history)
                 logger.debug("[%s] %s: buybox=%s, amz=%s",
-                              site, product.model,
-                              history.buybox_current, history.amz_current)
+                              site, product.model, history.buybox_current, history.amz_current)
+                return history
 
+            except requests.exceptions.RequestException as e:
+                logger.error("[%s] Network error for %s: %s", site, asin, e)
+                return _empty_history(product, site)
             except Exception as e:
-                logger.error("[%s] Error fetching %s: %s", site, asin, e)
-                results.append(_empty_history(product, site))
+                logger.error("[%s] Unexpected error for %s: %s", site, asin, e)
+                return _empty_history(product, site)
 
-            # Brief pause between requests
-            time.sleep(0.5)
-
-        logger.info("[%s] Keepa tokens remaining: %d", site, self._tokens_left)
-        return results
+        return _empty_history(product, site)
 
 
 def _parse_from_csv(product: Product, site: str, raw: dict) -> PriceHistory:

@@ -1,5 +1,6 @@
 """YAML config loading and validation for amz-scout."""
 
+import os
 from pathlib import Path
 
 import yaml
@@ -116,7 +117,13 @@ def validate_config(
 def update_marketplace_override(
     config_path: Path, model: str, marketplace: str, asin: str
 ) -> None:
-    """Update a product's marketplace_overrides in the YAML config file (auto-writeback)."""
+    """Update a product's marketplace_overrides in the YAML config file.
+
+    Uses atomic temp-file write to prevent data loss on crash.
+    Preserves original file content via YAML round-trip (load + dump).
+    """
+    import tempfile
+
     with open(config_path) as f:
         raw = yaml.safe_load(f)
 
@@ -126,5 +133,14 @@ def update_marketplace_override(
             overrides.setdefault(marketplace, {})["asin"] = asin
             break
 
-    with open(config_path, "w") as f:
-        yaml.dump(raw, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+    # Atomic write: write to temp file, then rename
+    tmp_fd, tmp_path = tempfile.mkstemp(
+        dir=config_path.parent, suffix=".yaml.tmp"
+    )
+    try:
+        with os.fdopen(tmp_fd, "w") as f:
+            yaml.dump(raw, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+        Path(tmp_path).replace(config_path)
+    except Exception:
+        Path(tmp_path).unlink(missing_ok=True)
+        raise
