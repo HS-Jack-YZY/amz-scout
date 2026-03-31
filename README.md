@@ -279,7 +279,9 @@ output/<project>/data/
 ## Keepa API 说明
 
 - Pro plan：60 tokens，1 token/min refill
-- 每个产品查询消耗约 5 tokens（含 stats + offers + buybox）
-- 全量采集（8 站 × 17 产品 = 680 tokens）需要分多次运行
+- 默认模式：**1 token/产品**（价格历史 + 月销量 + Buy Box 信息）
+- `--detailed` 模式：~5 tokens/产品（额外含卖家列表 + 预计算统计）
+- 全量默认采集（8 站 × 17 产品 = 136 tokens）约 2 小时 refill
 - `--data-only` 模式不消耗 Keepa token
 - 工具内置自动等待 token refill 逻辑
+- Raw JSON 保存在 `data/{region}/raw/` 目录，以后可重新解析无需花 token

@@ -7,7 +7,7 @@ Strategy:
   for seller count, FBA breakdown, and pre-computed stats.
 """
 
-import json as json_mod
+import json as json
 import logging
 import os
 import time
@@ -194,7 +194,7 @@ def _save_raw(raw_dir: Path, site: str, asin: str, product_data: dict) -> None:
     raw_dir.mkdir(parents=True, exist_ok=True)
     path = raw_dir / f"{site.lower()}_{asin}.json"
     with open(path, "w", encoding="utf-8") as f:
-        json_mod.dump(product_data, f, ensure_ascii=False, separators=(",", ":"))
+        json.dump(product_data, f, ensure_ascii=False, separators=(",", ":"))
     logger.debug("Saved raw JSON: %s", path)
 
 

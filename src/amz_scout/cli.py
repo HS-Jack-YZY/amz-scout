@@ -18,6 +18,8 @@ from amz_scout.config import (
     validate_config,
 )
 from amz_scout.csv_io import (
+    merge_competitive,
+    merge_price_history,
     read_competitive_data,
     read_price_history,
     write_competitive_data,
@@ -161,11 +163,7 @@ def _scrape_price_history(
             console.print(f"  [cyan]{site}[/]: {has_data}/{len(histories)} with price")
             data_dir = output_base / "data" / mp_config.region
             csv_path = data_dir / f"{site.lower()}_price_history.csv"
-            # Merge with existing
-            existing = read_price_history(csv_path)
-            existing_keys = {(r.date, r.site, r.model) for r in histories}
-            merged = [r for r in existing if (r.date, r.site, r.model) not in existing_keys]
-            merged.extend(histories)
+            merged = merge_price_history(read_price_history(csv_path), histories)
             write_price_history(merged, csv_path)
 
     if keepa:
@@ -272,12 +270,7 @@ def _save_competitive(
     """Save competitive data CSV, merging with existing data if present."""
     data_dir = output_base / "data" / mp_config.region
     csv_path = data_dir / f"{site.lower()}_competitive_data.csv"
-
-    # Merge: new results replace existing rows with same (date, site, model)
-    existing = read_competitive_data(csv_path)
-    existing_keys = {(r.date, r.site, r.model) for r in results}
-    merged = [r for r in existing if (r.date, r.site, r.model) not in existing_keys]
-    merged.extend(results)
+    merged = merge_competitive(read_competitive_data(csv_path), results)
     write_competitive_data(merged, csv_path)
 
 
