@@ -83,6 +83,15 @@ class PriceHistory:
     new_avg90: float | None = None
     # Sales rank
     sales_rank: int | None = None
+    # Monthly sold (from Keepa monthlySoldHistory — much more precise than Amazon's "100+ bought")
+    monthly_sold: int | None = None
+    # Buy Box info
+    buybox_is_amazon: str = ""    # "True" / "False"
+    buybox_is_fba: str = ""       # "True" / "False"
+    buybox_seller_id: str = ""    # Keepa seller ID
+    # Seller count (from offers)
+    seller_count: int | None = None
+    fba_seller_count: int | None = None
 
 
 @dataclass(frozen=True)

@@ -121,7 +121,14 @@ class KeepaClient:
             try:
                 resp = requests.get(
                     f"{API_BASE}/product",
-                    params={"key": self._key, "domain": domain_code, "asin": asin},
+                    params={
+                        "key": self._key,
+                        "domain": domain_code,
+                        "asin": asin,
+                        "stats": 90,
+                        "offers": 20,
+                        "buybox": 1,
+                    },
                     timeout=30,
                 )
 
@@ -159,7 +166,7 @@ class KeepaClient:
                 if not raw_products:
                     return _empty_history(product, site)
 
-                history = _parse_from_csv(product, site, raw_products[0])
+                history = _parse_product(product, site, raw_products[0])
                 logger.debug("[%s] %s: buybox=%s, amz=%s",
                               site, product.model, history.buybox_current, history.amz_current)
                 return history
@@ -174,70 +181,66 @@ class KeepaClient:
         return _empty_history(product, site)
 
 
-def _parse_from_csv(product: Product, site: str, raw: dict) -> PriceHistory:
-    """Parse price history from the csv arrays (raw time series data).
+def _parse_product(product: Product, site: str, raw: dict) -> PriceHistory:
+    """Parse Keepa product response using pre-computed stats (Pro plan).
 
-    Computes current/lowest/highest/avg from the raw data points since
-    the free API plan doesn't include pre-computed stats.
+    Uses stats=90 for min/max/avg, offers for seller count,
+    buybox for Buy Box info, and monthlySoldHistory for sales volume.
     """
+    stats = raw.get("stats", {})
     csv_data = raw.get("csv", [])
-    if not csv_data:
-        return _empty_history(product, site)
 
-    def summarize(type_index: int) -> dict[str, float | None]:
-        """Compute current/lowest/highest/avg90 from a csv series."""
-        if type_index >= len(csv_data) or not csv_data[type_index]:
-            return {"current": None, "lowest": None, "highest": None, "avg90": None}
+    # ─── Price stats (pre-computed by Keepa, much more reliable than manual calc) ───
+    cur = stats.get("current", [])
+    avg90 = stats.get("avg90", [])
+    mn = stats.get("min", [])
+    mx = stats.get("max", [])
 
-        arr = csv_data[type_index]
-        points = []
-        for i in range(0, len(arr) - 1, 2):
-            price_cents = arr[i + 1]
-            if price_cents == -1:
-                continue
-            points.append(price_cents)
+    def s_cur(idx: int) -> float | None:
+        return cents_to_price(cur[idx]) if len(cur) > idx else None
 
-        if not points:
-            return {"current": None, "lowest": None, "highest": None, "avg90": None}
+    def s_avg(idx: int) -> float | None:
+        return cents_to_price(avg90[idx]) if len(avg90) > idx else None
 
-        # Filter extreme outliers (likely data errors): keep within 5x-0.2x of median
-        sorted_prices = sorted(points)
-        median = sorted_prices[len(sorted_prices) // 2]
-        filtered = [p for p in points if median * 0.2 <= p <= median * 5]
-        if not filtered:
-            filtered = points
+    def s_min(idx: int) -> float | None:
+        if len(mn) > idx and mn[idx]:
+            v = mn[idx]
+            return cents_to_price(v[1]) if isinstance(v, (list, tuple)) and len(v) >= 2 else cents_to_price(v)
+        return None
 
-        current_cents = arr[-1] if arr[-1] != -1 else None
-        return {
-            "current": cents_to_price(current_cents),
-            "lowest": cents_to_price(min(filtered)),
-            "highest": cents_to_price(max(filtered)),
-            "avg90": cents_to_price(int(sum(filtered) / len(filtered))),
-        }
+    def s_max(idx: int) -> float | None:
+        if len(mx) > idx and mx[idx]:
+            v = mx[idx]
+            return cents_to_price(v[1]) if isinstance(v, (list, tuple)) and len(v) >= 2 else cents_to_price(v)
+        return None
 
-    # CSV indices: 0=Amazon, 1=New3P, 2=Used, 3=SalesRank, 4=ListPrice
-    # Buy Box requires higher API plan (csv[18]), not available on basic plan.
-    # We use Amazon + New 3P as the primary price indicators.
-    amazon = summarize(0)   # Amazon direct
-    new_3p = summarize(1)   # 3rd party new (lowest)
+    # Index: 0=Amazon, 1=New3P, 3=SalesRank (not a price)
+    # Buy Box: derive from Amazon or New 3P
+    amz_cur, new_cur = s_cur(0), s_cur(1)
+    bb_cur = amz_cur or new_cur
 
-    # Buy Box: try csv[18] if available, otherwise derive from Amazon/New3P
-    buybox_data = summarize(18)  # BUY_BOX_SHIPPING (may be empty on basic plan)
-    if buybox_data["current"] is None:
-        # Fallback: use the lower of Amazon and New 3P as a proxy
-        buybox_data = {
-            "current": amazon["current"] or new_3p["current"],
-            "lowest": _min_none(amazon["lowest"], new_3p["lowest"]),
-            "highest": _max_none(amazon["highest"], new_3p["highest"]),
-            "avg90": amazon["avg90"] or new_3p["avg90"],
-        }
-
-    # Sales rank from csv[3]
+    # ─── Sales rank from csv[3] (more current than stats) ───
     sales_rank = None
     if len(csv_data) > 3 and csv_data[3]:
         rank_arr = csv_data[3]
         if len(rank_arr) >= 2 and rank_arr[-1] != -1:
             sales_rank = int(rank_arr[-1])
+
+    # ─── Monthly sold (Keepa exclusive — precise unit count) ───
+    monthly_sold = None
+    msh = raw.get("monthlySoldHistory", [])
+    if msh and len(msh) >= 2 and msh[-1] != -1:
+        monthly_sold = int(msh[-1])
+
+    # ─── Buy Box info (from stats + buybox=1) ───
+    bb_is_amazon = str(stats.get("buyBoxIsAmazon", ""))
+    bb_is_fba = str(stats.get("buyBoxIsFBA", ""))
+    bb_seller = stats.get("buyBoxSellerId", "")
+
+    # ─── Seller count (from offers) ───
+    offers = raw.get("offers", [])
+    seller_count = len(offers) if offers else None
+    fba_count = sum(1 for o in offers if o.get("isFBA")) if offers else None
 
     return PriceHistory(
         date=today_iso(),
@@ -246,36 +249,26 @@ def _parse_from_csv(product: Product, site: str, raw: dict) -> PriceHistory:
         brand=product.brand,
         model=product.model,
         asin=product.asin_for(site),
-        buybox_current=buybox_data["current"],
-        buybox_lowest=buybox_data["lowest"],
-        buybox_highest=buybox_data["highest"],
-        buybox_avg90=buybox_data["avg90"],
-        amz_current=amazon["current"],
-        amz_lowest=amazon["lowest"],
-        amz_highest=amazon["highest"],
-        amz_avg90=amazon["avg90"],
-        new_current=new_3p["current"],
-        new_lowest=new_3p["lowest"],
-        new_highest=new_3p["highest"],
-        new_avg90=new_3p["avg90"],
+        buybox_current=bb_cur,
+        buybox_lowest=s_min(0) if s_min(0) else s_min(1),
+        buybox_highest=s_max(0) if s_max(0) else s_max(1),
+        buybox_avg90=s_avg(0) if s_avg(0) else s_avg(1),
+        amz_current=amz_cur,
+        amz_lowest=s_min(0),
+        amz_highest=s_max(0),
+        amz_avg90=s_avg(0),
+        new_current=new_cur,
+        new_lowest=s_min(1),
+        new_highest=s_max(1),
+        new_avg90=s_avg(1),
         sales_rank=sales_rank,
+        monthly_sold=monthly_sold,
+        buybox_is_amazon=bb_is_amazon,
+        buybox_is_fba=bb_is_fba,
+        buybox_seller_id=bb_seller or "",
+        seller_count=seller_count,
+        fba_seller_count=fba_count,
     )
-
-
-def _min_none(a: float | None, b: float | None) -> float | None:
-    if a is None:
-        return b
-    if b is None:
-        return a
-    return min(a, b)
-
-
-def _max_none(a: float | None, b: float | None) -> float | None:
-    if a is None:
-        return b
-    if b is None:
-        return a
-    return max(a, b)
 
 
 def _empty_history(product: Product, site: str) -> PriceHistory:

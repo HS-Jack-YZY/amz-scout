@@ -206,7 +206,23 @@ output/<project>/data/
 | 文件 | 主要字段 |
 |------|---------|
 | `*_competitive_data.csv` | date, site, category, brand, model, asin, title, price, rating, review_count, bought_past_month, bsr, available, url + 库存字段 + Listing 质量字段 |
-| `*_price_history.csv` | date, site, category, brand, model, asin, buybox_current/lowest/highest/avg90, amz_current/lowest/highest/avg90, new_current/lowest/highest/avg90, sales_rank |
+| `*_price_history.csv` | date, site, ...基础字段, buybox/amz/new 价格统计, sales_rank + **月销量 + Buy Box + 卖家字段** |
+
+**价格走势字段（Keepa Pro）：**
+
+| 字段 | 示例 | 说明 |
+|------|------|------|
+| `buybox/amz/new_current` | 135.99 | 当前价格（Buy Box / Amazon 自营 / 第三方新品） |
+| `buybox/amz/new_lowest` | 119.95 | 90 天最低价 |
+| `buybox/amz/new_highest` | 169.99 | 90 天最高价 |
+| `buybox/amz/new_avg90` | 159.93 | 90 天均价 |
+| `sales_rank` | 804 | 当前 Sales Rank |
+| `monthly_sold` | 2000 | **精确月销量**（比 Amazon 的 "100+ bought" 精确得多） |
+| `buybox_is_amazon` | "False" | Buy Box 是否 Amazon 自营 |
+| `buybox_is_fba` | "True" | Buy Box 是否 FBA 发货 |
+| `buybox_seller_id` | "A364119SDJA4QG" | Buy Box 卖家 ID |
+| `seller_count` | 7 | 总卖家数 |
+| `fba_seller_count` | 4 | FBA 卖家数 |
 
 **库存字段：**
 
@@ -262,8 +278,8 @@ output/<project>/data/
 
 ## Keepa API 说明
 
-- 免费 plan：60 tokens，1 token/min refill
-- 每个产品查询消耗 1 token
-- 全量采集（8 站 × 17 产品 = 136 tokens）需要等待约 2 小时 refill
+- Pro plan：60 tokens，1 token/min refill
+- 每个产品查询消耗约 5 tokens（含 stats + offers + buybox）
+- 全量采集（8 站 × 17 产品 = 680 tokens）需要分多次运行
 - `--data-only` 模式不消耗 Keepa token
 - 工具内置自动等待 token refill 逻辑
