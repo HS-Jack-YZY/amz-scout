@@ -12,15 +12,33 @@ amz-scout is a configuration-driven Amazon competitive data scraping tool. It au
 # Install (editable mode)
 pip install -e ".[dev]"
 
-# Run
-amz-scout scrape config/BE10000.yaml           # Full scrape (browser + Keepa)
+# ── Daily workflow ──
+amz-scout scrape config/BE10000.yaml              # Full scrape (browser + Keepa)
 amz-scout scrape config/BE10000.yaml --data-only  # Browser only, no Keepa tokens
-amz-scout scrape config/BE10000.yaml --history-only  # Keepa only, no browser
 amz-scout scrape config/BE10000.yaml -m UK -p "RT-BE58" --headed -v  # Debug single product
-amz-scout discover config/BE10000.yaml          # Find cross-marketplace ASINs
-amz-scout validate config/BE10000.yaml          # Validate config
-amz-scout status config/BE10000.yaml            # Check data completeness
-amz-scout reparse config/BE10000.yaml           # Regenerate CSV from raw JSON (free)
+amz-scout keepa config/BE10000.yaml               # Smart Keepa fetch (default: 7-day cache)
+amz-scout keepa config/BE10000.yaml --lazy        # Use cache no matter how old
+amz-scout keepa config/BE10000.yaml --offline     # DB + raw JSON only, zero API calls
+amz-scout keepa config/BE10000.yaml --fresh       # Force re-fetch from API
+amz-scout keepa config/BE10000.yaml --check       # Show data freshness matrix
+amz-scout keepa --budget                          # Show token balance
+amz-scout discover config/BE10000.yaml            # Find cross-marketplace ASINs
+amz-scout validate config/BE10000.yaml            # Validate config
+amz-scout status config/BE10000.yaml              # Unified: CSV + DB + freshness overview
+
+# ── Query (analysis from DB) ──
+amz-scout query latest config/BE10000.yaml -m UK
+amz-scout query trends config/BE10000.yaml -p "RT-BE58" -m UK --series new
+amz-scout query compare config/BE10000.yaml -p "RT-BE58"
+amz-scout query ranking config/BE10000.yaml -m UK
+amz-scout query availability config/BE10000.yaml
+amz-scout query sellers config/BE10000.yaml -p "RT-BE58" -m UK
+amz-scout query deals config/BE10000.yaml
+
+# ── Admin (one-time operations) ──
+amz-scout admin reparse config/BE10000.yaml       # Regenerate CSV from raw JSON (free)
+amz-scout admin migrate config/BE10000.yaml       # Import legacy data into SQLite
+amz-scout admin merge-dbs                         # Consolidate per-project databases
 
 # Test
 pytest                        # All tests
@@ -38,7 +56,7 @@ ruff format src/ tests/       # Format
 ## Architecture
 
 ```
-cli.py  ─────────────────────────  Typer CLI (5 commands: scrape/discover/validate/status/reparse)
+cli.py  ─────────────────────────  Typer CLI (5 daily + 7 query + 3 admin commands)
   │
   ├─→ config.py                    YAML loading via Pydantic (ProjectConfig + MarketplaceConfig)
   │     reads: config/marketplaces.yaml + config/<project>.yaml
@@ -53,6 +71,9 @@ cli.py  ────────────────────────
   │     └→ marketplace.py          Per-marketplace setup (cookies, delivery address, currency)
   │     └→ scraper/amazon.py       JS extraction from product pages → CompetitiveData dataclass
   │     └→ scraper/search.py       ASIN discovery via search fallback + auto-writeback to YAML
+  │
+  ├─→ freshness.py                  Strategy evaluation (lazy/offline/max-age/fresh) — pure functions
+  ├─→ keepa_service.py              Cache-first orchestration: check DB → read raw JSON or fetch API
   │
   ├─→ csv_io.py                    Read/write/merge CSVs (key: date+site+model)
   ├─→ db.py                        SQLite (WAL mode) with 6 tables, query functions for analysis
@@ -85,11 +106,17 @@ cli.py  ────────────────────────
 ## Output Layout
 
 ```
-output/<project>/data/{region}/
-  ├── raw/{site}_{asin}.json       # Keepa raw responses
-  ├── {site}_competitive_data.csv  # Current Amazon page data
-  └── {site}_price_history.csv     # Keepa 90-day price trends
+output/
+  ├── amz_scout.db                   # Shared SQLite database (all projects)
+  └── <project>/data/{region}/
+      ├── raw/{site}_{asin}.json     # Keepa raw responses (per-project)
+      ├── {site}_competitive_data.csv  # Current Amazon page data
+      └── {site}_price_history.csv     # Keepa 90-day price trends
 ```
+
+- **Database is shared** across projects at `output/amz_scout.db` — Keepa data is ASIN-centric, no need to isolate
+- **CSV and raw JSON remain per-project** for project-specific reports
+- Use `amz-scout admin merge-dbs` to consolidate existing per-project databases
 
 Regions: `eu` (UK/DE/FR/IT/ES/NL), `na` (US/CA/MX), `apac` (JP/AU)
 
