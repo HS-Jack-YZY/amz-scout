@@ -2,11 +2,138 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## What This Is
+## How to Answer User Questions About Amazon Data
 
-amz-scout is a configuration-driven Amazon competitive data scraping tool. It automates collection of product page data (via browser-use CLI) and price history (via Keepa API) across 11 Amazon marketplaces, storing results in CSV + SQLite.
+When the user asks about Amazon product data (prices, trends, rankings, availability), **use the Python API directly** — do not shell out to CLI commands.
 
-## Commands
+### Decision Tree
+
+```
+User asks about product data (prices, trends, competitors, etc.)
+  │
+  ├─ "价格趋势" / "price trend" / "历史价格"
+  │   → query_trends(project, product, marketplace, series)
+  │
+  ├─ "对比" / "compare" / "跨市场"
+  │   → query_compare(project, product)
+  │
+  ├─ "排名" / "ranking" / "BSR"
+  │   → query_ranking(project, marketplace)
+  │
+  ├─ "上架" / "availability" / "哪些国家有卖"
+  │   → query_availability(project)
+  │
+  ├─ "卖家" / "seller" / "Buy Box" / "谁在卖"
+  │   → query_sellers(project, product, marketplace)
+  │
+  ├─ "促销" / "deal" / "折扣"
+  │   → query_deals(project, marketplace)
+  │
+  ├─ "最新数据" / "latest" / "当前价格"
+  │   → query_latest(project, marketplace)
+  │
+  ├─ "数据新鲜度" / "多久没更新" / "freshness"
+  │   → check_freshness(project)
+  │
+  ├─ "Keepa token" / "余额" / "budget"
+  │   → keepa_budget()
+  │
+  ├─ "这个项目有哪些产品" / "配置" / "project info"
+  │   → resolve_project(project)
+  │
+  └─ "刷新数据" / "更新" / "重新获取"
+      → ensure_keepa_data(project, strategy="fresh")
+```
+
+### Calling the API
+
+```python
+from amz_scout.api import (
+    resolve_project, resolve_product, ensure_keepa_data,
+    query_latest, query_trends, query_compare, query_ranking,
+    query_availability, query_sellers, query_deals,
+    check_freshness, keepa_budget,
+)
+```
+
+Every function returns a dict envelope:
+```python
+{"ok": True, "data": [...], "error": None, "meta": {...}}
+{"ok": False, "data": [], "error": "...", "meta": {}}
+```
+
+Always check `result["ok"]` before using `result["data"]`.
+
+### Examples (Chinese + English)
+
+**"GL-Slate 7 在英国的价格趋势"**
+```python
+r = query_trends("BE10000", "Slate 7", "UK", series="new")
+# r["data"] = [{"date": "2026-04-01 02:12", "value": 15099, ...}, ...]
+# value 是 Keepa 编码: 除以 100 得到实际价格 (15099 → £150.99)
+```
+
+**"对比 RT-BE58 在所有市场的价格"**
+```python
+r = query_compare("BE10000", "RT-BE58")
+# r["data"] = [{"site": "UK", "price_cents": 9997, ...}, {"site": "DE", ...}]
+```
+
+**"帮我查一下 BE10000 项目有哪些产品"**
+```python
+r = resolve_project("BE10000")
+# r["data"]["products"] = [{"brand": "GL.iNet", "model": "GL-Slate 7 ...", ...}, ...]
+# r["data"]["target_marketplaces"] = ["UK", "DE", "FR", ...]
+```
+
+**"Keepa 还有多少 token？"**
+```python
+r = keepa_budget()
+# r["data"] = {"tokens_available": 55, "tokens_max": 60, "refill_rate": "1/min"}
+```
+
+**"确保英国的数据是最新的再查"**
+```python
+r = ensure_keepa_data("BE10000", marketplace="UK", strategy="fresh")
+# r["meta"] = {"fetched": 18, "cached": 0, "skipped": 0, "tokens_used": 18, "tokens_remaining": 42}
+# Then query:
+r = query_trends("BE10000", "Slate 7", "UK")
+```
+
+**"数据多久没更新了？"**
+```python
+r = check_freshness("BE10000")
+# r["data"] = [{"model": "GL-Slate 7 ...", "UK": "0d", "DE": "3d", "US": "never"}, ...]
+```
+
+### Key Behaviors to Remember
+
+1. **Auto-fetch**: `query_trends`, `query_sellers`, `query_deals` auto-fetch missing Keepa data by default (LAZY strategy: fetch only if never fetched before, zero tokens if cached). No need to call `ensure_keepa_data` manually for these.
+
+2. **Browser data cannot auto-fetch**: `query_latest`, `query_compare`, `query_ranking`, `query_availability` read from `competitive_snapshots` (browser scrape data). If empty, `meta["hint"]` tells the user to run `amz-scout scrape`.
+
+3. **Marketplace aliases**: All marketplace parameters accept case variants (`"uk"`), Keepa codes (`"GB"`), Amazon domains (`"amazon.co.uk"`), and currency codes (`"GBP"`).
+
+4. **Product resolution**: All product parameters accept model substrings (`"Slate 7"`) or ASINs (`"B0F2MR53D6"`). Case-insensitive.
+
+5. **Token awareness**: Keepa Pro plan has 60 tokens, refills 1/min. Basic queries cost 1 token/product. Always check `keepa_budget()` before suggesting a `strategy="fresh"` refresh.
+
+6. **Price encoding**: Keepa time series `value` is in cents (divide by 100). Rating is ×10 (45 = 4.5 stars). Sales rank is raw integer. value=-1 means unavailable.
+
+### Available Projects
+
+Check `config/` directory for project YAML files. Current projects:
+- `BE10000` — GL.iNet BE10000 竞品分析 (17 products, 8 markets: UK/DE/FR/IT/ES/NL/CA/AU)
+- `test_keepa` — Keepa 功能测试 (5 products, 3 markets: UK/DE/US)
+- `JP_Competitor` — 日本市场竞品
+
+When user doesn't specify a project, use `BE10000` as the default.
+
+---
+
+## Developer Reference
+
+### Commands
 
 ```bash
 # Install (editable mode)
@@ -26,15 +153,6 @@ amz-scout discover config/BE10000.yaml            # Find cross-marketplace ASINs
 amz-scout validate config/BE10000.yaml            # Validate config
 amz-scout status config/BE10000.yaml              # Unified: CSV + DB + freshness overview
 
-# ── Query (analysis from DB) ──
-amz-scout query latest config/BE10000.yaml -m UK
-amz-scout query trends config/BE10000.yaml -p "RT-BE58" -m UK --series new
-amz-scout query compare config/BE10000.yaml -p "RT-BE58"
-amz-scout query ranking config/BE10000.yaml -m UK
-amz-scout query availability config/BE10000.yaml
-amz-scout query sellers config/BE10000.yaml -p "RT-BE58" -m UK
-amz-scout query deals config/BE10000.yaml
-
 # ── Admin (one-time operations) ──
 amz-scout admin reparse config/BE10000.yaml       # Regenerate CSV from raw JSON (free)
 amz-scout admin migrate config/BE10000.yaml       # Import legacy data into SQLite
@@ -42,9 +160,7 @@ amz-scout admin merge-dbs                         # Consolidate per-project data
 
 # Test
 pytest                        # All tests
-pytest tests/test_utils.py    # Single file
-pytest -m unit                # Unit tests only
-pytest -m integration         # Integration tests only
+pytest tests/test_api.py      # API layer tests
 pytest --cov=amz_scout        # With coverage
 
 # Lint
@@ -53,7 +169,7 @@ ruff check --fix src/ tests/  # Auto-fix
 ruff format src/ tests/       # Format
 ```
 
-## Architecture
+### Architecture
 
 ```
 api.py  ─────────────────────────  Programmatic API (strings in, dicts out)
@@ -95,19 +211,19 @@ cli.py  ────────────────────────
 
 6 tables: `competitive_snapshots` (browser data), `keepa_time_series` (price arrays), `keepa_buybox_history`, `keepa_coupon_history`, `keepa_deals`, `keepa_products` (metadata). Series types 0-35 follow Keepa's csv[] indices; 100 = monthly_sold, 200+ = category rankings.
 
-## Config Structure
+### Config Structure
 
 - `config/marketplaces.yaml` — 13 marketplace definitions (domain, Keepa codes, currency, region, postcode)
 - **Keepa support**: 11 of 13 marketplaces have Keepa API support. AU and NL are browser-only (`keepa_domain_code: null`). Valid domain codes are defined in `KEEPA_VALID_DOMAINS` in `config.py`.
 - `config/<project>.yaml` — Product list, target marketplaces, scrape settings (retry_count, delays)
 - Products can have `marketplace_overrides` for per-site ASINs and `search_keywords` for discovery fallback
 
-## External Dependencies
+### External Dependencies
 
 - **browser-use CLI** (`uv tool install browser-use`) — not a pip dependency, called via subprocess
 - **Keepa API** — requires `KEEPA_API_KEY` in `.env`; Pro plan = 60 tokens, 1/min refill
 
-## Output Layout
+### Output Layout
 
 ```
 output/
@@ -120,96 +236,12 @@ output/
 
 - **Database is shared** across projects at `output/amz_scout.db` — Keepa data is ASIN-centric, no need to isolate
 - **CSV and raw JSON remain per-project** for project-specific reports
-- Use `amz-scout admin merge-dbs` to consolidate existing per-project databases
 
 Regions: `eu` (UK/DE/FR/IT/ES/NL), `na` (US/CA/MX), `apac` (JP/AU/IN), `sa` (BR)
 
-## Conventions
+### Conventions
 
 - Python 3.12+, ruff for linting/formatting (line-length 100)
 - Frozen dataclasses for all data models — never mutate, always create new
 - `utils.py` contains parsers (price, rating, BSR) and a `@retry` decorator
 - Marketplace setup logic in `marketplace.py` has per-country address handlers (standard EU, Canada 2-part postcode, Australia postcode+city)
-- Keepa cents encoding: divide by 100 for price; -1 means unavailable
-
-## Programmatic API (api.py)
-
-All functions take simple strings and return a dict envelope:
-```python
-{"ok": True, "data": [...], "error": None, "meta": {...}}
-```
-
-### Usage
-
-```python
-from amz_scout.api import (
-    resolve_project, resolve_product, ensure_keepa_data,
-    query_latest, query_trends, query_compare, query_ranking,
-    query_availability, query_sellers, query_deals,
-    check_freshness, keepa_budget,
-)
-
-# Accept project name ("BE10000") or path ("config/BE10000.yaml")
-info = resolve_project("BE10000")
-# info["data"]["products"], info["data"]["target_marketplaces"]
-
-# Ensure data exists (LAZY = fetch only if missing, zero tokens if cached)
-ensure_keepa_data("BE10000", marketplace="UK")
-
-# Query
-trends = query_trends("BE10000", product="Slate 7", marketplace="UK", series="new")
-# trends["data"] = [{"keepa_ts": ..., "value": ..., "date": "2026-04-01 02:12"}, ...]
-
-compare = query_compare("BE10000", product="RT-BE58")
-budget = keepa_budget()
-```
-
-### Functions
-
-| Function | Args | Returns |
-|----------|------|---------|
-| `resolve_project(project)` | project name or path | products, marketplaces, ASINs |
-| `resolve_product(project, query, marketplace?)` | model substring or ASIN | asin, model, source |
-| `query_latest(project, marketplace?, category?)` | | competitive snapshots |
-| `query_trends(project, product, marketplace, series?, days?, auto_fetch?)` | series: amazon\|new\|used\|sales_rank\|rating\|reviews | time series with dates |
-| `query_compare(project, product)` | | cross-market comparison |
-| `query_ranking(project, marketplace, category?)` | | BSR-sorted products |
-| `query_availability(project)` | | availability matrix |
-| `query_sellers(project, product, marketplace, auto_fetch?)` | | Buy Box seller history |
-| `query_deals(project, marketplace?, auto_fetch?)` | | deal/promotion records |
-| `ensure_keepa_data(project, marketplace?, product?, strategy?)` | strategy: lazy\|offline\|max_age\|fresh | fetch/cache counts, tokens used |
-| `check_freshness(project, marketplace?, product?)` | | freshness matrix (Nd per cell) |
-| `keepa_budget()` | | tokens available/max/refill rate |
-
-### Smart query (auto-fetch)
-
-`query_trends`, `query_sellers`, and `query_deals` have `auto_fetch=True` by default.
-When enabled, missing Keepa data is fetched automatically (LAZY strategy: fetch only if
-completely absent, never re-fetch stale data). The `meta` dict reports what happened:
-
-```python
-r = query_trends("BE10000", "Slate 7", "UK")
-r["meta"]["auto_fetched"]     # True if data was just fetched, False if cached
-r["meta"]["tokens_used"]      # only present if auto_fetched=True
-```
-
-Pass `auto_fetch=False` to skip auto-fetch (pure DB read, like `--offline`).
-
-Browser-data queries (`query_latest`, `query_compare`, `query_ranking`, `query_availability`)
-cannot auto-fetch. When results are empty, `meta["hint"]` explains how to populate data.
-
-### Marketplace aliases
-
-All functions accepting `marketplace` resolve aliases automatically:
-- Case variants: `"uk"`, `"UK"` → `"UK"`
-- Keepa domain codes: `"GB"` → `"UK"`, `"JP"` → `"JP"`
-- Amazon domains: `"amazon.co.uk"` → `"UK"`, `"amazon.de"` → `"DE"`
-- Currency codes: `"GBP"` → `"UK"`, `"JPY"` → `"JP"`
-
-### Product resolution
-
-`resolve_product` and query functions that take `product` accept:
-- Model substrings: `"Slate 7"`, `"RT-BE58"`, `"BE550"` (case-insensitive)
-- Direct ASINs: `"B0F2MR53D6"` (10-char alphanumeric)
-
-Resolution uses the project config's product list first, not the database.
