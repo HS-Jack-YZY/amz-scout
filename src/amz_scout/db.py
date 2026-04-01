@@ -78,7 +78,7 @@ SERIES_NAMES = {
     100: "MONTHLY_SOLD",
 }
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # ─── Connection management ────────────────────────────────────────────
 
@@ -107,16 +107,48 @@ def open_db(db_path: Path):
         conn.close()
 
 
+def resolve_db_path(output_dir: str | None = None) -> Path:
+    """Resolve the shared database path.
+
+    The DB lives at ``output/amz_scout.db`` (one level above per-project dirs).
+    If *output_dir* is an explicit project path like ``output/BE10000``, the DB
+    is placed in its parent (``output/``).
+    """
+    if output_dir:
+        return Path(output_dir).parent / "amz_scout.db"
+    return Path("output") / "amz_scout.db"
+
+
 def init_schema(conn: sqlite3.Connection) -> None:
     """Create all tables and indexes if they don't exist. Idempotent."""
     cur = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_migrations'"
     )
     if cur.fetchone() is not None:
+        _migrate(conn)
         return  # Already initialized
 
     conn.executescript(_SCHEMA_SQL)
     logger.info("Database schema initialized (version %d)", SCHEMA_VERSION)
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Apply incremental schema migrations."""
+    row = conn.execute("SELECT MAX(version) AS v FROM schema_migrations").fetchone()
+    current = row["v"] if row else 0
+
+    if current < 2:
+        # v2: add project column to competitive_snapshots
+        cols = [r["name"] for r in conn.execute("PRAGMA table_info(competitive_snapshots)")]
+        if "project" not in cols:
+            conn.execute(
+                "ALTER TABLE competitive_snapshots ADD COLUMN project TEXT NOT NULL DEFAULT ''"
+            )
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (version, description) "
+            "VALUES (2, 'add project column to competitive_snapshots')"
+        )
+        logger.info("Migrated schema to version 2")
 
 
 _SCHEMA_SQL = """
@@ -126,6 +158,7 @@ CREATE TABLE schema_migrations (
     applied_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
 );
 INSERT INTO schema_migrations (version, description) VALUES (1, 'initial schema');
+INSERT INTO schema_migrations (version, description) VALUES (2, 'add project column to competitive_snapshots');
 
 CREATE TABLE competitive_snapshots (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -158,6 +191,7 @@ CREATE TABLE competitive_snapshots (
     rating_raw      TEXT NOT NULL DEFAULT '',
     review_count_raw TEXT NOT NULL DEFAULT '',
     bsr_raw         TEXT NOT NULL DEFAULT '',
+    project         TEXT NOT NULL DEFAULT '',
     created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
     UNIQUE(asin, site, scraped_at)
 );
@@ -468,12 +502,12 @@ def _insert_deals(
 
 
 def upsert_competitive(
-    conn: sqlite3.Connection, rows: list[CompetitiveData],
+    conn: sqlite3.Connection, rows: list[CompetitiveData], project: str = "",
 ) -> int:
     """Insert or replace competitive snapshots. Returns rows affected."""
     if not rows:
         return 0
-    db_rows = [_competitive_to_db_row(r) for r in rows]
+    db_rows = [_competitive_to_db_row(r, project) for r in rows]
     with conn:
         conn.executemany(
             """INSERT OR REPLACE INTO competitive_snapshots (
@@ -482,21 +516,23 @@ def upsert_competitive(
                 bought_past_month, bsr, available, url,
                 stock_status, stock_count, sold_by, other_offers,
                 coupon, is_prime, star_distribution, image_count, qa_count,
-                fulfillment, price_raw, rating_raw, review_count_raw, bsr_raw
+                fulfillment, price_raw, rating_raw, review_count_raw, bsr_raw,
+                project
             ) VALUES (
                 ?, ?, ?, ?, ?, ?, ?,
                 ?, ?, ?, ?,
                 ?, ?, ?, ?,
                 ?, ?, ?, ?,
                 ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?
+                ?, ?, ?, ?, ?,
+                ?
             )""",
             db_rows,
         )
     return len(db_rows)
 
 
-def _competitive_to_db_row(r: CompetitiveData) -> tuple:
+def _competitive_to_db_row(r: CompetitiveData, project: str = "") -> tuple:
     """Convert CompetitiveData to a DB-ready tuple with type conversions."""
     price_val = parse_price(r.price)
     price_cents = round(price_val * 100) if price_val is not None else None
@@ -546,6 +582,7 @@ def _competitive_to_db_row(r: CompetitiveData) -> tuple:
         r.stock_status, stock_ct, r.sold_by, r.other_offers,
         r.coupon, is_prime, r.star_distribution, img_ct, qa_ct,
         r.fulfillment, r.price, r.rating, r.review_count, r.bsr,
+        project,
     )
 
 
@@ -760,8 +797,6 @@ def query_stats(conn: sqlite3.Connection) -> dict:
     """Database statistics."""
     stats: dict = {}
     for table in sorted(_STAT_TABLES):
-        if table not in _STAT_TABLES:
-            raise ValueError(f"Unknown table: {table}")
         row = conn.execute(f"SELECT COUNT(*) AS cnt FROM {table}").fetchone()  # noqa: S608
         stats[table] = row["cnt"]
 
@@ -781,6 +816,34 @@ def query_stats(conn: sqlite3.Connection) -> dict:
     stats["distinct_sites"] = row["sites"]
 
     return stats
+
+
+# ─── Freshness queries ───────────────────────────────────────────────
+
+
+def query_keepa_fetched_at(
+    conn: sqlite3.Connection,
+    asin_site_pairs: list[tuple[str, str]],
+) -> dict[tuple[str, str], str | None]:
+    """Look up fetched_at for multiple (asin, site) pairs from keepa_products.
+
+    Returns dict mapping each (asin, site) -> fetched_at ISO string,
+    or None if no record exists.
+    """
+    if not asin_site_pairs:
+        return {}
+
+    conditions = " OR ".join(["(asin = ? AND site = ?)"] * len(asin_site_pairs))
+    params = [v for pair in asin_site_pairs for v in pair]
+    rows = conn.execute(
+        f"SELECT asin, site, fetched_at FROM keepa_products WHERE {conditions}",
+        params,
+    ).fetchall()
+
+    result: dict[tuple[str, str], str | None] = {pair: None for pair in asin_site_pairs}
+    for row in rows:
+        result[(row["asin"], row["site"])] = row["fetched_at"]
+    return result
 
 
 # ─── Migration helpers ────────────────────────────────────────────────
