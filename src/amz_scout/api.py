@@ -9,6 +9,7 @@ No exceptions are raised to the caller.  Errors are captured in the envelope.
 """
 
 import logging
+import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import NamedTuple
@@ -70,6 +71,8 @@ KEEPA_EPOCH = datetime(2011, 1, 1)
 KEEPA_TOKEN_MAX = 60
 KEEPA_REFILL_RATE = "1/min"
 
+BROWSER_QUERY_HINT = "No competitive data found. Run 'amz-scout scrape <config>' to populate."
+
 
 # ─── Internal helpers ────────────────────────────────────────────────
 
@@ -80,6 +83,7 @@ class _ProjectInfo(NamedTuple):
     products: list[Product]
     db_path: Path
     output_base: Path
+    marketplace_aliases: dict[str, str]  # lowercase alias → canonical code
 
 
 def _load_project(project: str) -> _ProjectInfo:
@@ -106,7 +110,25 @@ def _load_project(project: str) -> _ProjectInfo:
     db_path = resolve_db_path(config.project.output_dir)
     output_base = Path(config.project.output_dir)
 
-    return _ProjectInfo(config, marketplaces, products, db_path, output_base)
+    # Build marketplace alias map: lowercase variant → canonical code
+    aliases: dict[str, str] = {}
+    for code, mp in marketplaces.items():
+        aliases[code.lower()] = code                          # "uk" → "UK"
+        aliases[mp.keepa_domain.lower()] = code               # "gb" → "UK"
+        aliases[mp.amazon_domain.lower()] = code              # "amazon.co.uk" → "UK"
+        aliases[mp.currency_code.lower()] = code              # "gbp" → "UK"
+
+    return _ProjectInfo(config, marketplaces, products, db_path, output_base, aliases)
+
+
+def _resolve_site(
+    marketplace: str | None,
+    aliases: dict[str, str],
+) -> str | None:
+    """Resolve a marketplace query to canonical code, or pass through as-is."""
+    if marketplace is None:
+        return None
+    return aliases.get(marketplace.lower()) or marketplace
 
 
 def _resolve_asin(
@@ -140,15 +162,46 @@ def _envelope(
     ok: bool,
     data: list | dict | None = None,
     error: str | None = None,
+    hint_if_empty: str | None = None,
     **meta: object,
 ) -> dict:
     """Build the standard response envelope."""
+    if hint_if_empty and not data:
+        meta["hint"] = hint_if_empty
     return {
         "ok": ok,
         "data": data if data is not None else [],
         "error": error,
         "meta": meta,
     }
+
+
+def _auto_fetch(
+    conn: sqlite3.Connection,
+    info: _ProjectInfo,
+    products: list[Product],
+    sites: list[str],
+) -> dict:
+    """Opportunistic LAZY fetch; failures are logged but never block the query."""
+    try:
+        from amz_scout.freshness import FreshnessStrategy
+        from amz_scout.keepa_service import get_keepa_data
+
+        result = get_keepa_data(
+            conn, products, sites, info.marketplaces,
+            strategy=FreshnessStrategy.LAZY,
+            output_base=info.output_base,
+        )
+        if result.fetch_count > 0:
+            return {
+                "auto_fetched": True,
+                "tokens_used": result.tokens_used,
+                "tokens_remaining": result.tokens_remaining,
+            }
+        return {"auto_fetched": False}
+    except Exception:
+        logger.warning("auto_fetch failed, proceeding with cached data")
+        return {"auto_fetched": False, "auto_fetch_error": True}
 
 
 def _add_dates(rows: list[dict]) -> list[dict]:
@@ -234,13 +287,14 @@ def query_latest(
     """Latest competitive snapshot per product/site."""
     try:
         info = _load_project(project)
+        site = _resolve_site(marketplace, info.marketplace_aliases)
         with open_db(info.db_path) as conn:
-            rows = _db_query_latest(conn, site=marketplace, category=category)
+            rows = _db_query_latest(conn, site=site, category=category)
     except Exception as e:
         logger.exception("query_latest failed")
         return _envelope(False, error=str(e))
 
-    return _envelope(True, data=rows, count=len(rows))
+    return _envelope(True, data=rows, hint_if_empty=BROWSER_QUERY_HINT, count=len(rows))
 
 
 def query_trends(
@@ -249,16 +303,26 @@ def query_trends(
     marketplace: str = "UK",
     series: str = "new",
     days: int = 90,
+    auto_fetch: bool = True,
 ) -> dict:
-    """Price/data time series for one product on one marketplace."""
+    """Price/data time series for one product on one marketplace.
+
+    When *auto_fetch* is True (default), missing Keepa data is fetched
+    automatically using the LAZY strategy before querying.
+    """
     try:
         info = _load_project(project)
-        asin, model, _ = _resolve_asin(info.products, product, marketplace)
+        site = _resolve_site(marketplace, info.marketplace_aliases)
+        asin, model, _ = _resolve_asin(info.products, product, site)
         series_type = SERIES_MAP.get(series.lower(), SERIES_NEW)
         series_name = SERIES_NAMES.get(series_type, str(series_type))
 
         with open_db(info.db_path) as conn:
-            rows = query_price_trends(conn, asin, marketplace, series_type, days)
+            fetch_meta = (
+                _auto_fetch(conn, info, [p for p in info.products if p.model == model], [site])
+                if auto_fetch else {}
+            )
+            rows = query_price_trends(conn, asin, site, series_type, days)
 
         rows = _add_dates(rows)
     except Exception as e:
@@ -268,6 +332,7 @@ def query_trends(
     return _envelope(
         True, data=rows,
         asin=asin, model=model, series_name=series_name, count=len(rows),
+        **fetch_meta,
     )
 
 
@@ -281,7 +346,7 @@ def query_compare(project: str, product: str) -> dict:
         logger.exception("query_compare failed")
         return _envelope(False, error=str(e))
 
-    return _envelope(True, data=rows, count=len(rows))
+    return _envelope(True, data=rows, hint_if_empty=BROWSER_QUERY_HINT, count=len(rows))
 
 
 def query_ranking(
@@ -292,13 +357,14 @@ def query_ranking(
     """Products ranked by BSR for a marketplace."""
     try:
         info = _load_project(project)
+        site = _resolve_site(marketplace, info.marketplace_aliases)
         with open_db(info.db_path) as conn:
-            rows = query_bsr_ranking(conn, marketplace, category)
+            rows = query_bsr_ranking(conn, site, category)
     except Exception as e:
         logger.exception("query_ranking failed")
         return _envelope(False, error=str(e))
 
-    return _envelope(True, data=rows, count=len(rows))
+    return _envelope(True, data=rows, hint_if_empty=BROWSER_QUERY_HINT, count=len(rows))
 
 
 def query_availability(project: str) -> dict:
@@ -311,41 +377,68 @@ def query_availability(project: str) -> dict:
         logger.exception("query_availability failed")
         return _envelope(False, error=str(e))
 
-    return _envelope(True, data=rows, count=len(rows))
+    return _envelope(True, data=rows, hint_if_empty=BROWSER_QUERY_HINT, count=len(rows))
 
 
 def query_sellers(
     project: str,
     product: str,
     marketplace: str = "UK",
+    auto_fetch: bool = True,
 ) -> dict:
-    """Buy Box seller history for one product."""
+    """Buy Box seller history for one product.
+
+    When *auto_fetch* is True (default), missing Keepa data is fetched
+    automatically using the LAZY strategy before querying.
+    """
     try:
         info = _load_project(project)
-        asin, model, _ = _resolve_asin(info.products, product, marketplace)
+        site = _resolve_site(marketplace, info.marketplace_aliases)
+        asin, model, _ = _resolve_asin(info.products, product, site)
 
         with open_db(info.db_path) as conn:
-            rows = query_seller_history(conn, asin, marketplace)
+            fetch_meta = (
+                _auto_fetch(conn, info, [p for p in info.products if p.model == model], [site])
+                if auto_fetch else {}
+            )
+            rows = query_seller_history(conn, asin, site)
 
         rows = _add_dates(rows)
     except Exception as e:
         logger.exception("query_sellers failed")
         return _envelope(False, error=str(e))
 
-    return _envelope(True, data=rows, asin=asin, model=model, count=len(rows))
+    return _envelope(True, data=rows, asin=asin, model=model, count=len(rows), **fetch_meta)
 
 
-def query_deals(project: str, marketplace: str | None = None) -> dict:
-    """Deal/promotion history."""
+def query_deals(
+    project: str,
+    marketplace: str | None = None,
+    auto_fetch: bool = True,
+) -> dict:
+    """Deal/promotion history.
+
+    When *auto_fetch* is True (default), missing Keepa data is fetched
+    automatically using the LAZY strategy before querying.
+    For deals, auto-fetch targets only the specified marketplace
+    (or all project marketplaces if None).
+    """
     try:
         info = _load_project(project)
+        site = _resolve_site(marketplace, info.marketplace_aliases)
+
         with open_db(info.db_path) as conn:
-            rows = query_deals_history(conn, site=marketplace)
+            if auto_fetch:
+                fetch_sites = [site] if site else info.config.target_marketplaces
+                fetch_meta = _auto_fetch(conn, info, info.products, fetch_sites)
+            else:
+                fetch_meta = {}
+            rows = query_deals_history(conn, site=site)
     except Exception as e:
         logger.exception("query_deals failed")
         return _envelope(False, error=str(e))
 
-    return _envelope(True, data=rows, count=len(rows))
+    return _envelope(True, data=rows, count=len(rows), **fetch_meta)
 
 
 # ─── Public: Keepa data management ──────────────────────────────────
@@ -381,7 +474,8 @@ def ensure_keepa_data(
             return _envelope(False, error=f"Unknown strategy: {strategy}")
 
         info = _load_project(project)
-        sites = [marketplace] if marketplace else info.config.target_marketplaces
+        site = _resolve_site(marketplace, info.marketplace_aliases)
+        sites = [site] if site else info.config.target_marketplaces
         products = info.products
 
         if product:
@@ -444,7 +538,8 @@ def check_freshness(
         )
 
         info = _load_project(project)
-        sites = [marketplace] if marketplace else info.config.target_marketplaces
+        site = _resolve_site(marketplace, info.marketplace_aliases)
+        sites = [site] if site else info.config.target_marketplaces
         products = info.products
 
         if product:

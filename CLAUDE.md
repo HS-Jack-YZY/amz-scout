@@ -171,15 +171,40 @@ budget = keepa_budget()
 | `resolve_project(project)` | project name or path | products, marketplaces, ASINs |
 | `resolve_product(project, query, marketplace?)` | model substring or ASIN | asin, model, source |
 | `query_latest(project, marketplace?, category?)` | | competitive snapshots |
-| `query_trends(project, product, marketplace, series?, days?)` | series: amazon\|new\|used\|sales_rank\|rating\|reviews | time series with dates |
+| `query_trends(project, product, marketplace, series?, days?, auto_fetch?)` | series: amazon\|new\|used\|sales_rank\|rating\|reviews | time series with dates |
 | `query_compare(project, product)` | | cross-market comparison |
 | `query_ranking(project, marketplace, category?)` | | BSR-sorted products |
 | `query_availability(project)` | | availability matrix |
-| `query_sellers(project, product, marketplace)` | | Buy Box seller history |
-| `query_deals(project, marketplace?)` | | deal/promotion records |
+| `query_sellers(project, product, marketplace, auto_fetch?)` | | Buy Box seller history |
+| `query_deals(project, marketplace?, auto_fetch?)` | | deal/promotion records |
 | `ensure_keepa_data(project, marketplace?, product?, strategy?)` | strategy: lazy\|offline\|max_age\|fresh | fetch/cache counts, tokens used |
 | `check_freshness(project, marketplace?, product?)` | | freshness matrix (Nd per cell) |
 | `keepa_budget()` | | tokens available/max/refill rate |
+
+### Smart query (auto-fetch)
+
+`query_trends`, `query_sellers`, and `query_deals` have `auto_fetch=True` by default.
+When enabled, missing Keepa data is fetched automatically (LAZY strategy: fetch only if
+completely absent, never re-fetch stale data). The `meta` dict reports what happened:
+
+```python
+r = query_trends("BE10000", "Slate 7", "UK")
+r["meta"]["auto_fetched"]     # True if data was just fetched, False if cached
+r["meta"]["tokens_used"]      # only present if auto_fetched=True
+```
+
+Pass `auto_fetch=False` to skip auto-fetch (pure DB read, like `--offline`).
+
+Browser-data queries (`query_latest`, `query_compare`, `query_ranking`, `query_availability`)
+cannot auto-fetch. When results are empty, `meta["hint"]` explains how to populate data.
+
+### Marketplace aliases
+
+All functions accepting `marketplace` resolve aliases automatically:
+- Case variants: `"uk"`, `"UK"` → `"UK"`
+- Keepa domain codes: `"GB"` → `"UK"`, `"JP"` → `"JP"`
+- Amazon domains: `"amazon.co.uk"` → `"UK"`, `"amazon.de"` → `"DE"`
+- Currency codes: `"GBP"` → `"UK"`, `"JPY"` → `"JP"`
 
 ### Product resolution
 

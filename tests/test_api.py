@@ -12,6 +12,7 @@ from amz_scout.api import (
     _envelope,
     _load_project,
     _resolve_asin,
+    _resolve_site,
     check_freshness,
     ensure_keepa_data,
     keepa_budget,
@@ -411,3 +412,131 @@ class TestKeepaBudget:
             pytest.skip("Keepa API key not configured")
         assert "tokens_available" in r["data"]
         assert r["data"]["tokens_max"] == 60
+
+
+# ─── Smart query tests ──────────────────────────────────────────────
+
+
+class TestResolveSite:
+    def test_case_insensitive(self, config_dir):
+        _, proj_path = config_dir
+        info = _load_project(proj_path)
+        assert _resolve_site("uk", info.marketplace_aliases) == "UK"
+        assert _resolve_site("UK", info.marketplace_aliases) == "UK"
+        assert _resolve_site("de", info.marketplace_aliases) == "DE"
+
+    def test_keepa_domain_alias(self, config_dir):
+        _, proj_path = config_dir
+        info = _load_project(proj_path)
+        assert _resolve_site("GB", info.marketplace_aliases) == "UK"
+        assert _resolve_site("gb", info.marketplace_aliases) == "UK"
+
+    def test_amazon_domain_alias(self, config_dir):
+        _, proj_path = config_dir
+        info = _load_project(proj_path)
+        assert _resolve_site("amazon.co.uk", info.marketplace_aliases) == "UK"
+        assert _resolve_site("amazon.de", info.marketplace_aliases) == "DE"
+
+    def test_unknown_passes_through(self, config_dir):
+        _, proj_path = config_dir
+        info = _load_project(proj_path)
+        assert _resolve_site("XX", info.marketplace_aliases) == "XX"
+        assert _resolve_site("unknown", info.marketplace_aliases) == "unknown"
+
+    def test_none_returns_none(self, config_dir):
+        _, proj_path = config_dir
+        info = _load_project(proj_path)
+        assert _resolve_site(None, info.marketplace_aliases) is None
+
+
+class TestAutoFetch:
+    def test_auto_fetch_false_skips_fetch(self, config_dir):
+        """auto_fetch=False should never trigger Keepa API."""
+        _, proj_path = config_dir
+        r = query_trends(proj_path, product="Slate 7", marketplace="UK", auto_fetch=False)
+        assert r["ok"] is True
+        assert "auto_fetched" not in r["meta"]
+
+    def test_auto_fetch_true_reports_status(self, config_dir):
+        """auto_fetch=True should report fetch status in meta."""
+        _, proj_path = config_dir
+        r = query_trends(proj_path, product="Slate 7", marketplace="UK", auto_fetch=True)
+        assert r["ok"] is True
+        assert "auto_fetched" in r["meta"]
+
+    def test_sellers_auto_fetch(self, config_dir):
+        _, proj_path = config_dir
+        r = query_sellers(proj_path, product="Slate 7", marketplace="UK", auto_fetch=True)
+        assert r["ok"] is True
+        assert "auto_fetched" in r["meta"]
+
+    def test_deals_auto_fetch(self, config_dir):
+        _, proj_path = config_dir
+        r = query_deals(proj_path, marketplace="UK", auto_fetch=True)
+        assert r["ok"] is True
+        assert "auto_fetched" in r["meta"]
+
+    def test_deals_auto_fetch_false(self, config_dir):
+        _, proj_path = config_dir
+        r = query_deals(proj_path, marketplace="UK", auto_fetch=False)
+        assert r["ok"] is True
+        assert "auto_fetched" not in r["meta"]
+
+
+class TestMarketplaceAliasInQueries:
+    def test_trends_with_alias(self, config_dir):
+        _, proj_path = config_dir
+        r = query_trends(proj_path, product="Slate 7", marketplace="gb", auto_fetch=False)
+        assert r["ok"] is True
+
+    def test_ranking_with_alias(self, seeded_config):
+        _, proj_path = seeded_config
+        r = query_ranking(proj_path, marketplace="gb")
+        assert r["ok"] is True
+
+    def test_sellers_with_alias(self, config_dir):
+        _, proj_path = config_dir
+        r = query_sellers(proj_path, product="RT-BE58", marketplace="gb", auto_fetch=False)
+        assert r["ok"] is True
+
+    def test_ensure_keepa_data_with_alias(self, config_dir):
+        _, proj_path = config_dir
+        r = ensure_keepa_data(proj_path, marketplace="gb", strategy="offline")
+        assert r["ok"] is True
+
+    def test_check_freshness_with_alias(self, config_dir):
+        _, proj_path = config_dir
+        r = check_freshness(proj_path, marketplace="gb")
+        assert r["ok"] is True
+
+
+class TestBrowserQueryHint:
+    def test_latest_empty_has_hint(self, config_dir):
+        _, proj_path = config_dir
+        r = query_latest(proj_path, marketplace="UK")
+        assert r["ok"] is True
+        assert r["data"] == []
+        assert "hint" in r["meta"]
+        assert "scrape" in r["meta"]["hint"].lower()
+
+    def test_latest_with_data_no_hint(self, seeded_config):
+        _, proj_path = seeded_config
+        r = query_latest(proj_path, marketplace="UK")
+        assert r["ok"] is True
+        assert len(r["data"]) > 0
+        assert "hint" not in r["meta"]
+
+    def test_compare_empty_has_hint(self, config_dir):
+        _, proj_path = config_dir
+        r = query_compare(proj_path, product="NonExistent")
+        assert "hint" in r["meta"]
+
+    def test_ranking_empty_has_hint(self, config_dir):
+        _, proj_path = config_dir
+        r = query_ranking(proj_path, marketplace="UK")
+        assert "hint" in r["meta"]
+
+    def test_availability_empty_has_hint(self, config_dir):
+        _, proj_path = config_dir
+        r = query_availability(proj_path)
+        assert "hint" in r["meta"]
