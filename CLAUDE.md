@@ -56,7 +56,10 @@ ruff format src/ tests/       # Format
 ## Architecture
 
 ```
-cli.py  ─────────────────────────  Typer CLI (5 daily + 7 query + 3 admin commands)
+api.py  ─────────────────────────  Programmatic API (strings in, dicts out)
+  │                                  12 public functions, no exceptions to caller
+  │
+cli.py  ─────────────────────────  Typer CLI (thin shell, delegates to api.py for queries)
   │
   ├─→ config.py                    YAML loading via Pydantic (ProjectConfig + MarketplaceConfig)
   │     reads: config/marketplaces.yaml + config/<project>.yaml
@@ -128,3 +131,60 @@ Regions: `eu` (UK/DE/FR/IT/ES/NL), `na` (US/CA/MX), `apac` (JP/AU/IN), `sa` (BR)
 - `utils.py` contains parsers (price, rating, BSR) and a `@retry` decorator
 - Marketplace setup logic in `marketplace.py` has per-country address handlers (standard EU, Canada 2-part postcode, Australia postcode+city)
 - Keepa cents encoding: divide by 100 for price; -1 means unavailable
+
+## Programmatic API (api.py)
+
+All functions take simple strings and return a dict envelope:
+```python
+{"ok": True, "data": [...], "error": None, "meta": {...}}
+```
+
+### Usage
+
+```python
+from amz_scout.api import (
+    resolve_project, resolve_product, ensure_keepa_data,
+    query_latest, query_trends, query_compare, query_ranking,
+    query_availability, query_sellers, query_deals,
+    check_freshness, keepa_budget,
+)
+
+# Accept project name ("BE10000") or path ("config/BE10000.yaml")
+info = resolve_project("BE10000")
+# info["data"]["products"], info["data"]["target_marketplaces"]
+
+# Ensure data exists (LAZY = fetch only if missing, zero tokens if cached)
+ensure_keepa_data("BE10000", marketplace="UK")
+
+# Query
+trends = query_trends("BE10000", product="Slate 7", marketplace="UK", series="new")
+# trends["data"] = [{"keepa_ts": ..., "value": ..., "date": "2026-04-01 02:12"}, ...]
+
+compare = query_compare("BE10000", product="RT-BE58")
+budget = keepa_budget()
+```
+
+### Functions
+
+| Function | Args | Returns |
+|----------|------|---------|
+| `resolve_project(project)` | project name or path | products, marketplaces, ASINs |
+| `resolve_product(project, query, marketplace?)` | model substring or ASIN | asin, model, source |
+| `query_latest(project, marketplace?, category?)` | | competitive snapshots |
+| `query_trends(project, product, marketplace, series?, days?)` | series: amazon\|new\|used\|sales_rank\|rating\|reviews | time series with dates |
+| `query_compare(project, product)` | | cross-market comparison |
+| `query_ranking(project, marketplace, category?)` | | BSR-sorted products |
+| `query_availability(project)` | | availability matrix |
+| `query_sellers(project, product, marketplace)` | | Buy Box seller history |
+| `query_deals(project, marketplace?)` | | deal/promotion records |
+| `ensure_keepa_data(project, marketplace?, product?, strategy?)` | strategy: lazy\|offline\|max_age\|fresh | fetch/cache counts, tokens used |
+| `check_freshness(project, marketplace?, product?)` | | freshness matrix (Nd per cell) |
+| `keepa_budget()` | | tokens available/max/refill rate |
+
+### Product resolution
+
+`resolve_product` and query functions that take `product` accept:
+- Model substrings: `"Slate 7"`, `"RT-BE58"`, `"BE550"` (case-insensitive)
+- Direct ASINs: `"B0F2MR53D6"` (10-char alphanumeric)
+
+Resolution uses the project config's product list first, not the database.

@@ -1,0 +1,52 @@
+project:
+  name: test_keepa
+  description: Keepa 功能测试 — UK/DE/US 三站 × 5 产品
+  output_dir: output/test_keepa
+target_marketplaces:
+- UK
+- DE
+- US
+settings:
+  retry_count: 3
+  page_load_wait: 3
+  inter_product_delay: 2
+  screenshot_on_error: true
+  headed_mode: false
+  keepa_stats_days: 90
+products:
+- category: Travel Router
+  brand: GL.iNet
+  model: GL-Slate 7 (GL-BE3600)
+  default_asin: B0F2MR53D6
+  search_keywords: GL.iNet Slate 7 GL-BE3600
+- category: Travel Router
+  brand: ASUS
+  model: RT-BE58
+  default_asin: B0FGDRP3VZ
+  search_keywords: ASUS RT-BE58 WiFi 7 travel router
+  marketplace_overrides:
+    UK:
+      asin: B0FGDRP3VZ
+    US:
+      asin: B0FSPQSJGF
+- category: Home Router
+  brand: TP-Link
+  model: Archer BE550 (BE9300)
+  default_asin: B0CT94XNX3
+  search_keywords: TP-Link Archer BE550 WiFi 7
+  marketplace_overrides:
+    US:
+      asin: B0CJSNSVMR
+- category: Home Router
+  brand: NETGEAR
+  model: Nighthawk RS300 (BE9300)
+  default_asin: B0D5F75828
+  search_keywords: NETGEAR Nighthawk RS300 WiFi 7
+  marketplace_overrides:
+    US:
+      asin: B0D4JBGPH4
+- category: Home Router
+  brand: GL.iNet
+  model: Flint3 (GL-BE9300)
+  default_asin: B0FB8X43KJ
+  search_keywords: GL.iNet Flint 3 GL-BE9300
