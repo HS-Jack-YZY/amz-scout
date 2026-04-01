@@ -1,6 +1,8 @@
 """CLI interface for amz-scout."""
 
+import json as json_mod
 import logging
+import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -24,6 +26,12 @@ from amz_scout.csv_io import (
     read_price_history,
     write_competitive_data,
     write_price_history,
+)
+from amz_scout.db import (
+    import_from_csv,
+    import_from_raw_json,
+    open_db,
+    upsert_competitive,
 )
 from amz_scout.marketplace import setup_marketplace
 from amz_scout.models import CompetitiveData, PriceHistory, Product
@@ -99,23 +107,25 @@ def scrape(
     output_base = Path(proj.project.output_dir)
     output_base.mkdir(parents=True, exist_ok=True)
 
-    # ── Price history (Keepa) ──
-    if not data_only:
-        _scrape_price_history(
-            proj, products, target_sites, marketplaces, output_base, headed_mode,
-            detailed=detailed,
-        )
+    db_path = output_base / "amz_scout.db"
+    with open_db(db_path) as db_conn:
+        # ── Price history (Keepa) ──
+        if not data_only:
+            _scrape_price_history(
+                proj, products, target_sites, marketplaces, output_base, headed_mode,
+                detailed=detailed, db_conn=db_conn,
+            )
 
-    # ── Amazon product pages (browser needed) ──
-    if not history_only:
-        if not check_browser_use_installed():
-            console.print("[red]browser-use CLI not found.[/] Install: uv tool install browser-use")
-            raise typer.Exit(1)
+        # ── Amazon product pages (browser needed) ──
+        if not history_only:
+            if not check_browser_use_installed():
+                console.print("[red]browser-use CLI not found.[/] Install: uv tool install browser-use")
+                raise typer.Exit(1)
 
-        _scrape_amazon(
-            proj, products, target_sites, marketplaces,
-            output_base, project_path, headed_mode,
-        )
+            _scrape_amazon(
+                proj, products, target_sites, marketplaces,
+                output_base, project_path, headed_mode, db_conn=db_conn,
+            )
 
     console.print("\n[green bold]Done![/]")
 
@@ -128,6 +138,7 @@ def _scrape_price_history(
     output_base: Path,
     headed: bool = False,
     detailed: bool = False,
+    db_conn=None,
 ) -> None:
     """Fetch Keepa price history."""
     mode_label = "detailed ~5 tok/product" if detailed else "basic 1 tok/product"
@@ -171,6 +182,9 @@ def _scrape_price_history(
             csv_path = data_dir / f"{site.lower()}_price_history.csv"
             merged = merge_price_history(read_price_history(csv_path), histories)
             write_price_history(merged, csv_path)
+            # DB write (fire-and-forget)
+            if db_conn:
+                _store_raw_to_db(db_conn, raw_dir, products, site)
 
     if keepa:
         remaining = keepa.tokens_left
@@ -191,6 +205,7 @@ def _scrape_amazon(
     output_base: Path,
     project_path: Path,
     headed: bool,
+    db_conn=None,
 ) -> None:
     """Scrape Amazon product pages across target marketplaces."""
     console.print("\n[bold]── Amazon Product Pages ──[/]")
@@ -272,7 +287,7 @@ def _scrape_amazon(
                     time.sleep(proj.settings.inter_product_delay)
 
             # Final write
-            _save_competitive(results, output_base, mp_config, site)
+            _save_competitive(results, output_base, mp_config, site, db_conn=db_conn)
             has_price = sum(1 for r in results if r.price not in ("N/A", "", "Currently unavailable"))
             console.print(f"  [green]{site}: {has_price}/{len(results)} with price[/]")
 
@@ -282,7 +297,7 @@ def _scrape_amazon(
         except Exception as e:
             # Save whatever we have so far on unexpected crash
             if results:
-                _save_competitive(results, output_base, mp_config, site)
+                _save_competitive(results, output_base, mp_config, site, db_conn=db_conn)
                 console.print(f"  [yellow]{site}: saved {len(results)} partial results before error[/]")
             console.print(f"  [red]{site}: {e}[/]")
 
@@ -295,12 +310,16 @@ def _save_competitive(
     output_base: Path,
     mp_config: MarketplaceConfig,
     site: str,
+    db_conn=None,
 ) -> None:
     """Save competitive data CSV, merging with existing data if present."""
     data_dir = output_base / "data" / mp_config.region
     csv_path = data_dir / f"{site.lower()}_competitive_data.csv"
     merged = merge_competitive(read_competitive_data(csv_path), results)
     write_competitive_data(merged, csv_path)
+    # DB write (fire-and-forget)
+    if db_conn:
+        _store_competitive_to_db(db_conn, results)
 
 
 @app.command()
@@ -480,6 +499,21 @@ def _validate_results(results: list[CompetitiveData], site: str) -> None:
             console.print(f"    [yellow]! {w}[/]")
 
 
+def _store_raw_to_db(db_conn, raw_dir: Path, products: list[Product], site: str) -> None:
+    """Import Keepa raw JSON into DB. Failures are logged, not raised."""
+    ok, fail = import_from_raw_json(db_conn, raw_dir, products, site)
+    if fail:
+        console.print(f"  [yellow]DB: {ok} stored, {fail} failed[/]")
+
+
+def _store_competitive_to_db(db_conn, results: list[CompetitiveData]) -> None:
+    """Write browser snapshots to DB. Failures are logged, not raised."""
+    try:
+        upsert_competitive(db_conn, results)
+    except Exception:
+        logging.getLogger(__name__).exception("DB write failed for competitive data")
+
+
 @app.command()
 def reparse(
     project_config: str = typer.Argument(help="Path to project YAML config"),
@@ -495,7 +529,6 @@ def reparse(
     output_base = Path(proj.project.output_dir)
 
     from amz_scout.scraper.keepa import _parse_product, _empty_history
-    import json as json_mod
 
     console.print("[bold]── Reparse from raw JSON ──[/]")
 
@@ -527,7 +560,70 @@ def reparse(
         csv_path = data_dir / f"{site.lower()}_price_history.csv"
         write_price_history(histories, csv_path)
 
+    # Also rebuild DB from raw JSON
+    db_path = output_base / "amz_scout.db"
+    with open_db(db_path) as db_conn:
+        for site in target_sites:
+            mp_config = marketplaces.get(site)
+            if not mp_config:
+                continue
+            raw_dir = output_base / "data" / mp_config.region / "raw"
+            if raw_dir.exists():
+                _store_raw_to_db(db_conn, raw_dir, products, site)
+
     console.print("[green bold]Done![/]")
+
+
+@app.command()
+def migrate(
+    project_config: str = typer.Argument(help="Path to project YAML config"),
+    verbose: bool = typer.Option(False, "-v", "--verbose"),
+) -> None:
+    """Import existing raw JSON + CSV data into SQLite database."""
+    _setup_logging(verbose)
+    project_path, mp_path = _resolve_config_paths(project_config)
+    proj = load_project_config(project_path)
+    marketplaces = load_marketplace_config(mp_path)
+    products = [p.to_product() for p in proj.products]
+    output_base = Path(proj.project.output_dir)
+    db_path = output_base / "amz_scout.db"
+
+    console.print("[bold]── Migrate to SQLite ──[/]")
+    console.print(f"  DB: {db_path}")
+
+    total_keepa, total_competitive = 0, 0
+
+    with open_db(db_path) as db_conn:
+        for site in proj.target_marketplaces:
+            mp_config = marketplaces.get(site)
+            if not mp_config:
+                continue
+
+            # Import Keepa raw JSON
+            raw_dir = output_base / "data" / mp_config.region / "raw"
+            if raw_dir.exists():
+                ok, fail = import_from_raw_json(db_conn, raw_dir, products, site)
+                total_keepa += ok
+                status = f"[green]{ok} products[/]"
+                if fail:
+                    status += f" [yellow]({fail} failed)[/]"
+                console.print(f"  [cyan]{site}[/] Keepa: {status}")
+
+            # Import competitive CSV
+            data_dir = output_base / "data" / mp_config.region
+            csv_path = data_dir / f"{site.lower()}_competitive_data.csv"
+            if csv_path.exists():
+                count = import_from_csv(db_conn, csv_path)
+                total_competitive += count
+                console.print(f"  [cyan]{site}[/] Competitive: [green]{count} rows[/]")
+
+        from amz_scout.db import query_stats
+        stats = query_stats(db_conn)
+
+    console.print(f"\n[green bold]Migration complete![/]")
+    console.print(f"  Keepa products: {total_keepa}")
+    console.print(f"  Competitive rows: {total_competitive}")
+    console.print(f"  Time series data points: {stats.get('keepa_time_series', 0)}")
 
 
 def _count_lines(path: Path) -> int:
@@ -535,6 +631,273 @@ def _count_lines(path: Path) -> int:
         return 0
     with open(path) as f:
         return sum(1 for _ in f) - 1  # Subtract header
+
+
+# ─── Query subcommand group ───────────────────────────────────────────
+
+query_app = typer.Typer(name="query", help="Query the SQLite database")
+app.add_typer(query_app)
+
+
+def _get_db_conn(project_config: str):
+    """Helper to open DB from project config."""
+    project_path, mp_path = _resolve_config_paths(project_config)
+    proj = load_project_config(project_path)
+    db_path = Path(proj.project.output_dir) / "amz_scout.db"
+    if not db_path.exists():
+        console.print(f"[red]Database not found:[/] {db_path}")
+        console.print("Run [bold]amz-scout migrate[/] first.")
+        raise typer.Exit(1)
+    return open_db(db_path), proj
+
+
+def _render_output(rows: list[dict], fmt: str, columns: list[str] | None = None) -> None:
+    """Render query results as table, csv, or json."""
+    if not rows:
+        console.print("[yellow]No data found.[/]")
+        return
+
+    if fmt == "json":
+        console.print(json_mod.dumps(rows, indent=2, ensure_ascii=False, default=str))
+        return
+
+    if fmt == "csv":
+        import csv
+        import io
+        cols = columns or list(rows[0].keys())
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(cols)
+        for row in rows:
+            writer.writerow([row.get(c, "") for c in cols])
+        print(buf.getvalue(), end="")
+        return
+
+    # Default: Rich table
+    cols = columns or list(rows[0].keys())
+    table = Table()
+    for c in cols:
+        table.add_column(c)
+    for row in rows:
+        table.add_row(*[str(row.get(c, "")) for c in cols])
+    console.print(table)
+
+
+@query_app.command("latest")
+def query_latest_cmd(
+    project_config: str = typer.Argument(help="Path to project YAML config"),
+    marketplace: str | None = typer.Option(None, "-m", "--marketplace"),
+    category: str | None = typer.Option(None, "-c", "--category"),
+    fmt: str = typer.Option("table", "--format", help="Output format: table|csv|json"),
+) -> None:
+    """Show latest competitive data per product."""
+    from amz_scout.db import query_latest
+    db_ctx, _ = _get_db_conn(project_config)
+    with db_ctx as conn:
+        rows = query_latest(conn, site=marketplace, category=category)
+    cols = ["site", "brand", "model", "price_cents", "currency", "rating",
+            "review_count", "bsr", "available", "fulfillment"]
+    _render_output(rows, fmt, cols)
+
+
+@query_app.command("trends")
+def query_trends_cmd(
+    project_config: str = typer.Argument(help="Path to project YAML config"),
+    product: str = typer.Option(..., "-p", "--product", help="Product model or ASIN"),
+    marketplace: str = typer.Option("UK", "-m", "--marketplace"),
+    days: int = typer.Option(90, "--days"),
+    series: str = typer.Option("new", "--series", help="Series: amazon|new|used|sales_rank|rating|reviews"),
+    fmt: str = typer.Option("table", "--format", help="Output format: table|csv|json"),
+) -> None:
+    """Show price/data trends for a product over time."""
+    from amz_scout.db import (
+        SERIES_AMAZON, SERIES_BUY_BOX_SHIPPING, SERIES_COUNT_NEW,
+        SERIES_LISTPRICE, SERIES_MONTHLY_SOLD, SERIES_NAMES, SERIES_NEW,
+        SERIES_RATING, SERIES_COUNT_REVIEWS, SERIES_SALES_RANK, SERIES_USED,
+        query_price_trends,
+    )
+
+    series_map = {
+        "amazon": SERIES_AMAZON, "new": SERIES_NEW, "used": SERIES_USED,
+        "sales_rank": SERIES_SALES_RANK, "listprice": SERIES_LISTPRICE,
+        "rating": SERIES_RATING, "reviews": SERIES_COUNT_REVIEWS,
+        "count_new": SERIES_COUNT_NEW, "buybox": SERIES_BUY_BOX_SHIPPING,
+        "monthly_sold": SERIES_MONTHLY_SOLD,
+    }
+    series_type = series_map.get(series.lower(), 1)
+
+    db_ctx, _ = _get_db_conn(project_config)
+    with db_ctx as conn:
+        asin = _resolve_asin(conn, product, marketplace)
+        rows = query_price_trends(conn, asin, marketplace, series_type, days)
+
+    rows = _add_dates(rows)
+
+    series_name = SERIES_NAMES.get(series_type, str(series_type))
+    console.print(f"[bold]{asin} / {marketplace} / {series_name} (last {days} days)[/]")
+    _render_output(rows, fmt, ["date", "value"])
+
+
+@query_app.command("compare")
+def query_compare_cmd(
+    project_config: str = typer.Argument(help="Path to project YAML config"),
+    product: str = typer.Option(..., "-p", "--product", help="Product model substring"),
+    fmt: str = typer.Option("table", "--format", help="Output format: table|csv|json"),
+) -> None:
+    """Compare one product across all marketplaces."""
+    from amz_scout.db import query_cross_market
+    db_ctx, _ = _get_db_conn(project_config)
+    with db_ctx as conn:
+        rows = query_cross_market(conn, product)
+    cols = ["site", "brand", "model", "price_cents", "currency", "rating",
+            "review_count", "bsr", "available"]
+    _render_output(rows, fmt, cols)
+
+
+@query_app.command("ranking")
+def query_ranking_cmd(
+    project_config: str = typer.Argument(help="Path to project YAML config"),
+    marketplace: str = typer.Option(..., "-m", "--marketplace"),
+    category: str | None = typer.Option(None, "-c", "--category"),
+    fmt: str = typer.Option("table", "--format", help="Output format: table|csv|json"),
+) -> None:
+    """Products ranked by BSR for a marketplace."""
+    from amz_scout.db import query_bsr_ranking
+    db_ctx, _ = _get_db_conn(project_config)
+    with db_ctx as conn:
+        rows = query_bsr_ranking(conn, marketplace, category)
+    cols = ["bsr", "brand", "model", "price_cents", "currency", "rating",
+            "review_count"]
+    _render_output(rows, fmt, cols)
+
+
+@query_app.command("availability")
+def query_availability_cmd(
+    project_config: str = typer.Argument(help="Path to project YAML config"),
+    fmt: str = typer.Option("table", "--format", help="Output format: table|csv|json"),
+) -> None:
+    """Availability matrix: all products across all sites."""
+    from amz_scout.db import query_availability
+    db_ctx, _ = _get_db_conn(project_config)
+    with db_ctx as conn:
+        rows = query_availability(conn)
+    _render_output(rows, fmt)
+
+
+@query_app.command("reviews")
+def query_reviews_cmd(
+    project_config: str = typer.Argument(help="Path to project YAML config"),
+    product: str = typer.Option(..., "-p", "--product", help="Product model or ASIN"),
+    marketplace: str = typer.Option("UK", "-m", "--marketplace"),
+    fmt: str = typer.Option("table", "--format", help="Output format: table|csv|json"),
+) -> None:
+    """Review count history for a product."""
+    from amz_scout.db import query_review_growth
+    db_ctx, _ = _get_db_conn(project_config)
+    with db_ctx as conn:
+        asin = _resolve_asin(conn, product, marketplace)
+        rows = query_review_growth(conn, asin, marketplace)
+    rows = _add_dates(rows)
+    console.print(f"[bold]{asin} / {marketplace} / Review Count[/]")
+    _render_output(rows, fmt, ["date", "value"])
+
+
+@query_app.command("sales")
+def query_sales_cmd(
+    project_config: str = typer.Argument(help="Path to project YAML config"),
+    product: str = typer.Option(..., "-p", "--product", help="Product model or ASIN"),
+    marketplace: str = typer.Option("UK", "-m", "--marketplace"),
+    fmt: str = typer.Option("table", "--format", help="Output format: table|csv|json"),
+) -> None:
+    """Monthly sold history for a product."""
+    from amz_scout.db import query_monthly_sales
+    db_ctx, _ = _get_db_conn(project_config)
+    with db_ctx as conn:
+        asin = _resolve_asin(conn, product, marketplace)
+        rows = query_monthly_sales(conn, asin, marketplace)
+    rows = _add_dates(rows)
+    console.print(f"[bold]{asin} / {marketplace} / Monthly Sold[/]")
+    _render_output(rows, fmt, ["date", "value"])
+
+
+@query_app.command("sellers")
+def query_sellers_cmd(
+    project_config: str = typer.Argument(help="Path to project YAML config"),
+    product: str = typer.Option(..., "-p", "--product", help="Product model or ASIN"),
+    marketplace: str = typer.Option("UK", "-m", "--marketplace"),
+    fmt: str = typer.Option("table", "--format", help="Output format: table|csv|json"),
+) -> None:
+    """Buy Box seller history for a product."""
+    from amz_scout.db import query_seller_history
+    db_ctx, _ = _get_db_conn(project_config)
+    with db_ctx as conn:
+        asin = _resolve_asin(conn, product, marketplace)
+        rows = query_seller_history(conn, asin, marketplace)
+    rows = _add_dates(rows)
+    console.print(f"[bold]{asin} / {marketplace} / Buy Box History[/]")
+    _render_output(rows, fmt, ["date", "seller_id"])
+
+
+@query_app.command("deals")
+def query_deals_cmd(
+    project_config: str = typer.Argument(help="Path to project YAML config"),
+    marketplace: str | None = typer.Option(None, "-m", "--marketplace"),
+    fmt: str = typer.Option("table", "--format", help="Output format: table|csv|json"),
+) -> None:
+    """Deal/promotion history."""
+    from amz_scout.db import query_deals_history
+    db_ctx, _ = _get_db_conn(project_config)
+    with db_ctx as conn:
+        rows = query_deals_history(conn, site=marketplace)
+    _render_output(rows, fmt)
+
+
+@query_app.command("stats")
+def query_stats_cmd(
+    project_config: str = typer.Argument(help="Path to project YAML config"),
+) -> None:
+    """Show database statistics."""
+    from amz_scout.db import query_stats
+    db_ctx, _ = _get_db_conn(project_config)
+    with db_ctx as conn:
+        stats = query_stats(conn)
+
+    table = Table(title="Database Statistics")
+    table.add_column("Table")
+    table.add_column("Rows", justify="right")
+    for key, val in stats.items():
+        if key in ("date_range", "distinct_products", "distinct_sites"):
+            continue
+        table.add_row(key, f"{val:,}")
+    console.print(table)
+    console.print(f"  Date range: {stats['date_range']}")
+    console.print(f"  Distinct products: {stats['distinct_products']}")
+    console.print(f"  Distinct sites: {stats['distinct_sites']}")
+
+
+def _resolve_asin(conn: sqlite3.Connection, product: str, marketplace: str) -> str:
+    """Resolve product string to ASIN."""
+    if len(product) == 10 and product.isascii() and product.isalnum():
+        return product
+    row = conn.execute(
+        "SELECT DISTINCT asin FROM keepa_products WHERE model LIKE ? AND site = ?",
+        (f"%{product}%", marketplace),
+    ).fetchone()
+    if row:
+        return row["asin"]
+    console.print(f"[red]Product not found:[/] {product}")
+    raise typer.Exit(1)
+
+
+def _add_dates(rows: list[dict]) -> list[dict]:
+    """Return new list with human-readable date field added from keepa_ts."""
+    from datetime import datetime, timedelta
+    keepa_epoch = datetime(2011, 1, 1)
+    return [
+        {**r, "date": (keepa_epoch + timedelta(minutes=r["keepa_ts"])).strftime("%Y-%m-%d %H:%M")}
+        if "keepa_ts" in r else r
+        for r in rows
+    ]
 
 
 if __name__ == "__main__":

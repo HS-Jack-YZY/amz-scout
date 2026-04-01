@@ -1,0 +1,835 @@
+"""SQLite database layer for amz-scout.
+
+Design principle: store raw facts only, aggregate on demand.
+- keepa_time_series: every data point from Keepa csv[], monthlySoldHistory, salesRanks
+- keepa_products: product metadata snapshot (updated on each fetch)
+- competitive_snapshots: browser scrape observations (one per asin/site/date)
+- keepa_buybox_history, keepa_coupon_history, keepa_deals: specialized time series
+"""
+
+import json as json_mod
+import logging
+import re
+import sqlite3
+from contextlib import contextmanager
+from pathlib import Path
+
+from amz_scout.models import CompetitiveData
+from amz_scout.utils import parse_bsr_routers, parse_price, parse_rating, parse_reviews
+
+logger = logging.getLogger(__name__)
+
+
+# ─── Series type constants (csv[] indices 0-35, then extensions) ──────
+
+SERIES_AMAZON = 0
+SERIES_NEW = 1
+SERIES_USED = 2
+SERIES_SALES_RANK = 3
+SERIES_LISTPRICE = 4
+SERIES_COLLECTIBLE = 5
+SERIES_REFURBISHED = 6
+SERIES_NEW_FBM_SHIPPING = 7
+SERIES_LIGHTNING_DEAL = 8
+SERIES_WAREHOUSE = 9
+SERIES_NEW_FBA = 10
+SERIES_COUNT_NEW = 11
+SERIES_COUNT_USED = 12
+SERIES_COUNT_REFURBISHED = 13
+SERIES_COUNT_COLLECTIBLE = 14
+SERIES_EXTRA_INFO = 15
+SERIES_RATING = 16
+SERIES_COUNT_REVIEWS = 17
+SERIES_BUY_BOX_SHIPPING = 18
+SERIES_USED_NEW_SHIPPING = 19
+SERIES_USED_VERY_GOOD = 20
+SERIES_USED_GOOD = 21
+SERIES_USED_ACCEPTABLE = 22
+SERIES_COLLECTIBLE_NEW = 23
+SERIES_COLLECTIBLE_VERY_GOOD = 24
+SERIES_COLLECTIBLE_GOOD = 25
+SERIES_COLLECTIBLE_ACCEPTABLE = 26
+SERIES_COUNT_NEW_FBM = 27
+SERIES_NEW_PRICE_IS_MAP = 28
+SERIES_USED_LIKE_NEW = 29
+SERIES_COUNT_USED_NEW = 30
+SERIES_COUNT_USED_VERY_GOOD = 31
+SERIES_COUNT_USED_GOOD = 32
+SERIES_COUNT_USED_ACCEPTABLE = 33
+SERIES_COUNT_COLLECTIBLE_NEW = 34
+SERIES_TRADE_IN = 35
+
+SERIES_MONTHLY_SOLD = 100
+SERIES_SALES_RANK_BASE = 200  # 200 + category_index in salesRanks dict
+
+SERIES_NAMES = {
+    0: "AMAZON", 1: "NEW", 2: "USED", 3: "SALES_RANK", 4: "LISTPRICE",
+    5: "COLLECTIBLE", 6: "REFURBISHED", 7: "NEW_FBM_SHIPPING",
+    8: "LIGHTNING_DEAL", 9: "WAREHOUSE", 10: "NEW_FBA",
+    11: "COUNT_NEW", 12: "COUNT_USED", 13: "COUNT_REFURBISHED",
+    14: "COUNT_COLLECTIBLE", 15: "EXTRA_INFO", 16: "RATING",
+    17: "COUNT_REVIEWS", 18: "BUY_BOX_SHIPPING", 19: "USED_NEW_SHIPPING",
+    20: "USED_VERY_GOOD", 21: "USED_GOOD", 22: "USED_ACCEPTABLE",
+    23: "COLLECTIBLE_NEW", 24: "COLLECTIBLE_VERY_GOOD", 25: "COLLECTIBLE_GOOD",
+    26: "COLLECTIBLE_ACCEPTABLE", 27: "COUNT_NEW_FBM", 28: "NEW_PRICE_IS_MAP",
+    29: "USED_LIKE_NEW", 30: "COUNT_USED_NEW", 31: "COUNT_USED_VERY_GOOD",
+    32: "COUNT_USED_GOOD", 33: "COUNT_USED_ACCEPTABLE",
+    34: "COUNT_COLLECTIBLE_NEW", 35: "TRADE_IN",
+    100: "MONTHLY_SOLD",
+}
+
+SCHEMA_VERSION = 1
+
+# ─── Connection management ────────────────────────────────────────────
+
+
+def get_connection(db_path: Path) -> sqlite3.Connection:
+    """Open or create a SQLite database with optimized settings."""
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA synchronous = NORMAL")
+    conn.execute("PRAGMA cache_size = -32000")
+    conn.execute("PRAGMA temp_store = MEMORY")
+    conn.execute("PRAGMA mmap_size = 134217728")
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.row_factory = sqlite3.Row
+    init_schema(conn)
+    return conn
+
+
+@contextmanager
+def open_db(db_path: Path):
+    """Context manager for DB connection lifecycle."""
+    conn = get_connection(db_path)
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+def init_schema(conn: sqlite3.Connection) -> None:
+    """Create all tables and indexes if they don't exist. Idempotent."""
+    cur = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_migrations'"
+    )
+    if cur.fetchone() is not None:
+        return  # Already initialized
+
+    conn.executescript(_SCHEMA_SQL)
+    logger.info("Database schema initialized (version %d)", SCHEMA_VERSION)
+
+
+_SCHEMA_SQL = """
+CREATE TABLE schema_migrations (
+    version     INTEGER PRIMARY KEY,
+    description TEXT NOT NULL DEFAULT '',
+    applied_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+INSERT INTO schema_migrations (version, description) VALUES (1, 'initial schema');
+
+CREATE TABLE competitive_snapshots (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    scraped_at      TEXT NOT NULL,
+    site            TEXT NOT NULL,
+    category        TEXT NOT NULL,
+    brand           TEXT NOT NULL,
+    model           TEXT NOT NULL,
+    asin            TEXT NOT NULL,
+    title           TEXT NOT NULL DEFAULT '',
+    price_cents     INTEGER,
+    currency        TEXT NOT NULL DEFAULT '',
+    rating          REAL,
+    review_count    INTEGER,
+    bought_past_month INTEGER,
+    bsr             INTEGER,
+    available       INTEGER NOT NULL DEFAULT 1,
+    url             TEXT NOT NULL DEFAULT '',
+    stock_status    TEXT NOT NULL DEFAULT '',
+    stock_count     INTEGER,
+    sold_by         TEXT NOT NULL DEFAULT '',
+    other_offers    TEXT NOT NULL DEFAULT '',
+    coupon          TEXT NOT NULL DEFAULT '',
+    is_prime        INTEGER,
+    star_distribution TEXT NOT NULL DEFAULT '',
+    image_count     INTEGER,
+    qa_count        INTEGER,
+    fulfillment     TEXT NOT NULL DEFAULT '',
+    price_raw       TEXT NOT NULL DEFAULT '',
+    rating_raw      TEXT NOT NULL DEFAULT '',
+    review_count_raw TEXT NOT NULL DEFAULT '',
+    bsr_raw         TEXT NOT NULL DEFAULT '',
+    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    UNIQUE(asin, site, scraped_at)
+);
+CREATE INDEX idx_cs_site_date ON competitive_snapshots(site, scraped_at);
+CREATE INDEX idx_cs_brand_model ON competitive_snapshots(brand, model);
+
+CREATE TABLE keepa_time_series (
+    asin            TEXT NOT NULL,
+    site            TEXT NOT NULL,
+    series_type     INTEGER NOT NULL,
+    keepa_ts        INTEGER NOT NULL,
+    value           INTEGER NOT NULL,
+    fetched_at      TEXT NOT NULL,
+    PRIMARY KEY (asin, site, series_type, keepa_ts)
+) WITHOUT ROWID;
+CREATE INDEX idx_kts_site_type ON keepa_time_series(site, series_type);
+CREATE INDEX idx_kts_fetched ON keepa_time_series(fetched_at, asin, site);
+
+CREATE TABLE keepa_buybox_history (
+    asin            TEXT NOT NULL,
+    site            TEXT NOT NULL,
+    keepa_ts        INTEGER NOT NULL,
+    seller_id       TEXT NOT NULL,
+    fetched_at      TEXT NOT NULL,
+    PRIMARY KEY (asin, site, keepa_ts)
+) WITHOUT ROWID;
+CREATE INDEX idx_kbb_seller ON keepa_buybox_history(seller_id, asin, site);
+
+CREATE TABLE keepa_coupon_history (
+    asin            TEXT NOT NULL,
+    site            TEXT NOT NULL,
+    keepa_ts        INTEGER NOT NULL,
+    amount          INTEGER NOT NULL,
+    coupon_type     INTEGER NOT NULL DEFAULT 0,
+    fetched_at      TEXT NOT NULL,
+    PRIMARY KEY (asin, site, keepa_ts)
+) WITHOUT ROWID;
+
+CREATE TABLE keepa_deals (
+    asin            TEXT NOT NULL,
+    site            TEXT NOT NULL,
+    start_time      INTEGER NOT NULL,
+    end_time        INTEGER,
+    deal_type       TEXT NOT NULL,
+    access_type     TEXT NOT NULL DEFAULT 'ALL',
+    badge           TEXT NOT NULL DEFAULT '',
+    percent_claimed INTEGER NOT NULL DEFAULT 0,
+    deal_status     TEXT NOT NULL DEFAULT 'ACTIVE'
+                    CHECK(deal_status IN ('ACTIVE', 'ENDED', 'UNKNOWN')),
+    fetched_at      TEXT NOT NULL,
+    PRIMARY KEY (asin, site, start_time)
+) WITHOUT ROWID;
+
+CREATE TABLE keepa_products (
+    asin                TEXT NOT NULL,
+    site                TEXT NOT NULL,
+    title               TEXT,
+    brand               TEXT,
+    manufacturer        TEXT,
+    model               TEXT,
+    part_number         TEXT,
+    binding             TEXT,
+    product_group       TEXT,
+    product_type        TEXT,
+    color               TEXT,
+    size                TEXT,
+    item_weight         INTEGER,
+    item_height         INTEGER,
+    item_length         INTEGER,
+    item_width          INTEGER,
+    package_weight      INTEGER,
+    package_height      INTEGER,
+    package_length      INTEGER,
+    package_width       INTEGER,
+    features            TEXT,
+    images_csv          TEXT,
+    image_count         INTEGER,
+    included_components TEXT,
+    special_features    TEXT,
+    recommended_uses    TEXT,
+    root_category       INTEGER,
+    category_tree       TEXT,
+    categories          TEXT,
+    sales_rank_ref      INTEGER,
+    ean_list            TEXT,
+    upc_list            TEXT,
+    listed_since        INTEGER,
+    tracking_since      INTEGER,
+    fba_pick_pack_fee   INTEGER,
+    fba_fee_updated     INTEGER,
+    referral_fee_pct    REAL,
+    availability_amazon INTEGER,
+    has_reviews         INTEGER,
+    is_adult            INTEGER,
+    is_sns              INTEGER,
+    new_price_is_map    INTEGER,
+    buybox_eligible_counts TEXT,
+    last_update         INTEGER,
+    last_price_change   INTEGER,
+    last_rating_update  INTEGER,
+    last_sold_update    INTEGER,
+    fetched_at          TEXT NOT NULL,
+    PRIMARY KEY (asin, site)
+);
+"""
+
+
+# ─── Write: Keepa raw JSON → DB ──────────────────────────────────────
+
+
+def store_keepa_product(
+    conn: sqlite3.Connection,
+    asin: str,
+    site: str,
+    raw: dict,
+    fetched_at: str,
+) -> None:
+    """Parse a full Keepa product JSON and write all tables in one transaction."""
+    with conn:
+        _upsert_keepa_product(conn, asin, site, raw, fetched_at)
+        _insert_time_series(conn, asin, site, raw, fetched_at)
+        _insert_buybox_history(conn, asin, site, raw, fetched_at)
+        _insert_coupon_history(conn, asin, site, raw, fetched_at)
+        _insert_deals(conn, asin, site, raw, fetched_at)
+
+
+def _upsert_keepa_product(
+    conn: sqlite3.Connection, asin: str, site: str, raw: dict, fetched_at: str,
+) -> None:
+    fba = raw.get("fbaFees") or {}
+    images = raw.get("images") or []
+    conn.execute(
+        """INSERT OR REPLACE INTO keepa_products (
+            asin, site, title, brand, manufacturer, model, part_number,
+            binding, product_group, product_type, color, size,
+            item_weight, item_height, item_length, item_width,
+            package_weight, package_height, package_length, package_width,
+            features, images_csv, image_count, included_components,
+            special_features, recommended_uses,
+            root_category, category_tree, categories, sales_rank_ref,
+            ean_list, upc_list, listed_since, tracking_since,
+            fba_pick_pack_fee, fba_fee_updated, referral_fee_pct,
+            availability_amazon, has_reviews, is_adult, is_sns, new_price_is_map,
+            buybox_eligible_counts,
+            last_update, last_price_change, last_rating_update, last_sold_update,
+            fetched_at
+        ) VALUES (
+            ?, ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?,
+            ?, ?, ?, ?,
+            ?, ?, ?, ?,
+            ?, ?, ?, ?,
+            ?, ?,
+            ?, ?, ?, ?,
+            ?, ?, ?, ?,
+            ?, ?, ?,
+            ?, ?, ?, ?, ?,
+            ?,
+            ?, ?, ?, ?,
+            ?
+        )""",
+        (
+            asin, site,
+            raw.get("title"), raw.get("brand"), raw.get("manufacturer"),
+            raw.get("model"), raw.get("partNumber"),
+            raw.get("binding"), raw.get("productGroup"),
+            raw.get("type"), raw.get("color"), raw.get("size"),
+            raw.get("itemWeight"), raw.get("itemHeight"),
+            raw.get("itemLength"), raw.get("itemWidth"),
+            raw.get("packageWeight"), raw.get("packageHeight"),
+            raw.get("packageLength"), raw.get("packageWidth"),
+            _json_or_none(raw.get("features")),
+            raw.get("imagesCSV"),
+            len(images) if images else None,
+            raw.get("includedComponents"),
+            _json_or_none(raw.get("specialFeatures")),
+            raw.get("recommendedUsesForProduct"),
+            raw.get("rootCategory"),
+            _json_or_none(raw.get("categoryTree")),
+            _json_or_none(raw.get("categories")),
+            raw.get("salesRankReference"),
+            _json_or_none(raw.get("eanList")),
+            _json_or_none(raw.get("upcList")),
+            raw.get("listedSince"), raw.get("trackingSince"),
+            fba.get("pickAndPackFee"), fba.get("lastUpdate"),
+            raw.get("referralFeePercentage"),
+            raw.get("availabilityAmazon"),
+            int(raw.get("hasReviews", False)),
+            int(raw.get("isAdultProduct", False)),
+            int(raw.get("isSNS", False)),
+            int(raw.get("newPriceIsMAP", False)),
+            _json_or_none(raw.get("buyBoxEligibleOfferCounts")),
+            raw.get("lastUpdate"), raw.get("lastPriceChange"),
+            raw.get("lastRatingUpdate"), raw.get("lastSoldUpdate"),
+            fetched_at,
+        ),
+    )
+
+
+def _insert_time_series(
+    conn: sqlite3.Connection, asin: str, site: str, raw: dict, fetched_at: str,
+) -> None:
+    rows: list[tuple] = []
+
+    # csv[] arrays (indices 0-35)
+    csv_data = raw.get("csv") or []
+    for type_idx in range(min(len(csv_data), 36)):
+        arr = csv_data[type_idx]
+        if not arr:
+            continue
+        for i in range(0, len(arr) - 1, 2):
+            ts, val = arr[i], arr[i + 1]
+            if isinstance(ts, int) and isinstance(val, int):
+                rows.append((asin, site, type_idx, ts, val, fetched_at))
+
+    # monthlySoldHistory
+    msh = raw.get("monthlySoldHistory") or []
+    for i in range(0, len(msh) - 1, 2):
+        ts, val = msh[i], msh[i + 1]
+        if isinstance(ts, int) and isinstance(val, int):
+            rows.append((asin, site, SERIES_MONTHLY_SOLD, ts, val, fetched_at))
+
+    # salesRanks (dict of category_id → [ts, val, ...])
+    sales_ranks = raw.get("salesRanks") or {}
+    for cat_idx, (_, arr) in enumerate(sorted(sales_ranks.items())):
+        series_type = SERIES_SALES_RANK_BASE + cat_idx
+        for i in range(0, len(arr) - 1, 2):
+            ts, val = arr[i], arr[i + 1]
+            if isinstance(ts, int) and isinstance(val, int):
+                rows.append((asin, site, series_type, ts, val, fetched_at))
+
+    if rows:
+        conn.executemany(
+            "INSERT OR IGNORE INTO keepa_time_series "
+            "(asin, site, series_type, keepa_ts, value, fetched_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            rows,
+        )
+
+
+def _insert_buybox_history(
+    conn: sqlite3.Connection, asin: str, site: str, raw: dict, fetched_at: str,
+) -> None:
+    bbh = raw.get("buyBoxSellerIdHistory")
+    if not bbh or not isinstance(bbh, list):
+        return
+    rows = []
+    for i in range(0, len(bbh) - 1, 2):
+        ts = bbh[i]
+        seller = bbh[i + 1]
+        if isinstance(ts, int) and isinstance(seller, str) and seller:
+            rows.append((asin, site, ts, seller, fetched_at))
+    if rows:
+        conn.executemany(
+            "INSERT OR IGNORE INTO keepa_buybox_history "
+            "(asin, site, keepa_ts, seller_id, fetched_at) VALUES (?, ?, ?, ?, ?)",
+            rows,
+        )
+
+
+def _insert_coupon_history(
+    conn: sqlite3.Connection, asin: str, site: str, raw: dict, fetched_at: str,
+) -> None:
+    ch = raw.get("couponHistory")
+    if not ch or not isinstance(ch, list):
+        return
+    rows = []
+    for i in range(0, len(ch) - 2, 3):
+        ts, amount, ctype = ch[i], ch[i + 1], ch[i + 2]
+        if isinstance(ts, int) and isinstance(amount, int):
+            rows.append((asin, site, ts, amount, ctype if isinstance(ctype, int) else 0, fetched_at))
+    if rows:
+        conn.executemany(
+            "INSERT OR IGNORE INTO keepa_coupon_history "
+            "(asin, site, keepa_ts, amount, coupon_type, fetched_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            rows,
+        )
+
+
+def _insert_deals(
+    conn: sqlite3.Connection, asin: str, site: str, raw: dict, fetched_at: str,
+) -> None:
+    deals = raw.get("deals")
+    if not deals or not isinstance(deals, list):
+        return
+    for d in deals:
+        start = d.get("startTime")
+        if not isinstance(start, int):
+            continue
+        end = d.get("endTime")
+        status = "ENDED" if isinstance(end, int) and end > 0 else "ACTIVE"
+        conn.execute(
+            "INSERT OR IGNORE INTO keepa_deals "
+            "(asin, site, start_time, end_time, deal_type, access_type, "
+            "badge, percent_claimed, deal_status, fetched_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                asin, site, start, end if isinstance(end, int) else None,
+                d.get("dealType", "UNKNOWN"), d.get("accessType", "ALL"),
+                d.get("badge", ""), d.get("percentClaimed", 0),
+                status, fetched_at,
+            ),
+        )
+
+
+# ─── Write: CompetitiveData → DB ─────────────────────────────────────
+
+
+def upsert_competitive(
+    conn: sqlite3.Connection, rows: list[CompetitiveData],
+) -> int:
+    """Insert or replace competitive snapshots. Returns rows affected."""
+    if not rows:
+        return 0
+    db_rows = [_competitive_to_db_row(r) for r in rows]
+    with conn:
+        conn.executemany(
+            """INSERT OR REPLACE INTO competitive_snapshots (
+                scraped_at, site, category, brand, model, asin, title,
+                price_cents, currency, rating, review_count,
+                bought_past_month, bsr, available, url,
+                stock_status, stock_count, sold_by, other_offers,
+                coupon, is_prime, star_distribution, image_count, qa_count,
+                fulfillment, price_raw, rating_raw, review_count_raw, bsr_raw
+            ) VALUES (
+                ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?,
+                ?, ?, ?, ?,
+                ?, ?, ?, ?,
+                ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?
+            )""",
+            db_rows,
+        )
+    return len(db_rows)
+
+
+def _competitive_to_db_row(r: CompetitiveData) -> tuple:
+    """Convert CompetitiveData to a DB-ready tuple with type conversions."""
+    price_val = parse_price(r.price)
+    price_cents = round(price_val * 100) if price_val is not None else None
+
+    # Extract currency symbol
+    currency = ""
+    if r.price and r.price not in ("N/A", "", "-"):
+        for sym in ("£", "€", "$", "¥"):
+            if sym in r.price:
+                currency = sym
+                break
+
+    rating_val = parse_rating(r.rating)
+    review_val = parse_reviews(r.review_count)
+    bsr_val = parse_bsr_routers(r.bsr)
+
+    bought = None
+    if r.bought_past_month and r.bought_past_month != "N/A":
+        m = re.search(r"(\d[\d,]*)", r.bought_past_month.replace(",", ""))
+        if m:
+            bought = int(m.group(1))
+
+    available = 0 if r.available in ("Not listed", "Out of stock", "No") else 1
+
+    stock_ct = None
+    if r.stock_count and r.stock_count.isdigit():
+        stock_ct = int(r.stock_count)
+
+    is_prime = None
+    if r.is_prime == "True":
+        is_prime = 1
+    elif r.is_prime == "False":
+        is_prime = 0
+
+    img_ct = int(r.image_count) if r.image_count and r.image_count.isdigit() else None
+
+    qa_ct = None
+    if r.qa_count:
+        m = re.search(r"(\d+)", r.qa_count)
+        if m:
+            qa_ct = int(m.group(1))
+
+    return (
+        r.date, r.site, r.category, r.brand, r.model, r.asin, r.title,
+        price_cents, currency, rating_val, review_val,
+        bought, bsr_val, available, r.url,
+        r.stock_status, stock_ct, r.sold_by, r.other_offers,
+        r.coupon, is_prime, r.star_distribution, img_ct, qa_ct,
+        r.fulfillment, r.price, r.rating, r.review_count, r.bsr,
+    )
+
+
+# ─── Query functions ──────────────────────────────────────────────────
+
+
+def query_latest(
+    conn: sqlite3.Connection,
+    site: str | None = None,
+    category: str | None = None,
+) -> list[dict]:
+    """Latest competitive snapshot per (asin, site)."""
+    sql = """
+        SELECT cs.* FROM competitive_snapshots cs
+        INNER JOIN (
+            SELECT asin, site, MAX(scraped_at) AS max_date
+            FROM competitive_snapshots
+            GROUP BY asin, site
+        ) latest ON cs.asin = latest.asin
+                 AND cs.site = latest.site
+                 AND cs.scraped_at = latest.max_date
+        WHERE 1=1
+    """
+    params: list = []
+    if site:
+        sql += " AND cs.site = ?"
+        params.append(site)
+    if category:
+        sql += " AND cs.category = ?"
+        params.append(category)
+    sql += " ORDER BY cs.category, cs.brand, cs.model, cs.site"
+    return [dict(row) for row in conn.execute(sql, params)]
+
+
+def query_price_trends(
+    conn: sqlite3.Connection,
+    asin: str,
+    site: str,
+    series_type: int = SERIES_NEW,
+    days: int = 90,
+) -> list[dict]:
+    """Time series data points for one product, one series type."""
+    if days:
+        sql = """
+            SELECT keepa_ts, value, fetched_at
+            FROM keepa_time_series
+            WHERE asin = ? AND site = ? AND series_type = ?
+              AND keepa_ts >= (
+                SELECT MAX(keepa_ts) - ? FROM keepa_time_series
+                WHERE asin = ? AND site = ? AND series_type = ?
+              )
+            ORDER BY keepa_ts DESC
+        """
+        cutoff_minutes = days * 24 * 60
+        params = (asin, site, series_type, cutoff_minutes, asin, site, series_type)
+    else:
+        sql = """
+            SELECT keepa_ts, value, fetched_at
+            FROM keepa_time_series
+            WHERE asin = ? AND site = ? AND series_type = ?
+            ORDER BY keepa_ts DESC
+        """
+        params = (asin, site, series_type)
+    return [dict(r) for r in conn.execute(sql, params)]
+
+
+def query_cross_market(
+    conn: sqlite3.Connection,
+    model: str,
+    date: str | None = None,
+) -> list[dict]:
+    """Compare one product across all marketplaces."""
+    if date:
+        sql = """
+            SELECT * FROM competitive_snapshots
+            WHERE model LIKE ? AND scraped_at = ?
+            ORDER BY site
+        """
+        params = [f"%{model}%", date]
+    else:
+        sql = """
+            SELECT cs.* FROM competitive_snapshots cs
+            INNER JOIN (
+                SELECT asin, site, MAX(scraped_at) AS max_date
+                FROM competitive_snapshots
+                WHERE model LIKE ?
+                GROUP BY asin, site
+            ) latest ON cs.asin = latest.asin
+                     AND cs.site = latest.site
+                     AND cs.scraped_at = latest.max_date
+            ORDER BY cs.site
+        """
+        params = [f"%{model}%"]
+    return [dict(row) for row in conn.execute(sql, params)]
+
+
+def query_bsr_ranking(
+    conn: sqlite3.Connection,
+    site: str,
+    category: str | None = None,
+) -> list[dict]:
+    """Products ranked by BSR for a marketplace (latest snapshot)."""
+    sql = """
+        SELECT cs.* FROM competitive_snapshots cs
+        INNER JOIN (
+            SELECT asin, site, MAX(scraped_at) AS max_date
+            FROM competitive_snapshots
+            WHERE site = ?
+            GROUP BY asin, site
+        ) latest ON cs.asin = latest.asin
+                 AND cs.site = latest.site
+                 AND cs.scraped_at = latest.max_date
+        WHERE cs.bsr IS NOT NULL
+    """
+    params: list = [site]
+    if category:
+        sql += " AND cs.category = ?"
+        params.append(category)
+    sql += " ORDER BY cs.bsr ASC"
+    return [dict(row) for row in conn.execute(sql, params)]
+
+
+def query_availability(
+    conn: sqlite3.Connection,
+    date: str | None = None,
+) -> list[dict]:
+    """Availability matrix: all products × all sites."""
+    if date:
+        sql = """
+            SELECT brand, model, asin, site, available, price_cents, currency
+            FROM competitive_snapshots
+            WHERE scraped_at = ?
+            ORDER BY brand, model, site
+        """
+        params = [date]
+    else:
+        sql = """
+            SELECT cs.brand, cs.model, cs.asin, cs.site, cs.available,
+                   cs.price_cents, cs.currency
+            FROM competitive_snapshots cs
+            INNER JOIN (
+                SELECT asin, site, MAX(scraped_at) AS max_date
+                FROM competitive_snapshots
+                GROUP BY asin, site
+            ) latest ON cs.asin = latest.asin
+                     AND cs.site = latest.site
+                     AND cs.scraped_at = latest.max_date
+            ORDER BY cs.brand, cs.model, cs.site
+        """
+        params = []
+    return [dict(row) for row in conn.execute(sql, params)]
+
+
+def query_review_growth(
+    conn: sqlite3.Connection,
+    asin: str,
+    site: str,
+) -> list[dict]:
+    """Review count time series (csv[17] = COUNT_REVIEWS)."""
+    return query_price_trends(conn, asin, site, SERIES_COUNT_REVIEWS, days=0)
+
+
+def query_seller_history(
+    conn: sqlite3.Connection,
+    asin: str,
+    site: str,
+) -> list[dict]:
+    """Buy Box seller history for one product."""
+    sql = """
+        SELECT keepa_ts, seller_id, fetched_at
+        FROM keepa_buybox_history
+        WHERE asin = ? AND site = ?
+        ORDER BY keepa_ts
+    """
+    return [dict(r) for r in conn.execute(sql, (asin, site))]
+
+
+def query_monthly_sales(
+    conn: sqlite3.Connection,
+    asin: str,
+    site: str,
+) -> list[dict]:
+    """Monthly sold history (series_type=100)."""
+    return query_price_trends(conn, asin, site, SERIES_MONTHLY_SOLD, days=0)
+
+
+def query_deals_history(
+    conn: sqlite3.Connection,
+    asin: str | None = None,
+    site: str | None = None,
+) -> list[dict]:
+    """Deal/promotion records."""
+    sql = "SELECT * FROM keepa_deals WHERE 1=1"
+    params: list = []
+    if asin:
+        sql += " AND asin = ?"
+        params.append(asin)
+    if site:
+        sql += " AND site = ?"
+        params.append(site)
+    sql += " ORDER BY start_time DESC"
+    return [dict(r) for r in conn.execute(sql, params)]
+
+
+_STAT_TABLES = frozenset({
+    "competitive_snapshots", "keepa_time_series", "keepa_buybox_history",
+    "keepa_coupon_history", "keepa_deals", "keepa_products",
+})
+
+
+def query_stats(conn: sqlite3.Connection) -> dict:
+    """Database statistics."""
+    stats: dict = {}
+    for table in sorted(_STAT_TABLES):
+        if table not in _STAT_TABLES:
+            raise ValueError(f"Unknown table: {table}")
+        row = conn.execute(f"SELECT COUNT(*) AS cnt FROM {table}").fetchone()  # noqa: S608
+        stats[table] = row["cnt"]
+
+    # Date range
+    row = conn.execute(
+        "SELECT MIN(scraped_at) AS min_date, MAX(scraped_at) AS max_date "
+        "FROM competitive_snapshots"
+    ).fetchone()
+    stats["date_range"] = f"{row['min_date'] or '—'} to {row['max_date'] or '—'}"
+
+    # Distinct products and sites
+    row = conn.execute(
+        "SELECT COUNT(DISTINCT asin) AS products, COUNT(DISTINCT site) AS sites "
+        "FROM keepa_time_series"
+    ).fetchone()
+    stats["distinct_products"] = row["products"]
+    stats["distinct_sites"] = row["sites"]
+
+    return stats
+
+
+# ─── Migration helpers ────────────────────────────────────────────────
+
+
+def import_from_raw_json(
+    conn: sqlite3.Connection,
+    raw_dir: Path,
+    products: list,
+    site: str,
+    fetched_at: str | None = None,
+) -> tuple[int, int]:
+    """Import Keepa data from raw JSON files. Returns (ok, failed) counts."""
+    from amz_scout.utils import today_iso
+    fetched = fetched_at or today_iso()
+    ok, fail = 0, 0
+    for prod in products:
+        asin = prod.asin_for(site)
+        json_path = raw_dir / f"{site.lower()}_{asin}.json"
+        if not json_path.exists():
+            continue
+        try:
+            with open(json_path) as f:
+                raw = json_mod.load(f)
+            store_keepa_product(conn, asin, site, raw, fetched)
+            ok += 1
+        except Exception:
+            logger.exception("Import failed for %s/%s", site, asin)
+            fail += 1
+    return ok, fail
+
+
+def import_from_csv(
+    conn: sqlite3.Connection,
+    csv_path: Path,
+) -> int:
+    """Import competitive data from an existing CSV file. Returns row count."""
+    from amz_scout.csv_io import read_competitive_data
+    rows = read_competitive_data(csv_path)
+    return upsert_competitive(conn, rows)
+
+
+# ─── Helpers ──────────────────────────────────────────────────────────
+
+
+def _json_or_none(val) -> str | None:
+    """Serialize a value to JSON string, or return None if empty."""
+    if val is None:
+        return None
+    if isinstance(val, (list, dict)):
+        return json_mod.dumps(val, ensure_ascii=False) if val else None
+    return str(val)
