@@ -124,7 +124,9 @@ def get_keepa_data(
 
         for site, pf_items in by_site.items():
             mp = marketplaces.get(site)
-            if not mp:
+            if not mp or mp.keepa_domain_code is None:
+                reason = "not configured" if not mp else "Keepa unsupported"
+                _log(f"  [{site}] {reason} — skipping Keepa fetch")
                 for pf in pf_items:
                     outcomes.append(
                         KeepaProductOutcome(

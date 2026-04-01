@@ -94,7 +94,8 @@ cli.py  ────────────────────────
 
 ## Config Structure
 
-- `config/marketplaces.yaml` — 11 marketplace definitions (domain, Keepa codes, currency, region, postcode)
+- `config/marketplaces.yaml` — 13 marketplace definitions (domain, Keepa codes, currency, region, postcode)
+- **Keepa support**: 11 of 13 marketplaces have Keepa API support. AU and NL are browser-only (`keepa_domain_code: null`). Valid domain codes are defined in `KEEPA_VALID_DOMAINS` in `config.py`.
 - `config/<project>.yaml` — Product list, target marketplaces, scrape settings (retry_count, delays)
 - Products can have `marketplace_overrides` for per-site ASINs and `search_keywords` for discovery fallback
 
@@ -118,7 +119,7 @@ output/
 - **CSV and raw JSON remain per-project** for project-specific reports
 - Use `amz-scout admin merge-dbs` to consolidate existing per-project databases
 
-Regions: `eu` (UK/DE/FR/IT/ES/NL), `na` (US/CA/MX), `apac` (JP/AU)
+Regions: `eu` (UK/DE/FR/IT/ES/NL), `na` (US/CA/MX), `apac` (JP/AU/IN), `sa` (BR)
 
 ## Conventions
 

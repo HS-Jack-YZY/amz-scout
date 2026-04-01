@@ -53,7 +53,7 @@ marketplaces:
   NL:
     amazon_domain: "amazon.nl"
     keepa_domain: "NL"
-    keepa_domain_code: 14
+    keepa_domain_code: null  # Keepa does not support NL; browser-only
     currency_code: "EUR"
     currency_symbol: "€"
     price_format: "european"
@@ -91,6 +91,28 @@ marketplaces:
     region: "na"
     delivery_postcode: "06600"
 
+  # ─── South Asia ────────────────────────────
+  IN:
+    amazon_domain: "amazon.in"
+    keepa_domain: "IN"
+    keepa_domain_code: 10
+    currency_code: "INR"
+    currency_symbol: "₹"
+    price_format: "standard"
+    region: "apac"
+    delivery_postcode: "110001"
+
+  # ─── South America ────────────────────────
+  BR:
+    amazon_domain: "amazon.com.br"
+    keepa_domain: "BR"
+    keepa_domain_code: 12
+    currency_code: "BRL"
+    currency_symbol: "R$"
+    price_format: "european"
+    region: "sa"
+    delivery_postcode: "01310-100"
+
   # ─── Asia Pacific ─────────────────────────
   JP:
     amazon_domain: "amazon.co.jp"
@@ -105,7 +127,7 @@ marketplaces:
   AU:
     amazon_domain: "amazon.com.au"
     keepa_domain: "AU"
-    keepa_domain_code: 10
+    keepa_domain_code: null  # Keepa does not support AU; browser-only
     currency_code: "AUD"
     currency_symbol: "$"
     price_format: "standard"
