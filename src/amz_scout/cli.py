@@ -1135,11 +1135,11 @@ def keepa(
 
     console.print(
         f"\n  [dim]{result.cache_count} cached, {result.fetch_count} fetched, "
-        f"{result.skip_count} skipped"
+        f"{result.skip_count} skipped[/]"
     )
     if result.tokens_used > 0:
         console.print(
-            f"  Tokens: {result.tokens_used} used, "
+            f"  [dim]Tokens: {result.tokens_used} used, "
             f"{result.tokens_remaining} remaining[/]"
         )
 
