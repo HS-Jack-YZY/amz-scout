@@ -82,8 +82,12 @@ def get_keepa_data(
     _log = on_progress or (lambda msg: logger.info(msg))
 
     # Step 1: evaluate freshness
+    requested_mode = "detailed" if detailed else "basic"
     fetched_at_map = query_freshness(conn, products, sites)
-    freshness_results = evaluate_freshness(products, sites, fetched_at_map, strategy, max_age_days)
+    freshness_results = evaluate_freshness(
+        products, sites, fetched_at_map, strategy, max_age_days,
+        requested_mode=requested_mode,
+    )
     cache_list, fetch_list, skip_list = partition_by_action(freshness_results)
 
     outcomes: list[KeepaProductOutcome] = []
@@ -158,7 +162,8 @@ def get_keepa_data(
 
             # Store to DB
             if raw_dir:
-                _store_fetched_to_db(conn, raw_dir, site_products, site)
+                _store_fetched_to_db(conn, raw_dir, site_products, site,
+                                     fetch_mode=requested_mode)
 
             # Build outcomes
             history_map = {h.asin: h for h in histories}
@@ -263,8 +268,9 @@ def _store_fetched_to_db(
     raw_dir: Path,
     products: list[Product],
     site: str,
+    fetch_mode: str = "basic",
 ) -> None:
     """Import freshly fetched raw JSON files to DB."""
-    ok, fail = import_from_raw_json(conn, raw_dir, products, site)
+    ok, fail = import_from_raw_json(conn, raw_dir, products, site, fetch_mode=fetch_mode)
     if fail:
         logger.warning("[%s] DB import: %d ok, %d failed", site, ok, fail)

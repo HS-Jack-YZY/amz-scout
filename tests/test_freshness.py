@@ -26,7 +26,7 @@ class TestEvaluateFreshness:
     def test_lazy_uses_cache_when_data_exists(self):
         products = [_product()]
         sites = ["UK"]
-        fetched = {("B0FGDRP3VZ", "UK"): "2025-01-01"}
+        fetched = {("B0FGDRP3VZ", "UK"): ("2025-01-01", "basic")}
         results = evaluate_freshness(
             products,
             sites,
@@ -53,7 +53,7 @@ class TestEvaluateFreshness:
     def test_offline_uses_cache_when_data_exists(self):
         products = [_product()]
         sites = ["UK"]
-        fetched = {("B0FGDRP3VZ", "UK"): "2025-01-01"}
+        fetched = {("B0FGDRP3VZ", "UK"): ("2025-01-01", "basic")}
         results = evaluate_freshness(
             products,
             sites,
@@ -79,7 +79,7 @@ class TestEvaluateFreshness:
     def test_max_age_uses_cache_when_fresh(self):
         products = [_product()]
         sites = ["UK"]
-        fetched = {("B0FGDRP3VZ", "UK"): "2026-03-30"}
+        fetched = {("B0FGDRP3VZ", "UK"): ("2026-03-30", "basic")}
         results = evaluate_freshness(
             products,
             sites,
@@ -94,7 +94,7 @@ class TestEvaluateFreshness:
     def test_max_age_refetches_when_stale(self):
         products = [_product()]
         sites = ["UK"]
-        fetched = {("B0FGDRP3VZ", "UK"): "2026-03-20"}
+        fetched = {("B0FGDRP3VZ", "UK"): ("2026-03-20", "basic")}
         results = evaluate_freshness(
             products,
             sites,
@@ -123,7 +123,7 @@ class TestEvaluateFreshness:
     def test_fresh_always_fetches(self):
         products = [_product()]
         sites = ["UK"]
-        fetched = {("B0FGDRP3VZ", "UK"): "2026-04-01"}
+        fetched = {("B0FGDRP3VZ", "UK"): ("2026-04-01", "basic")}
         results = evaluate_freshness(
             products,
             sites,
@@ -138,10 +138,10 @@ class TestEvaluateFreshness:
         products = [_product("A", "B0AAAAAAA1"), _product("B", "B0BBBBBBB2")]
         sites = ["UK", "DE"]
         fetched = {
-            ("B0AAAAAAA1", "UK"): "2026-03-31",
+            ("B0AAAAAAA1", "UK"): ("2026-03-31", "basic"),
             ("B0AAAAAAA1", "DE"): None,
-            ("B0BBBBBBB2", "UK"): "2026-03-20",
-            ("B0BBBBBBB2", "DE"): "2026-03-31",
+            ("B0BBBBBBB2", "UK"): ("2026-03-20", "basic"),
+            ("B0BBBBBBB2", "DE"): ("2026-03-31", "basic"),
         }
         results = evaluate_freshness(
             products,
@@ -215,3 +215,48 @@ class TestResolveStrategy:
     def test_mutual_exclusivity(self):
         with pytest.raises(ValueError, match="Only one strategy"):
             resolve_strategy(lazy=True, fresh=True)
+
+
+class TestFetchModeUpgrade:
+    """Test that basic cache triggers re-fetch when detailed is requested."""
+
+    def test_basic_cache_with_detailed_request_fetches(self):
+        products = [_product()]
+        sites = ["UK"]
+        fetched = {("B0FGDRP3VZ", "UK"): ("2026-04-01", "basic")}
+        results = evaluate_freshness(
+            products, sites, fetched, FreshnessStrategy.LAZY,
+            today="2026-04-01", requested_mode="detailed",
+        )
+        assert results[0].action == "fetch"
+        assert "basic" in results[0].reason and "detailed" in results[0].reason
+
+    def test_detailed_cache_with_detailed_request_uses_cache(self):
+        products = [_product()]
+        sites = ["UK"]
+        fetched = {("B0FGDRP3VZ", "UK"): ("2026-04-01", "detailed")}
+        results = evaluate_freshness(
+            products, sites, fetched, FreshnessStrategy.LAZY,
+            today="2026-04-01", requested_mode="detailed",
+        )
+        assert results[0].action == "use_cache"
+
+    def test_basic_request_uses_basic_cache(self):
+        products = [_product()]
+        sites = ["UK"]
+        fetched = {("B0FGDRP3VZ", "UK"): ("2026-04-01", "basic")}
+        results = evaluate_freshness(
+            products, sites, fetched, FreshnessStrategy.LAZY,
+            today="2026-04-01", requested_mode="basic",
+        )
+        assert results[0].action == "use_cache"
+
+    def test_detailed_cache_with_basic_request_uses_cache(self):
+        products = [_product()]
+        sites = ["UK"]
+        fetched = {("B0FGDRP3VZ", "UK"): ("2026-04-01", "detailed")}
+        results = evaluate_freshness(
+            products, sites, fetched, FreshnessStrategy.LAZY,
+            today="2026-04-01", requested_mode="basic",
+        )
+        assert results[0].action == "use_cache"

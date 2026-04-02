@@ -42,7 +42,7 @@ class TestQueryKeepaFetchedAt:
     def test_returns_fetched_at(self, conn, raw_data):
         store_keepa_product(conn, "B0F2MR53D6", "UK", raw_data, "2026-03-25")
         result = query_keepa_fetched_at(conn, [("B0F2MR53D6", "UK")])
-        assert result[("B0F2MR53D6", "UK")] == "2026-03-25"
+        assert result[("B0F2MR53D6", "UK")] == ("2026-03-25", "basic")
 
     def test_returns_none_for_missing(self, conn):
         result = query_keepa_fetched_at(conn, [("BXXXXXXXXX", "UK")])
@@ -58,7 +58,7 @@ class TestQueryKeepaFetchedAt:
                 ("BXXXXXXXXX", "UK"),
             ],
         )
-        assert result[("B0F2MR53D6", "UK")] == "2026-03-25"
+        assert result[("B0F2MR53D6", "UK")] == ("2026-03-25", "basic")
         assert result[("B0F2MR53D6", "DE")] is None
         assert result[("BXXXXXXXXX", "UK")] is None
 
@@ -71,4 +71,11 @@ class TestQueryKeepaFetchedAt:
         store_keepa_product(conn, "B0F2MR53D6", "UK", raw_data, "2026-03-20")
         store_keepa_product(conn, "B0F2MR53D6", "UK", raw_data, "2026-03-30")
         result = query_keepa_fetched_at(conn, [("B0F2MR53D6", "UK")])
-        assert result[("B0F2MR53D6", "UK")] == "2026-03-30"
+        assert result[("B0F2MR53D6", "UK")] == ("2026-03-30", "basic")
+
+    def test_fetch_mode_stored(self, conn, raw_data):
+        """fetch_mode is stored and returned correctly."""
+        store_keepa_product(conn, "B0F2MR53D6", "UK", raw_data, "2026-03-25",
+                            fetch_mode="detailed")
+        result = query_keepa_fetched_at(conn, [("B0F2MR53D6", "UK")])
+        assert result[("B0F2MR53D6", "UK")] == ("2026-03-25", "detailed")

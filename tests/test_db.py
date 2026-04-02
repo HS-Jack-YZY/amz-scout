@@ -83,11 +83,11 @@ class TestSchema:
     def test_init_schema_idempotent(self, conn):
         init_schema(conn)  # Second call should not raise
         row = conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()
-        assert row[0] == 3  # v1 initial + v2 project column + v3 product registry
+        assert row[0] == 4  # v1 + v2 + v3 + v4
 
     def test_schema_version(self, conn):
         row = conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()
-        assert row[0] == 3
+        assert row[0] == 4
 
 
 # ─── Keepa write tests ──────────────────────────────────────────────

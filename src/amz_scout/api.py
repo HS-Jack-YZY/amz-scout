@@ -258,6 +258,26 @@ def _auto_fetch(
         return {"auto_fetched": False, "auto_fetch_error": True}
 
 
+def _try_mark_not_listed(
+    conn: sqlite3.Connection, asin: str, site: str,
+) -> None:
+    """If this ASIN is in the product registry, mark it as not_listed."""
+    try:
+        from amz_scout.db import update_asin_status
+
+        row = conn.execute(
+            "SELECT product_id FROM product_asins WHERE asin = ? AND marketplace = ?",
+            (asin, site),
+        ).fetchone()
+        if row:
+            update_asin_status(
+                conn, row["product_id"], site, "not_listed",
+                notes="Keepa returned no title or price data",
+            )
+    except Exception:
+        logger.warning("Failed to mark ASIN %s/%s as not_listed", asin, site)
+
+
 def _add_dates(rows: list[dict]) -> list[dict]:
     """Return new list with human-readable date field from keepa_ts."""
     return [
@@ -309,8 +329,8 @@ def resolve_project(project: str) -> dict:
 
 
 def resolve_product(
-    project: str,
-    query_str: str,
+    project: str | None = None,
+    query_str: str = "",
     marketplace: str | None = None,
 ) -> dict:
     """Resolve a product query string to ASIN and model info.
@@ -319,8 +339,10 @@ def resolve_product(
     fragments.  Returns the resolved ASIN for the given marketplace.
     """
     try:
-        info = _load_project(project)
-        asin, model, source = _resolve_asin(info.products, query_str, marketplace)
+        info = _resolve_context(project, marketplace=marketplace)
+        site = _resolve_site(marketplace, info.marketplace_aliases)
+        with open_db(info.db_path) as conn:
+            asin, model, source = _resolve_asin(info.products, query_str, site, conn=conn)
     except Exception as e:
         logger.exception("resolve_product failed")
         return _envelope(False, error=str(e))
@@ -559,33 +581,62 @@ def ensure_keepa_data(
                 output_base=info.output_base,
             )
 
-        outcomes = [
-            {
-                "asin": o.asin,
-                "site": o.site,
-                "model": o.model,
-                "source": o.source,
-                "age_days": o.freshness.age_days,
-            }
-            for o in result.outcomes
-        ]
+            outcomes = [
+                {
+                    "asin": o.asin,
+                    "site": o.site,
+                    "model": o.model,
+                    "source": o.source,
+                    "age_days": o.freshness.age_days,
+                }
+                for o in result.outcomes
+            ]
+
+            # Post-fetch validation: check for empty/invalid data
+            warnings: list[str] = []
+            fetched_outcomes = [o for o in result.outcomes if o.source == "fetched"]
+            if fetched_outcomes:
+                conds = " OR ".join(["(asin = ? AND site = ?)"] * len(fetched_outcomes))
+                title_params: list = [v for o in fetched_outcomes for v in (o.asin, o.site)]
+                title_rows = conn.execute(
+                    f"SELECT asin, site, title FROM keepa_products WHERE {conds}",
+                    title_params,
+                ).fetchall()
+                title_map = {(r["asin"], r["site"]): r["title"] or "" for r in title_rows}
+
+                for o in fetched_outcomes:
+                    title = title_map.get((o.asin, o.site), "")
+                    has_csv = o.price_history and (
+                        o.price_history.buybox_current is not None
+                        or o.price_history.new_current is not None
+                    )
+                    if not title and not has_csv:
+                        brand = o.freshness.brand
+                        warnings.append(
+                            f"{o.model} / {o.site} ({o.asin}): "
+                            "ASIN has no data — likely wrong or not listed. "
+                            f"Call discover_asin('{brand}', '{o.model}', "
+                            f"'{o.site}') to search for the correct ASIN."
+                        )
+                        _try_mark_not_listed(conn, o.asin, o.site)
+
     except ValueError as e:
-        # Keepa API key not configured, etc.
         logger.warning("ensure_keepa_data: %s", e)
         return _envelope(False, data={"outcomes": []}, error=str(e))
     except Exception as e:
         logger.exception("ensure_keepa_data failed")
         return _envelope(False, data={"outcomes": []}, error=str(e))
 
-    return _envelope(
-        True,
-        data={"outcomes": outcomes},
-        fetched=result.fetch_count,
-        cached=result.cache_count,
-        skipped=result.skip_count,
-        tokens_used=result.tokens_used,
-        tokens_remaining=result.tokens_remaining,
-    )
+    meta: dict = {
+        "fetched": result.fetch_count,
+        "cached": result.cache_count,
+        "skipped": result.skip_count,
+        "tokens_used": result.tokens_used,
+        "tokens_remaining": result.tokens_remaining,
+    }
+    if warnings:
+        meta["warnings"] = warnings
+    return _envelope(True, data={"outcomes": outcomes}, **meta)
 
 
 def check_freshness(
@@ -942,4 +993,102 @@ def validate_asins(
         True, data=results_list,
         verified=verified, wrong_product=wrong, not_listed=not_listed,
         skipped=skipped, total=len(results_list),
+    )
+
+
+def discover_asin(
+    brand: str,
+    model: str,
+    marketplace: str,
+    search_keywords: str = "",
+    headed: bool = False,
+    db_path: Path | str | None = None,
+) -> dict:
+    """Search Amazon to find the correct ASIN for a product on a marketplace.
+
+    This is a **slow** operation (10-30 seconds) that launches a browser.
+    Requires ``browser-use`` CLI to be installed.
+
+    On success, writes the found ASIN to ``product_asins`` with status
+    ``unverified``.  Call ``validate_asins()`` afterwards to confirm via
+    Keepa title matching.
+
+    Returns envelope with the found ASIN, or error if not found.
+    """
+    try:
+        from amz_scout.browser import BrowserSession, check_browser_use_installed
+        from amz_scout.marketplace import setup_marketplace
+
+        if not check_browser_use_installed():
+            return _envelope(False, error="browser-use CLI not installed. Install: uv tool install browser-use")
+
+        # Load marketplace config
+        mp_path = CONFIG_DIR / "marketplaces.yaml"
+        if not mp_path.exists():
+            return _envelope(False, error=f"Marketplace config not found: {mp_path}")
+        marketplaces = load_marketplace_config(mp_path)
+
+        aliases = _build_marketplace_aliases(marketplaces)
+        site = aliases.get(marketplace.lower()) or marketplace
+        mp_config = marketplaces.get(site)
+        if not mp_config:
+            return _envelope(False, error=f"Unknown marketplace: {marketplace}")
+
+        # Build a Product object for the search
+        keywords = search_keywords or f"{brand} {model}"
+        product = Product(
+            category="",
+            brand=brand,
+            model=model,
+            default_asin="",
+            search_keywords=keywords,
+        )
+
+        # Launch browser and search
+        browser = BrowserSession(headed=headed, session=f"discover-{site.lower()}")
+        try:
+            setup_marketplace(browser, site, mp_config)
+
+            from amz_scout.scraper.search import resolve_asin_via_search
+
+            found_asin = resolve_asin_via_search(
+                browser, product, site, mp_config,
+                config_path=None,  # Don't write to YAML — we write to SQLite
+            )
+        finally:
+            browser.close()
+
+        if not found_asin:
+            return _envelope(
+                False,
+                error=f"No matching product found for {brand} {model} on {site}",
+            )
+
+        # Write found ASIN to product registry
+        path = _get_db(db_path)
+        with open_db(path) as conn:
+            from amz_scout.db import find_product_exact, register_asin, register_product
+
+            existing = find_product_exact(conn, brand, model)
+            if existing:
+                register_asin(conn, existing["id"], site, found_asin, status="unverified",
+                              notes="discovered via browser search")
+            else:
+                pid = register_product(conn, "", brand, model, keywords)
+                register_asin(conn, pid, site, found_asin, status="unverified",
+                              notes="discovered via browser search")
+
+    except Exception as e:
+        logger.exception("discover_asin failed")
+        return _envelope(False, error=str(e))
+
+    return _envelope(
+        True,
+        data={
+            "brand": brand,
+            "model": model,
+            "marketplace": site,
+            "asin": found_asin,
+            "status": "unverified",
+        },
     )

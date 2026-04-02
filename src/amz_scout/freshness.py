@@ -40,8 +40,8 @@ def query_freshness(
     conn: sqlite3.Connection,
     products: list[Product],
     sites: list[str],
-) -> dict[tuple[str, str], str | None]:
-    """Query fetched_at for each (asin, site) pair from keepa_products."""
+) -> dict[tuple[str, str], tuple[str, str] | None]:
+    """Query (fetched_at, fetch_mode) for each (asin, site) pair."""
     pairs = [(p.asin_for(s), s) for p in products for s in sites]
     return query_keepa_fetched_at(conn, pairs)
 
@@ -49,14 +49,19 @@ def query_freshness(
 def evaluate_freshness(
     products: list[Product],
     sites: list[str],
-    fetched_at_map: dict[tuple[str, str], str | None],
+    fetched_at_map: dict[tuple[str, str], tuple[str, str] | None],
     strategy: FreshnessStrategy,
     max_age_days: int = 7,
     today: str | None = None,
+    requested_mode: str = "basic",
 ) -> list[ProductFreshness]:
     """Apply freshness strategy to determine action for each product/site pair.
 
     Pure function: no DB access, no side effects.
+
+    *requested_mode* is ``"basic"`` or ``"detailed"``.  If the cached data
+    was fetched in a lower mode than requested, it is treated as needing
+    re-fetch regardless of age.
     """
     ref_date = date.fromisoformat(today) if today else date.today()
     results: list[ProductFreshness] = []
@@ -64,13 +69,18 @@ def evaluate_freshness(
     for product in products:
         for site in sites:
             asin = product.asin_for(site)
-            fetched_at = fetched_at_map.get((asin, site))
+            entry = fetched_at_map.get((asin, site))
+            fetched_at = entry[0] if entry else None
+            cached_mode = entry[1] if entry else None
             age_days = None
             if fetched_at:
                 fetched_date = date.fromisoformat(fetched_at[:10])
                 age_days = (ref_date - fetched_date).days
 
-            action, reason = _decide(strategy, fetched_at, age_days, max_age_days)
+            action, reason = _decide(
+                strategy, fetched_at, age_days, max_age_days,
+                requested_mode, cached_mode,
+            )
             results.append(
                 ProductFreshness(
                     asin=asin,
@@ -92,9 +102,15 @@ def _decide(
     fetched_at: str | None,
     age_days: int | None,
     max_age_days: int,
+    requested_mode: str = "basic",
+    cached_mode: str | None = None,
 ) -> tuple[str, str]:
     """Return (action, reason) for a single product/site pair."""
     has_data = fetched_at is not None
+
+    # Mode upgrade: basic cache cannot satisfy a detailed request
+    if has_data and requested_mode == "detailed" and cached_mode == "basic":
+        return "fetch", "cached data is basic, detailed requested"
 
     if strategy == FreshnessStrategy.LAZY:
         if has_data:

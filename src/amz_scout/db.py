@@ -78,7 +78,7 @@ SERIES_NAMES = {
     100: "MONTHLY_SOLD",
 }
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # ─── Connection management ────────────────────────────────────────────
 
@@ -195,6 +195,19 @@ def _migrate(conn: sqlite3.Connection) -> None:
         )
         logger.info("Migrated schema to version 3")
 
+    if current < 4:
+        # v4: add fetch_mode to keepa_products
+        cols = [r["name"] for r in conn.execute("PRAGMA table_info(keepa_products)")]
+        if "fetch_mode" not in cols:
+            conn.execute(
+                "ALTER TABLE keepa_products ADD COLUMN fetch_mode TEXT NOT NULL DEFAULT 'basic'"
+            )
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (version, description) "
+            "VALUES (4, 'add fetch_mode to keepa_products')"
+        )
+        logger.info("Migrated schema to version 4")
+
 
 _SCHEMA_SQL = """
 CREATE TABLE schema_migrations (
@@ -205,6 +218,7 @@ CREATE TABLE schema_migrations (
 INSERT INTO schema_migrations (version, description) VALUES (1, 'initial schema');
 INSERT INTO schema_migrations (version, description) VALUES (2, 'add project column to competitive_snapshots');
 INSERT INTO schema_migrations (version, description) VALUES (3, 'add product registry tables');
+INSERT INTO schema_migrations (version, description) VALUES (4, 'add fetch_mode to keepa_products');
 
 CREATE TABLE competitive_snapshots (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -340,6 +354,7 @@ CREATE TABLE keepa_products (
     last_rating_update  INTEGER,
     last_sold_update    INTEGER,
     fetched_at          TEXT NOT NULL,
+    fetch_mode          TEXT NOT NULL DEFAULT 'basic',
     PRIMARY KEY (asin, site)
 );
 
@@ -386,10 +401,11 @@ def store_keepa_product(
     site: str,
     raw: dict,
     fetched_at: str,
+    fetch_mode: str = "basic",
 ) -> None:
     """Parse a full Keepa product JSON and write all tables in one transaction."""
     with conn:
-        _upsert_keepa_product(conn, asin, site, raw, fetched_at)
+        _upsert_keepa_product(conn, asin, site, raw, fetched_at, fetch_mode)
         _insert_time_series(conn, asin, site, raw, fetched_at)
         _insert_buybox_history(conn, asin, site, raw, fetched_at)
         _insert_coupon_history(conn, asin, site, raw, fetched_at)
@@ -398,6 +414,7 @@ def store_keepa_product(
 
 def _upsert_keepa_product(
     conn: sqlite3.Connection, asin: str, site: str, raw: dict, fetched_at: str,
+    fetch_mode: str = "basic",
 ) -> None:
     fba = raw.get("fbaFees") or {}
     images = raw.get("images") or []
@@ -415,7 +432,7 @@ def _upsert_keepa_product(
             availability_amazon, has_reviews, is_adult, is_sns, new_price_is_map,
             buybox_eligible_counts,
             last_update, last_price_change, last_rating_update, last_sold_update,
-            fetched_at
+            fetched_at, fetch_mode
         ) VALUES (
             ?, ?, ?, ?, ?, ?, ?,
             ?, ?, ?, ?, ?,
@@ -429,7 +446,7 @@ def _upsert_keepa_product(
             ?, ?, ?, ?, ?,
             ?,
             ?, ?, ?, ?,
-            ?
+            ?, ?
         )""",
         (
             asin, site,
@@ -464,7 +481,7 @@ def _upsert_keepa_product(
             _json_or_none(raw.get("buyBoxEligibleOfferCounts")),
             raw.get("lastUpdate"), raw.get("lastPriceChange"),
             raw.get("lastRatingUpdate"), raw.get("lastSoldUpdate"),
-            fetched_at,
+            fetched_at, fetch_mode,
         ),
     )
 
@@ -902,10 +919,10 @@ def query_stats(conn: sqlite3.Connection) -> dict:
 def query_keepa_fetched_at(
     conn: sqlite3.Connection,
     asin_site_pairs: list[tuple[str, str]],
-) -> dict[tuple[str, str], str | None]:
-    """Look up fetched_at for multiple (asin, site) pairs from keepa_products.
+) -> dict[tuple[str, str], tuple[str, str] | None]:
+    """Look up fetched_at + fetch_mode for (asin, site) pairs from keepa_products.
 
-    Returns dict mapping each (asin, site) -> fetched_at ISO string,
+    Returns dict mapping each (asin, site) -> (fetched_at, fetch_mode) tuple,
     or None if no record exists.
     """
     if not asin_site_pairs:
@@ -914,13 +931,15 @@ def query_keepa_fetched_at(
     conditions = " OR ".join(["(asin = ? AND site = ?)"] * len(asin_site_pairs))
     params = [v for pair in asin_site_pairs for v in pair]
     rows = conn.execute(
-        f"SELECT asin, site, fetched_at FROM keepa_products WHERE {conditions}",
+        f"SELECT asin, site, fetched_at, fetch_mode FROM keepa_products WHERE {conditions}",
         params,
     ).fetchall()
 
-    result: dict[tuple[str, str], str | None] = {pair: None for pair in asin_site_pairs}
+    result: dict[tuple[str, str], tuple[str, str] | None] = {
+        pair: None for pair in asin_site_pairs
+    }
     for row in rows:
-        result[(row["asin"], row["site"])] = row["fetched_at"]
+        result[(row["asin"], row["site"])] = (row["fetched_at"], row["fetch_mode"] or "basic")
     return result
 
 
@@ -1199,6 +1218,7 @@ def import_from_raw_json(
     products: list,
     site: str,
     fetched_at: str | None = None,
+    fetch_mode: str = "basic",
 ) -> tuple[int, int]:
     """Import Keepa data from raw JSON files. Returns (ok, failed) counts."""
     from amz_scout.utils import today_iso
@@ -1212,7 +1232,7 @@ def import_from_raw_json(
         try:
             with open(json_path) as f:
                 raw = json_mod.load(f)
-            store_keepa_product(conn, asin, site, raw, fetched)
+            store_keepa_product(conn, asin, site, raw, fetched, fetch_mode=fetch_mode)
             ok += 1
         except Exception:
             logger.exception("Import failed for %s/%s", site, asin)
