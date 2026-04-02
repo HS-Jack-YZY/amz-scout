@@ -9,62 +9,32 @@ When the user asks about Amazon product data (prices, trends, rankings, availabi
 ### Decision Tree
 
 ```
-User asks about product data (prices, trends, competitors, etc.)
+User asks about product data
   │
-  ├─ "价格趋势" / "price trend" / "历史价格"
-  │   → query_trends(project, product, marketplace, series)
+  ├─ 查询数据（不需要 YAML，自动从 DB 读取产品）
+  │   ├─ "价格趋势" / "历史价格"   → query_trends(product=, marketplace=, series=)
+  │   ├─ "对比" / "跨市场"          → query_compare(product=)
+  │   ├─ "排名" / "BSR"            → query_ranking(marketplace=)
+  │   ├─ "上架" / "哪些国家有卖"    → query_availability()
+  │   ├─ "卖家" / "Buy Box"        → query_sellers(product=, marketplace=)
+  │   ├─ "促销" / "折扣"           → query_deals(marketplace=)
+  │   └─ "最新数据" / "当前价格"    → query_latest(marketplace=)
   │
-  ├─ "对比" / "compare" / "跨市场"
-  │   → query_compare(project, product)
+  ├─ 数据管理
+  │   ├─ "刷新数据" / "更新"        → ensure_keepa_data(marketplace=, strategy="fresh")
+  │   ├─ "数据新鲜度"              → check_freshness()
+  │   ├─ "Keepa token 余额"       → keepa_budget()
+  │   └─ "验证 ASIN"              → validate_asins(marketplace=)
   │
-  ├─ "排名" / "ranking" / "BSR"
-  │   → query_ranking(project, marketplace)
+  ├─ 产品注册表管理
+  │   ├─ "有哪些产品"              → list_products(category?, brand?, marketplace?)
+  │   ├─ "添加产品"                → add_product(category, brand, model, asins={...})
+  │   ├─ "删除产品"                → remove_product_by_model(brand, model)
+  │   ├─ "更新 ASIN"              → update_product_asin(brand, model, marketplace, asin)
+  │   └─ "导入 YAML 配置"         → import_yaml(project_config, tag?)
   │
-  ├─ "上架" / "availability" / "哪些国家有卖"
-  │   → query_availability(project)
-  │
-  ├─ "卖家" / "seller" / "Buy Box" / "谁在卖"
-  │   → query_sellers(project, product, marketplace)
-  │
-  ├─ "促销" / "deal" / "折扣"
-  │   → query_deals(project, marketplace)
-  │
-  ├─ "最新数据" / "latest" / "当前价格"
-  │   → query_latest(project, marketplace)
-  │
-  ├─ "数据新鲜度" / "多久没更新" / "freshness"
-  │   → check_freshness(project)
-  │
-  ├─ "Keepa token" / "余额" / "budget"
-  │   → keepa_budget()
-  │
-  ├─ "这个项目有哪些产品" / "配置" / "project info"
-  │   → resolve_project(project)
-  │
-  ├─ "刷新数据" / "更新" / "重新获取"
-  │   → ensure_keepa_data(project, strategy="fresh")
-  │
-  ├─ "添加产品" / "add product" / "新增监控"
-  │   → add_product(category, brand, model, asins={"UK": "B0..."})
-  │
-  ├─ "删除产品" / "remove product"
-  │   → remove_product_by_model(brand, model)
-  │
-  ├─ "更新 ASIN" / "set asin" / "修正 ASIN"
-  │   → update_product_asin(brand, model, marketplace, asin)
-  │
-  ├─ "列出所有产品" / "list products" / "产品列表"
-  │   → list_products(category?, brand?, marketplace?, tag?)
-  │
-  ├─ "导入配置" / "import yaml" / "从配置文件导入"
-  │   → import_yaml(project_config, tag?)
-  │
-  ├─ "验证 ASIN" / "validate" / "检查 ASIN 是否正确"
-  │   → validate_asins(marketplace?)
-  │
-  └─ "搜索正确的 ASIN" / "discover" / "ASIN 不对，帮我找到对的"
-      → discover_asin(brand, model, marketplace)
-      ⚠ 慢操作 (10-30s)，需要 browser-use
+  └─ ASIN 发现（慢操作，需要浏览器）
+      └─ "搜索正确的 ASIN"         → discover_asin(brand, model, marketplace)
 ```
 
 ### Calling the API
@@ -93,22 +63,21 @@ Always check `result["ok"]` before using `result["data"]`.
 
 **"GL-Slate 7 在英国的价格趋势"**
 ```python
-r = query_trends("BE10000", "Slate 7", "UK", series="new")
+r = query_trends(product="Slate 7", marketplace="UK", series="new")
 # r["data"] = [{"date": "2026-04-01 02:12", "value": 15099, ...}, ...]
 # value 是 Keepa 编码: 除以 100 得到实际价格 (15099 → £150.99)
 ```
 
 **"对比 RT-BE58 在所有市场的价格"**
 ```python
-r = query_compare("BE10000", "RT-BE58")
+r = query_compare(product="RT-BE58")
 # r["data"] = [{"site": "UK", "price_cents": 9997, ...}, {"site": "DE", ...}]
 ```
 
-**"帮我查一下 BE10000 项目有哪些产品"**
+**"有哪些产品在监控？"**
 ```python
-r = resolve_project("BE10000")
-# r["data"]["products"] = [{"brand": "GL.iNet", "model": "GL-Slate 7 ...", ...}, ...]
-# r["data"]["target_marketplaces"] = ["UK", "DE", "FR", ...]
+r = list_products()
+# r["data"] = [{"brand": "GL.iNet", "model": "GL-Slate 7 ...", "marketplace": "UK", "asin": "...", ...}, ...]
 ```
 
 **"Keepa 还有多少 token？"**
@@ -119,15 +88,15 @@ r = keepa_budget()
 
 **"确保英国的数据是最新的再查"**
 ```python
-r = ensure_keepa_data("BE10000", marketplace="UK", strategy="fresh")
+r = ensure_keepa_data(marketplace="UK", strategy="fresh")
 # r["meta"] = {"fetched": 18, "cached": 0, "skipped": 0, "tokens_used": 18, "tokens_remaining": 42}
 # Then query:
-r = query_trends("BE10000", "Slate 7", "UK")
+r = query_trends(product="Slate 7", marketplace="UK")
 ```
 
 **"数据多久没更新了？"**
 ```python
-r = check_freshness("BE10000")
+r = check_freshness()
 # r["data"] = [{"model": "GL-Slate 7 ...", "UK": "0d", "DE": "3d", "US": "never"}, ...]
 ```
 
@@ -181,10 +150,9 @@ r = import_yaml("BE10000")
 
 ### Available Projects
 
-YAML config files (legacy, still supported via `project` parameter):
-- `BE10000`, `test_keepa`, `JP_Competitor`, `JP_travel_router`
+产品数据在 SQLite 产品注册表中（`products` + `product_asins` 表）。用 `import_yaml("BE10000")` 从 YAML 导入，或用 `add_product()` 直接注册。
 
-**推荐方式**: 用 `import_yaml("BE10000")` 导入到产品注册表后，直接用 `query_trends(product="Slate 7", marketplace="UK")` 查询，不需要传 project 参数。
+**所有 CLI 命令和 API 函数都不再需要 YAML 配置文件。** YAML 通过 `--config` 参数仍然支持（向后兼容），但不是必需的。
 
 ---
 
@@ -196,19 +164,30 @@ YAML config files (legacy, still supported via `project` parameter):
 # Install (editable mode)
 pip install -e ".[dev]"
 
-# ── Daily workflow ──
-amz-scout scrape config/BE10000.yaml              # Full scrape (browser + Keepa)
-amz-scout scrape config/BE10000.yaml --data-only  # Browser only, no Keepa tokens
-amz-scout scrape config/BE10000.yaml -m UK -p "RT-BE58" --headed -v  # Debug single product
-amz-scout keepa config/BE10000.yaml               # Smart Keepa fetch (default: 7-day cache)
-amz-scout keepa config/BE10000.yaml --lazy        # Use cache no matter how old
-amz-scout keepa config/BE10000.yaml --offline     # DB + raw JSON only, zero API calls
-amz-scout keepa config/BE10000.yaml --fresh       # Force re-fetch from API
-amz-scout keepa config/BE10000.yaml --check       # Show data freshness matrix
+# ── Daily workflow (no config file needed — reads from DB) ──
+amz-scout scrape -m UK                            # Scrape all DB products on UK
+amz-scout scrape -p "RT-BE58" -m UK --headed -v   # Debug single product
+amz-scout scrape -c "Travel Router"               # Scrape by category
+amz-scout keepa -m UK                             # Smart Keepa fetch (default: 7-day cache)
+amz-scout keepa --lazy                            # Use cache no matter how old
+amz-scout keepa --fresh -m UK                     # Force re-fetch from API
+amz-scout keepa --check -m UK                     # Show data freshness matrix
 amz-scout keepa --budget                          # Show token balance
-amz-scout discover config/BE10000.yaml            # Find cross-marketplace ASINs
-amz-scout validate config/BE10000.yaml            # Validate config
-amz-scout status config/BE10000.yaml              # Unified: CSV + DB + freshness overview
+amz-scout discover -m UK                          # Find cross-marketplace ASINs (browser)
+amz-scout status -m UK                            # CSV + DB + freshness overview
+
+# ── Query (no config file needed) ──
+amz-scout query latest -m UK
+amz-scout query trends -p "RT-BE58" -m UK --series new
+amz-scout query compare -p "RT-BE58"
+amz-scout query ranking -m UK
+amz-scout query sellers -p "RT-BE58" -m UK
+amz-scout query deals -m UK
+
+# ── Legacy YAML mode (still supported via --config) ──
+amz-scout scrape --config config/BE10000.yaml -m UK
+amz-scout keepa --config config/BE10000.yaml --check
+amz-scout validate config/BE10000.yaml            # Validate config (YAML only)
 
 # ── Admin (one-time operations) ──
 amz-scout admin reparse config/BE10000.yaml       # Regenerate CSV from raw JSON (free)
