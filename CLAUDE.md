@@ -41,8 +41,26 @@ User asks about product data (prices, trends, competitors, etc.)
   ├─ "这个项目有哪些产品" / "配置" / "project info"
   │   → resolve_project(project)
   │
-  └─ "刷新数据" / "更新" / "重新获取"
-      → ensure_keepa_data(project, strategy="fresh")
+  ├─ "刷新数据" / "更新" / "重新获取"
+  │   → ensure_keepa_data(project, strategy="fresh")
+  │
+  ├─ "添加产品" / "add product" / "新增监控"
+  │   → add_product(category, brand, model, asins={"UK": "B0..."})
+  │
+  ├─ "删除产品" / "remove product"
+  │   → remove_product_by_model(brand, model)
+  │
+  ├─ "更新 ASIN" / "set asin" / "修正 ASIN"
+  │   → update_product_asin(brand, model, marketplace, asin)
+  │
+  ├─ "列出所有产品" / "list products" / "产品列表"
+  │   → list_products(category?, brand?, marketplace?, tag?)
+  │
+  ├─ "导入配置" / "import yaml" / "从配置文件导入"
+  │   → import_yaml(project_config, tag?)
+  │
+  └─ "验证 ASIN" / "validate" / "检查 ASIN 是否正确"
+      → validate_asins(marketplace?)
 ```
 
 ### Calling the API
@@ -53,6 +71,9 @@ from amz_scout.api import (
     query_latest, query_trends, query_compare, query_ranking,
     query_availability, query_sellers, query_deals,
     check_freshness, keepa_budget,
+    # Product registry management
+    add_product, remove_product_by_model, update_product_asin,
+    list_products, import_yaml,
 )
 ```
 
@@ -106,6 +127,30 @@ r = check_freshness("BE10000")
 # r["data"] = [{"model": "GL-Slate 7 ...", "UK": "0d", "DE": "3d", "US": "never"}, ...]
 ```
 
+**"把 TP-Link AX1500 加到产品列表，日本和英国都要监控"**
+```python
+r = add_product("Travel Router", "TP-Link", "AX1500",
+                asins={"JP": "B0JP1234AB", "UK": "B0UK5678CD"}, tag="travel_routers")
+# r["data"] = {"id": 18, "brand": "TP-Link", "model": "AX1500"}
+```
+
+**"修改 AX1500 在日本的 ASIN，之前那个是错的"**
+```python
+r = update_product_asin("TP-Link", "AX1500", "JP", "B0NEWJPASIN", status="verified")
+```
+
+**"列出所有 Travel Router 产品"**
+```python
+r = list_products(category="Travel Router")
+# r["data"] = [{"brand": "TP-Link", "model": "AX1500", "marketplace": "JP", "asin": "...", ...}, ...]
+```
+
+**"把 BE10000 的配置导入到产品库"**
+```python
+r = import_yaml("BE10000")
+# r["data"] = {"tag": "BE10000", "products_imported": 17, "asins_registered": 147}
+```
+
 ### Key Behaviors to Remember
 
 1. **Auto-fetch**: `query_trends`, `query_sellers`, `query_deals` auto-fetch missing Keepa data by default (LAZY strategy: fetch only if never fetched before, zero tokens if cached). No need to call `ensure_keepa_data` manually for these.
@@ -114,20 +159,24 @@ r = check_freshness("BE10000")
 
 3. **Marketplace aliases**: All marketplace parameters accept case variants (`"uk"`), Keepa codes (`"GB"`), Amazon domains (`"amazon.co.uk"`), and currency codes (`"GBP"`).
 
-4. **Product resolution**: All product parameters accept model substrings (`"Slate 7"`) or ASINs (`"B0F2MR53D6"`). Case-insensitive.
+4. **Product resolution (4-level)**: DB registry first → config products fallback → ASIN pass-through → error. Accepts model substrings (`"Slate 7"`) or ASINs (`"B0F2MR53D6"`). Case-insensitive.
 
 5. **Token awareness**: Keepa Pro plan has 60 tokens, refills 1/min. Basic queries cost 1 token/product. Always check `keepa_budget()` before suggesting a `strategy="fresh"` refresh.
 
 6. **Price encoding**: Keepa time series `value` is in cents (divide by 100). Rating is ×10 (45 = 4.5 stars). Sales rank is raw integer. value=-1 means unavailable.
 
+7. **Product registry (SQLite)**: Products and their per-marketplace ASINs are stored in `products` + `product_asins` tables. Use `add_product()` to register new products, `import_yaml()` to bulk-import from existing YAML configs. ASIN `status` tracks verification: `unverified` → `verified` / `wrong_product` / `not_listed` / `unavailable`. Use `validate_asins()` after fetching Keepa data to auto-verify by title matching.
+
+8. **project 参数现在是可选的**: 所有 query 函数的 `project` 参数已改为 `str | None = None`。传 None 时从 SQLite 产品注册表加载产品，不需要 YAML 配置文件。传字符串时走旧的 YAML 路径（向后兼容）。
+
+9. **product_tags 表暂不使用**: `product_tags` 表已建好但当前不作为任何功能的依赖。产品过滤统一用 `category` / `brand` / `marketplace` 三个维度，不用 tag。等真正需要分组时再启用。
+
 ### Available Projects
 
-Check `config/` directory for project YAML files. Current projects:
-- `BE10000` — GL.iNet BE10000 竞品分析 (17 products, 8 markets: UK/DE/FR/IT/ES/NL/CA/AU)
-- `test_keepa` — Keepa 功能测试 (5 products, 3 markets: UK/DE/US)
-- `JP_Competitor` — 日本市场竞品
+YAML config files (legacy, still supported via `project` parameter):
+- `BE10000`, `test_keepa`, `JP_Competitor`, `JP_travel_router`
 
-When user doesn't specify a project, use `BE10000` as the default.
+**推荐方式**: 用 `import_yaml("BE10000")` 导入到产品注册表后，直接用 `query_trends(product="Slate 7", marketplace="UK")` 查询，不需要传 project 参数。
 
 ---
 

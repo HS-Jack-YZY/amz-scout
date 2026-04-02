@@ -12,10 +12,14 @@ from amz_scout.api import (
     _envelope,
     _load_project,
     _resolve_asin,
+    _resolve_context,
     _resolve_site,
+    add_product,
     check_freshness,
     ensure_keepa_data,
+    import_yaml,
     keepa_budget,
+    list_products,
     query_availability,
     query_compare,
     query_deals,
@@ -23,10 +27,19 @@ from amz_scout.api import (
     query_ranking,
     query_sellers,
     query_trends,
+    remove_product_by_model,
     resolve_product,
     resolve_project,
+    update_product_asin,
+    validate_asins,
 )
-from amz_scout.db import init_schema, upsert_competitive
+from amz_scout.db import (
+    init_schema,
+    register_asin,
+    register_product,
+    store_keepa_product,
+    upsert_competitive,
+)
 from amz_scout.models import CompetitiveData, Product
 
 # ─── Fixtures ────────────────────────────────────────────────────────
@@ -117,6 +130,13 @@ def config_dir(tmp_path):
     conn.close()
 
     return tmp_path, str(proj_path)
+
+
+@pytest.fixture
+def test_db(config_dir):
+    """Return the temp DB path for product registry tests."""
+    tmp_path, _ = config_dir
+    return tmp_path / "output" / "amz_scout.db"
 
 
 @pytest.fixture
@@ -540,3 +560,301 @@ class TestBrowserQueryHint:
         _, proj_path = config_dir
         r = query_availability(proj_path)
         assert "hint" in r["meta"]
+
+
+# ─── Product registry tests ─────────────────────────────────────────
+
+
+class TestAddProduct:
+    def test_basic_add(self, test_db):
+        r = add_product("Router", "TestBrand", "TestModel", db_path=test_db)
+        assert r["ok"] is True
+        assert r["data"]["brand"] == "TestBrand"
+        assert r["data"]["id"] > 0
+
+    def test_add_with_asins(self, test_db):
+        r = add_product(
+            "Router", "TestBrand", "WithASINs",
+            asins={"UK": "B0TESTUK01", "DE": "B0TESTDE01"},
+            db_path=test_db,
+        )
+        assert r["ok"] is True
+        assert r["meta"]["asins_registered"] == 2
+
+    def test_add_with_tag(self, test_db):
+        r = add_product("Router", "TestBrand", "Tagged", tag="my_project", db_path=test_db)
+        assert r["ok"] is True
+        r2 = list_products(tag="my_project", db_path=test_db)
+        assert r2["ok"] is True
+        assert r2["meta"]["count"] >= 1
+
+    def test_add_duplicate_returns_existing_id(self, test_db):
+        r1 = add_product("Router", "TestBrand", "DupTest", db_path=test_db)
+        r2 = add_product("Router", "TestBrand", "DupTest", db_path=test_db)
+        assert r1["ok"] and r2["ok"]
+        assert r1["data"]["id"] == r2["data"]["id"]
+
+
+class TestListProducts:
+    def test_empty_db(self, test_db):
+        r = list_products(db_path=test_db)
+        assert r["ok"] is True
+        assert r["data"] == []
+
+    def test_filter_by_category(self, test_db):
+        add_product("Router", "BrandA", "ModelA", db_path=test_db)
+        add_product("Switch", "BrandB", "ModelB", db_path=test_db)
+        r = list_products(category="Router", db_path=test_db)
+        models = {p["model"] for p in r["data"]}
+        assert "ModelA" in models
+        assert "ModelB" not in models
+
+    def test_filter_by_brand(self, test_db):
+        add_product("Router", "BrandX", "ModelX", db_path=test_db)
+        add_product("Router", "BrandY", "ModelY", db_path=test_db)
+        r = list_products(brand="BrandX", db_path=test_db)
+        assert all(p["brand"] == "BrandX" for p in r["data"])
+
+    def test_filter_by_marketplace(self, test_db):
+        add_product("Router", "BrandM", "OnlyUK", asins={"UK": "B0UKASIN01"}, db_path=test_db)
+        add_product("Router", "BrandM", "OnlyDE", asins={"DE": "B0DEASIN01"}, db_path=test_db)
+        r = list_products(marketplace="UK", db_path=test_db)
+        models = {p["model"] for p in r["data"]}
+        assert "OnlyUK" in models
+        assert "OnlyDE" not in models
+
+
+class TestRemoveProduct:
+    def test_remove_existing(self, test_db):
+        add_product("Router", "ToRemove", "RemoveMe", db_path=test_db)
+        r = remove_product_by_model("ToRemove", "RemoveMe", db_path=test_db)
+        assert r["ok"] is True
+        assert r["data"]["removed"] is True
+        r2 = list_products(brand="ToRemove", db_path=test_db)
+        assert r2["meta"]["count"] == 0
+
+    def test_remove_nonexistent(self, test_db):
+        r = remove_product_by_model("NoSuch", "Product", db_path=test_db)
+        assert r["ok"] is False
+        assert "not found" in r["error"].lower()
+
+    def test_remove_cascades_asins(self, test_db):
+        add_product("Router", "Cascade", "Test", asins={"UK": "B0CASCADE1"}, db_path=test_db)
+        remove_product_by_model("Cascade", "Test", db_path=test_db)
+        r = list_products(brand="Cascade", db_path=test_db)
+        assert r["meta"]["count"] == 0
+
+
+class TestUpdateProductAsin:
+    def test_update_existing_product(self, test_db):
+        add_product("Router", "UpdateMe", "Model1", asins={"UK": "B0OLDASIN1"}, db_path=test_db)
+        r = update_product_asin("UpdateMe", "Model1", "UK", "B0NEWASIN1", db_path=test_db)
+        assert r["ok"] is True
+        assert r["data"]["asin"] == "B0NEWASIN1"
+
+    def test_add_new_marketplace(self, test_db):
+        add_product("Router", "AddMP", "Model2", asins={"UK": "B0UKASIN02"}, db_path=test_db)
+        r = update_product_asin("AddMP", "Model2", "DE", "B0DEASIN02", db_path=test_db)
+        assert r["ok"] is True
+        r2 = list_products(brand="AddMP", marketplace="DE", db_path=test_db)
+        assert r2["meta"]["count"] == 1
+
+    def test_update_nonexistent_product(self, test_db):
+        r = update_product_asin("NoSuch", "Product", "UK", "B0WHATEVER", db_path=test_db)
+        assert r["ok"] is False
+
+    def test_update_with_status(self, test_db):
+        add_product("Router", "StatusTest", "Model3", db_path=test_db)
+        r = update_product_asin(
+            "StatusTest", "Model3", "UK", "B0STATUS01",
+            status="verified", notes="confirmed on amazon.co.uk",
+            db_path=test_db,
+        )
+        assert r["ok"] is True
+        assert r["data"]["status"] == "verified"
+
+
+class TestImportYaml:
+    def test_import_project(self, config_dir, test_db):
+        _, proj_path = config_dir
+        r = import_yaml(proj_path, db_path=test_db)
+        assert r["ok"] is True
+        assert r["data"]["products_imported"] == 2
+        assert r["data"]["tag"] == "test_api"
+
+    def test_import_with_custom_tag(self, config_dir, test_db):
+        _, proj_path = config_dir
+        r = import_yaml(proj_path, tag="custom_tag", db_path=test_db)
+        assert r["ok"] is True
+        assert r["data"]["tag"] == "custom_tag"
+        r2 = list_products(tag="custom_tag", db_path=test_db)
+        assert r2["meta"]["count"] > 0
+
+    def test_import_idempotent(self, config_dir, test_db):
+        _, proj_path = config_dir
+        r1 = import_yaml(proj_path, db_path=test_db)
+        r2 = import_yaml(proj_path, db_path=test_db)
+        assert r1["ok"] and r2["ok"]
+        assert r1["data"]["products_imported"] == r2["data"]["products_imported"]
+
+    def test_import_creates_marketplace_asins(self, config_dir, test_db):
+        _, proj_path = config_dir
+        import_yaml(proj_path, db_path=test_db)
+        # GL-Slate 7 has UK override (B0UKSPECIF) and default for DE
+        r = list_products(brand="GL.iNet", marketplace="UK", db_path=test_db)
+        uk_asins = [p["asin"] for p in r["data"] if "Slate" in p["model"]]
+        assert "B0UKSPECIF" in uk_asins
+
+        r = list_products(brand="GL.iNet", marketplace="DE", db_path=test_db)
+        de_asins = [p["asin"] for p in r["data"] if "Slate" in p["model"]]
+        assert "B0F2MR53D6" in de_asins  # Default ASIN for DE
+
+    def test_import_nonexistent_yaml(self, test_db):
+        r = import_yaml("/nonexistent/config.yaml", db_path=test_db)
+        assert r["ok"] is False
+
+
+# ─── Dual-resolution and DB-backed query tests ──────────────────────
+
+
+class TestResolveAsinDualMode:
+    """Test that _resolve_asin checks DB registry before falling back to config."""
+
+    def test_db_takes_priority(self, test_db):
+        """Product in DB registry is found via DB path."""
+        with sqlite3.connect(str(test_db)) as conn:
+            conn.row_factory = sqlite3.Row
+            pid = register_product(conn, "Router", "TestBrand", "TestRouter")
+            register_asin(conn, pid, "UK", "B0DBFOUND1")
+
+            asin, model, source = _resolve_asin([], "TestRouter", "UK", conn=conn)
+            assert asin == "B0DBFOUND1"
+            assert source == "db"
+
+    def test_config_fallback_when_not_in_db(self):
+        """Falls back to config products when DB has no match."""
+        products = [Product(
+            category="Router", brand="FallbackBrand", model="FallbackModel",
+            default_asin="B0FALLBACK",
+        )]
+        asin, _, source = _resolve_asin(products, "FallbackModel")
+        assert asin == "B0FALLBACK"
+        assert source == "config"
+
+    def test_asin_passthrough_still_works(self, test_db):
+        """Direct ASIN input works even with empty DB and empty config."""
+        with sqlite3.connect(str(test_db)) as conn:
+            conn.row_factory = sqlite3.Row
+            asin, _, source = _resolve_asin([], "B0DIRECTIN", conn=conn)
+            assert asin == "B0DIRECTIN"
+            assert source == "asin"
+
+
+class TestResolveContext:
+    """Test _resolve_context dual-source resolution."""
+
+    def test_with_project_loads_yaml(self, config_dir):
+        _, proj_path = config_dir
+        ctx = _resolve_context(proj_path)
+        assert len(ctx.products) == 2
+        assert ctx.config is not None
+
+    def test_without_project_loads_from_db(self):
+        """When project=None, loads from DB + marketplaces.yaml."""
+        ctx = _resolve_context(None)
+        assert ctx.config is None
+        assert ctx.db_path.name == "amz_scout.db"
+        assert "UK" in ctx.marketplaces
+
+
+class TestQueryWithoutProject:
+    """Test that query functions work with project=None (DB-backed)."""
+
+    def test_query_latest_without_project(self):
+        r = query_latest()
+        assert r["ok"] is True
+
+    def test_query_trends_without_project(self):
+        """query_trends with project=None should work if product is in DB."""
+        r = query_trends(product="Slate 7", marketplace="UK", auto_fetch=False)
+        assert r["ok"] is True
+
+    def test_query_compare_without_project(self):
+        r = query_compare(product="Slate 7")
+        assert r["ok"] is True
+
+    def test_query_ranking_without_project(self):
+        r = query_ranking(marketplace="UK")
+        assert r["ok"] is True
+
+    def test_query_availability_without_project(self):
+        r = query_availability()
+        assert r["ok"] is True
+
+    def test_query_deals_without_project(self):
+        r = query_deals(marketplace="UK", auto_fetch=False)
+        assert r["ok"] is True
+
+
+# ─── ASIN validation tests ──────────────────────────────────────────
+
+
+class TestValidateAsins:
+    def test_no_keepa_data_stays_unverified(self, test_db):
+        """Products without Keepa data should remain unverified."""
+        add_product("Router", "NoBrand", "NoData", asins={"UK": "B0NODATA01"}, db_path=test_db)
+        r = validate_asins(marketplace="UK", db_path=test_db)
+        assert r["ok"] is True
+        skipped = [x for x in r["data"] if x["status"] == "unverified"]
+        assert len(skipped) >= 1
+
+    def test_matching_title_verifies(self, test_db):
+        """Product with matching Keepa title should be verified."""
+        with sqlite3.connect(str(test_db)) as conn:
+            conn.row_factory = sqlite3.Row
+            init_schema(conn)
+            pid = register_product(conn, "Router", "GL.iNet", "Slate 7 Test")
+            register_asin(conn, pid, "UK", "B0VERIFYME")
+            # Simulate Keepa data with matching title
+            store_keepa_product(conn, "B0VERIFYME", "UK",
+                                {"title": "GL.iNet Slate 7 WiFi Travel Router"}, "2026-04-01")
+
+        r = validate_asins(marketplace="UK", db_path=test_db)
+        verified = [x for x in r["data"] if x["asin"] == "B0VERIFYME"]
+        assert len(verified) == 1
+        assert verified[0]["status"] == "verified"
+
+    def test_mismatched_title_marks_wrong_product(self, test_db):
+        """Product with non-matching title should be marked wrong_product."""
+        with sqlite3.connect(str(test_db)) as conn:
+            conn.row_factory = sqlite3.Row
+            init_schema(conn)
+            pid = register_product(conn, "Router", "GL.iNet", "Slate 7 Mismatch")
+            register_asin(conn, pid, "UK", "B0WRONGPRD")
+            store_keepa_product(conn, "B0WRONGPRD", "UK",
+                                {"title": "USB-C Hub Adapter Multiport"}, "2026-04-01")
+
+        r = validate_asins(marketplace="UK", db_path=test_db)
+        wrong = [x for x in r["data"] if x["asin"] == "B0WRONGPRD"]
+        assert len(wrong) == 1
+        assert wrong[0]["status"] == "wrong_product"
+
+    def test_empty_title_marks_not_listed(self, test_db):
+        """Product with empty Keepa title should be marked not_listed."""
+        with sqlite3.connect(str(test_db)) as conn:
+            conn.row_factory = sqlite3.Row
+            init_schema(conn)
+            pid = register_product(conn, "Router", "GL.iNet", "NotListed Test")
+            register_asin(conn, pid, "UK", "B0NOTLISTD")
+            store_keepa_product(conn, "B0NOTLISTD", "UK",
+                                {"title": None}, "2026-04-01")
+
+        r = validate_asins(marketplace="UK", db_path=test_db)
+        not_listed = [x for x in r["data"] if x["asin"] == "B0NOTLISTD"]
+        assert len(not_listed) == 1
+        assert not_listed[0]["status"] == "not_listed"
+
+    def test_empty_db_returns_empty(self, test_db):
+        r = validate_asins(db_path=test_db)
+        assert r["ok"] is True
+        assert r["data"] == []

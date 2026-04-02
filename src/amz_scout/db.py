@@ -78,7 +78,7 @@ SERIES_NAMES = {
     100: "MONTHLY_SOLD",
 }
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # ─── Connection management ────────────────────────────────────────────
 
@@ -150,6 +150,51 @@ def _migrate(conn: sqlite3.Connection) -> None:
         )
         logger.info("Migrated schema to version 2")
 
+    if current < 3:
+        # v3: add product registry tables
+        tables = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()}
+        if "products" not in tables:
+            conn.executescript("""
+                CREATE TABLE products (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    category        TEXT NOT NULL,
+                    brand           TEXT NOT NULL,
+                    model           TEXT NOT NULL,
+                    search_keywords TEXT NOT NULL DEFAULT '',
+                    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                    updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                    UNIQUE(brand, model)
+                );
+                CREATE TABLE product_asins (
+                    product_id      INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+                    marketplace     TEXT NOT NULL,
+                    asin            TEXT NOT NULL,
+                    status          TEXT NOT NULL DEFAULT 'unverified'
+                        CHECK(status IN (
+                            'unverified','verified','wrong_product','not_listed','unavailable'
+                        )),
+                    notes           TEXT NOT NULL DEFAULT '',
+                    last_checked    TEXT,
+                    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                    updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                    PRIMARY KEY (product_id, marketplace)
+                );
+                CREATE INDEX idx_pa_asin ON product_asins(asin);
+                CREATE TABLE product_tags (
+                    product_id  INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+                    tag         TEXT NOT NULL,
+                    PRIMARY KEY (product_id, tag)
+                ) WITHOUT ROWID;
+                CREATE INDEX idx_pt_tag ON product_tags(tag);
+            """)
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (version, description) "
+            "VALUES (3, 'add product registry tables')"
+        )
+        logger.info("Migrated schema to version 3")
+
 
 _SCHEMA_SQL = """
 CREATE TABLE schema_migrations (
@@ -159,6 +204,7 @@ CREATE TABLE schema_migrations (
 );
 INSERT INTO schema_migrations (version, description) VALUES (1, 'initial schema');
 INSERT INTO schema_migrations (version, description) VALUES (2, 'add project column to competitive_snapshots');
+INSERT INTO schema_migrations (version, description) VALUES (3, 'add product registry tables');
 
 CREATE TABLE competitive_snapshots (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -296,6 +342,38 @@ CREATE TABLE keepa_products (
     fetched_at          TEXT NOT NULL,
     PRIMARY KEY (asin, site)
 );
+
+CREATE TABLE products (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    category        TEXT NOT NULL,
+    brand           TEXT NOT NULL,
+    model           TEXT NOT NULL,
+    search_keywords TEXT NOT NULL DEFAULT '',
+    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    UNIQUE(brand, model)
+);
+
+CREATE TABLE product_asins (
+    product_id      INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+    marketplace     TEXT NOT NULL,
+    asin            TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'unverified'
+                    CHECK(status IN ('unverified','verified','wrong_product','not_listed','unavailable')),
+    notes           TEXT NOT NULL DEFAULT '',
+    last_checked    TEXT,
+    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    PRIMARY KEY (product_id, marketplace)
+);
+CREATE INDEX idx_pa_asin ON product_asins(asin);
+
+CREATE TABLE product_tags (
+    product_id  INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+    tag         TEXT NOT NULL,
+    PRIMARY KEY (product_id, tag)
+) WITHOUT ROWID;
+CREATE INDEX idx_pt_tag ON product_tags(tag);
 """
 
 
@@ -844,6 +922,272 @@ def query_keepa_fetched_at(
     for row in rows:
         result[(row["asin"], row["site"])] = row["fetched_at"]
     return result
+
+
+# ─── Product registry CRUD ───────────────────────────────────────────
+
+
+def register_product(
+    conn: sqlite3.Connection,
+    category: str,
+    brand: str,
+    model: str,
+    search_keywords: str = "",
+) -> int:
+    """Insert a product, or return existing id if (brand, model) already exists."""
+    row = conn.execute(
+        "SELECT id FROM products WHERE brand = ? AND model = ?", (brand, model)
+    ).fetchone()
+    if row:
+        return row["id"]
+    with conn:
+        cur = conn.execute(
+            "INSERT INTO products (category, brand, model, search_keywords) "
+            "VALUES (?, ?, ?, ?)",
+            (category, brand, model, search_keywords),
+        )
+    return cur.lastrowid  # type: ignore[return-value]
+
+
+def register_asin(
+    conn: sqlite3.Connection,
+    product_id: int,
+    marketplace: str,
+    asin: str,
+    status: str = "unverified",
+    notes: str = "",
+) -> None:
+    """Set or update the ASIN for a product on a marketplace."""
+    with conn:
+        conn.execute(
+            "INSERT INTO product_asins (product_id, marketplace, asin, status, notes) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(product_id, marketplace) DO UPDATE SET "
+            "asin=excluded.asin, status=excluded.status, notes=excluded.notes, "
+            "updated_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now')",
+            (product_id, marketplace, asin, status, notes),
+        )
+
+
+def tag_product(
+    conn: sqlite3.Connection,
+    product_id: int,
+    tag: str,
+) -> None:
+    """Add a tag to a product. No-op if already tagged."""
+    with conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO product_tags (product_id, tag) VALUES (?, ?)",
+            (product_id, tag),
+        )
+
+
+def remove_product(conn: sqlite3.Connection, product_id: int) -> None:
+    """Delete a product and cascade to product_asins and product_tags."""
+    with conn:
+        conn.execute("DELETE FROM products WHERE id = ?", (product_id,))
+
+
+def list_registered_products(
+    conn: sqlite3.Connection,
+    category: str | None = None,
+    brand: str | None = None,
+    marketplace: str | None = None,
+    tag: str | None = None,
+) -> list[dict]:
+    """List products with their ASIN mappings, with optional filters."""
+    sql = """
+        SELECT DISTINCT p.id, p.category, p.brand, p.model, p.search_keywords,
+               pa.marketplace, pa.asin, pa.status, pa.notes
+        FROM products p
+        LEFT JOIN product_asins pa ON p.id = pa.product_id
+        LEFT JOIN product_tags pt ON p.id = pt.product_id
+        WHERE 1=1
+    """
+    params: list = []
+    if category:
+        sql += " AND p.category = ?"
+        params.append(category)
+    if brand:
+        sql += " AND p.brand = ?"
+        params.append(brand)
+    if marketplace:
+        sql += " AND pa.marketplace = ?"
+        params.append(marketplace)
+    if tag:
+        sql += " AND pt.tag = ?"
+        params.append(tag)
+    sql += " ORDER BY p.brand, p.model, pa.marketplace"
+    return [dict(r) for r in conn.execute(sql, params)]
+
+
+def load_products_from_db(
+    conn: sqlite3.Connection,
+    category: str | None = None,
+    brand: str | None = None,
+    marketplace: str | None = None,
+) -> list:
+    """Materialize Product objects from the product registry tables.
+
+    Returns a list of Product dataclasses with marketplace_overrides
+    populated from product_asins rows, matching the same shape as
+    products loaded from YAML via ProductEntry.to_product().
+    """
+    from amz_scout.models import Product
+
+    # Get all matching products
+    sql = "SELECT DISTINCT p.id, p.category, p.brand, p.model, p.search_keywords FROM products p"
+    joins = []
+    wheres = []
+    params: list = []
+
+    if marketplace:
+        joins.append("JOIN product_asins pa ON p.id = pa.product_id")
+        wheres.append("pa.marketplace = ? AND pa.status != 'wrong_product'")
+        params.append(marketplace)
+
+    if category:
+        wheres.append("p.category = ?")
+        params.append(category)
+    if brand:
+        wheres.append("p.brand = ?")
+        params.append(brand)
+
+    if joins:
+        sql += " " + " ".join(joins)
+    if wheres:
+        sql += " WHERE " + " AND ".join(wheres)
+    sql += " ORDER BY p.brand, p.model"
+
+    product_rows = conn.execute(sql, params).fetchall()
+    if not product_rows:
+        return []
+
+    # Get all ASIN mappings for these products
+    product_ids = [r["id"] for r in product_rows]
+    placeholders = ",".join("?" * len(product_ids))
+    asin_rows = conn.execute(
+        f"SELECT product_id, marketplace, asin, status "
+        f"FROM product_asins WHERE product_id IN ({placeholders}) "
+        f"AND status != 'wrong_product'",
+        product_ids,
+    ).fetchall()
+
+    # Group ASINs by product_id
+    asins_by_product: dict[int, dict[str, dict[str, str]]] = {}
+    for ar in asin_rows:
+        pid = ar["product_id"]
+        if pid not in asins_by_product:
+            asins_by_product[pid] = {}
+        asins_by_product[pid][ar["marketplace"]] = {"asin": ar["asin"]}
+
+    # Build Product objects
+    results = []
+    for pr in product_rows:
+        overrides = asins_by_product.get(pr["id"], {})
+        # Pick the first ASIN as default (any marketplace)
+        first_asin = ""
+        if overrides:
+            first_asin = next(iter(overrides.values()))["asin"]
+
+        results.append(Product(
+            category=pr["category"],
+            brand=pr["brand"],
+            model=pr["model"],
+            default_asin=first_asin,
+            search_keywords=pr["search_keywords"] or "",
+            marketplace_overrides=overrides,
+        ))
+    return results
+
+
+def update_asin_status(
+    conn: sqlite3.Connection,
+    product_id: int,
+    marketplace: str,
+    status: str,
+    notes: str = "",
+) -> None:
+    """Update the status and notes for a product/marketplace ASIN mapping."""
+    with conn:
+        conn.execute(
+            "UPDATE product_asins SET status = ?, notes = ?, last_checked = "
+            "strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), "
+            "updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') "
+            "WHERE product_id = ? AND marketplace = ?",
+            (status, notes, product_id, marketplace),
+        )
+
+
+def get_unverified_asins(
+    conn: sqlite3.Connection,
+    marketplace: str | None = None,
+) -> list[dict]:
+    """Return product/ASIN pairs with status 'unverified'."""
+    sql = """
+        SELECT p.id AS product_id, p.brand, p.model, pa.marketplace, pa.asin
+        FROM products p
+        JOIN product_asins pa ON p.id = pa.product_id
+        WHERE pa.status = 'unverified'
+    """
+    params: list = []
+    if marketplace:
+        sql += " AND pa.marketplace = ?"
+        params.append(marketplace)
+    sql += " ORDER BY p.brand, p.model, pa.marketplace"
+    return [dict(r) for r in conn.execute(sql, params)]
+
+
+def find_product_exact(
+    conn: sqlite3.Connection,
+    brand: str,
+    model: str,
+) -> dict | None:
+    """Find a product by exact brand + model match. Returns dict with id or None."""
+    row = conn.execute(
+        "SELECT id FROM products WHERE brand = ? AND model = ?",
+        (brand, model),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def find_product(
+    conn: sqlite3.Connection,
+    query_str: str,
+    marketplace: str | None = None,
+) -> dict | None:
+    """Find a product by model substring or ASIN. Returns dict or None."""
+    # Try ASIN lookup first
+    if len(query_str) == 10 and query_str.isascii() and query_str.isalnum():
+        sql = """
+            SELECT p.id, p.category, p.brand, p.model, pa.asin, pa.marketplace
+            FROM products p
+            JOIN product_asins pa ON p.id = pa.product_id
+            WHERE pa.asin = ?
+        """
+        params: list = [query_str]
+        if marketplace:
+            sql += " AND pa.marketplace = ?"
+            params.append(marketplace)
+        sql += " LIMIT 1"
+        row = conn.execute(sql, params).fetchone()
+        if row:
+            return dict(row)
+
+    # Model substring match
+    sql = """
+        SELECT p.id, p.category, p.brand, p.model, pa.asin, pa.marketplace
+        FROM products p
+        LEFT JOIN product_asins pa ON p.id = pa.product_id
+        WHERE p.model LIKE ?
+    """
+    params = [f"%{query_str}%"]
+    if marketplace:
+        sql += " AND pa.marketplace = ?"
+        params.append(marketplace)
+    sql += " LIMIT 1"
+    row = conn.execute(sql, params).fetchone()
+    return dict(row) if row else None
 
 
 # ─── Migration helpers ────────────────────────────────────────────────
