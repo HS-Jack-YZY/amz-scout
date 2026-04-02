@@ -41,13 +41,16 @@ User asks about product data
 
 ```python
 from amz_scout.api import (
-    resolve_project, resolve_product, ensure_keepa_data,
+    # Queries
     query_latest, query_trends, query_compare, query_ranking,
     query_availability, query_sellers, query_deals,
-    check_freshness, keepa_budget,
-    # Product registry management
-    add_product, remove_product_by_model, update_product_asin,
-    list_products, import_yaml,
+    # Data management
+    ensure_keepa_data, check_freshness, keepa_budget, validate_asins,
+    # Product registry
+    list_products, add_product, remove_product_by_model,
+    update_product_asin, import_yaml, discover_asin,
+    # Resolution helpers
+    resolve_product,
 )
 ```
 
@@ -209,7 +212,7 @@ ruff format src/ tests/       # Format
 
 ```
 api.py  ─────────────────────────  Programmatic API (strings in, dicts out)
-  │                                  12 public functions, no exceptions to caller
+  │                                  20+ public functions, no exceptions to caller
   │
 cli.py  ─────────────────────────  Typer CLI (thin shell, delegates to api.py for queries)
   │
@@ -225,7 +228,7 @@ cli.py  ────────────────────────
   ├─→ browser.py                   BrowserSession: subprocess wrapper around `browser-use` CLI
   │     └→ marketplace.py          Per-marketplace setup (cookies, delivery address, currency)
   │     └→ scraper/amazon.py       JS extraction from product pages → CompetitiveData dataclass
-  │     └→ scraper/search.py       ASIN discovery via search fallback + auto-writeback to YAML
+  │     └→ scraper/search.py       ASIN discovery via search fallback + auto-writeback to DB
   │
   ├─→ freshness.py                  Strategy evaluation (lazy/offline/max-age/fresh) — pure functions
   ├─→ keepa_service.py              Cache-first orchestration: check DB → read raw JSON or fetch API
@@ -238,21 +241,20 @@ cli.py  ────────────────────────
 ### Key Design Decisions
 
 - **browser-use is a subprocess**, not a Python library. `BrowserSession` calls the CLI via `subprocess.run()`. One session persists per marketplace.
-- **ASIN resolution has a 3-level fallback**: marketplace_overrides → default_asin → search. Found ASINs are auto-written back to the project YAML.
+- **ASIN resolution has a 4-level fallback**: DB registry → config products → ASIN pass-through → error. Found ASINs are auto-written to the SQLite product registry (not YAML).
 - **Keepa raw JSON is always saved** so `reparse` can regenerate CSVs without spending tokens.
 - **All data models are frozen dataclasses** (immutable). CSV merge creates new lists rather than mutating.
 - **Config uses Pydantic for validation**, data models use stdlib `dataclasses` — intentional split.
 
 ### Database Schema (db.py)
 
-6 tables: `competitive_snapshots` (browser data), `keepa_time_series` (price arrays), `keepa_buybox_history`, `keepa_coupon_history`, `keepa_deals`, `keepa_products` (metadata). Series types 0-35 follow Keepa's csv[] indices; 100 = monthly_sold, 200+ = category rankings.
+9 tables: **Data**: `competitive_snapshots` (browser), `keepa_time_series` (price arrays), `keepa_buybox_history`, `keepa_coupon_history`, `keepa_deals`, `keepa_products` (metadata + fetch_mode). **Product registry**: `products`, `product_asins` (per-marketplace ASIN + status), `product_tags`. Series types 0-35 follow Keepa's csv[] indices; 100 = monthly_sold, 200+ = category rankings.
 
 ### Config Structure
 
-- `config/marketplaces.yaml` — 13 marketplace definitions (domain, Keepa codes, currency, region, postcode)
-- **Keepa support**: 11 of 13 marketplaces have Keepa API support. AU and NL are browser-only (`keepa_domain_code: null`). Valid domain codes are defined in `KEEPA_VALID_DOMAINS` in `config.py`.
-- `config/<project>.yaml` — Product list, target marketplaces, scrape settings (retry_count, delays)
-- Products can have `marketplace_overrides` for per-site ASINs and `search_keywords` for discovery fallback
+- `config/marketplaces.yaml` — 13 marketplace definitions (domain, Keepa codes, currency, region, postcode). **Only required YAML file.**
+- **Keepa support**: 11 of 13 marketplaces have Keepa API support. AU and NL are browser-only (`keepa_domain_code: null`).
+- `config/<project>.yaml` — **Legacy import format**, not required for daily operations. Use `import_yaml()` to migrate to DB.
 
 ### External Dependencies
 
@@ -263,15 +265,15 @@ cli.py  ────────────────────────
 
 ```
 output/
-  ├── amz_scout.db                   # Shared SQLite database (all projects)
-  └── <project>/data/{region}/
-      ├── raw/{site}_{asin}.json     # Keepa raw responses (per-project)
+  ├── amz_scout.db                   # Shared SQLite database (product registry + all data)
+  └── data/{region}/
+      ├── raw/{site}_{asin}.json     # Keepa raw responses
       ├── {site}_competitive_data.csv  # Current Amazon page data
       └── {site}_price_history.csv     # Keepa 90-day price trends
 ```
 
-- **Database is shared** across projects at `output/amz_scout.db` — Keepa data is ASIN-centric, no need to isolate
-- **CSV and raw JSON remain per-project** for project-specific reports
+- **Database is the single source of truth** for products, ASINs, and all Keepa/competitive data
+- **Raw JSON and CSV** are per-region flat directories (no per-project nesting in DB-first mode)
 
 Regions: `eu` (UK/DE/FR/IT/ES/NL), `na` (US/CA/MX), `apac` (JP/AU/IN), `sa` (BR)
 
