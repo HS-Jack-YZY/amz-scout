@@ -180,7 +180,13 @@ r = batch_discover(candidates=r["meta"]["discover_pending"], headed=True)
 
 11. **绝不猜测 ASIN**: 不在注册表的产品不要编造 ASIN。应该：(a) 问用户提供 ASIN，或 (b) 用 `discover_asin()` 浏览器搜索。现在用户直接给 ASIN 查询可以走临时查询（1 token），但结果 meta 中会标明是未注册产品。
 
-12. **product_tags 表暂不使用**: 表已建好但不作为功能依赖。过滤统一用 `category` / `brand` / `marketplace`。
+12. **禁止直接调用 Keepa API（严格执行）**:
+    - **绝不**用 `requests.get("https://api.keepa.com/...")` 或任何方式直接调用 Keepa API。所有 Keepa 操作必须通过 `amz_scout.api` 函数。
+    - **绝不**调用 Keepa search endpoint (`/search`)。一次搜索消耗 10+ token，极易耗尽额度。
+    - 当用户给产品名而非 ASIN 时，按此优先级找 ASIN：(1) 问用户 → (2) WebSearch 工具搜 Amazon 产品页 URL 提取 ASIN（0 token）→ (3) `discover_asin()` 浏览器搜索（0 token，慢）。
+    - 违反此规则会导致 token 耗尽（60 token 上限，1/min 恢复），阻塞所有用户至少 1 小时。
+
+13. **product_tags 表暂不使用**: 表已建好但不作为功能依赖。过滤统一用 `category` / `brand` / `marketplace`。
 
 ### Available Projects
 
