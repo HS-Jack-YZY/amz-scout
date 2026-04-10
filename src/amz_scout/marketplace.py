@@ -186,13 +186,13 @@ def _set_ca_address(browser: BrowserSession, config: MarketplaceConfig) -> bool:
 def _set_au_address(browser: BrowserSession, config: MarketplaceConfig) -> bool:
     """Set address for AU (postcode + city dropdown)."""
     # Type postcode
-    result = browser.evaluate(f"""(function() {{
+    result = browser.evaluate("""(function() {
         var input = document.querySelector('#GLUXPostalCodeWithCity_PostalCodeInput');
-        if (!input) return JSON.stringify({{error: 'AU input not found'}});
+        if (!input) return JSON.stringify({error: 'AU input not found'});
         input.focus();
         input.value = '';
-        return JSON.stringify({{ok: true}});
-    }})()""")
+        return JSON.stringify({ok: true});
+    })()""")
 
     if "error" in str(result):
         logger.warning("AU postcode input not found")

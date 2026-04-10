@@ -25,7 +25,8 @@ User asks about product data
   │   ├─ "数据新鲜度"              → check_freshness()
   │   ├─ "Keepa token 余额"       → keepa_budget()
   │   ├─ "验证 ASIN"              → validate_asins(marketplace=)
-  │   └─ "验证并发现"              → validate_and_discover(marketplace=)
+  │   ├─ "验证并发现"              → validate_and_discover(marketplace=)
+  │   └─ "同步注册表"              → sync_registry()
   │
   ├─ 产品注册表管理
   │   ├─ "有哪些产品"              → list_products(category?, brand?, marketplace?)
@@ -48,6 +49,7 @@ from amz_scout.api import (
     query_availability, query_sellers, query_deals,
     # Data management
     ensure_keepa_data, check_freshness, keepa_budget, validate_asins,
+    sync_registry,
     # Product registry
     list_products, add_product, remove_product_by_model,
     update_product_asin, import_yaml, discover_asin,
@@ -158,10 +160,11 @@ r = batch_discover(candidates=r["meta"]["discover_pending"], headed=True)
 
 3. **Marketplace aliases**: All marketplace parameters accept case variants (`"uk"`), Keepa codes (`"GB"`), Amazon domains (`"amazon.co.uk"`), and currency codes (`"GBP"`).
 
-4. **Product resolution (4-level + token 保护)**: DB registry → config products → ASIN pass-through → error。第 3 级（ASIN 透传）现在有三层防护：
+4. **Product resolution (4-level + auto-registration)**: DB registry → config products → ASIN pass-through → error。第 3 级（ASIN 透传）行为：
    - **格式校验**：`^[A-Z0-9]{10}$`，不匹配直接报错。非 B 开头加软警告（可能是 ISBN）。
    - **跨市场感知**：如果 ASIN 在 DB 中注册于其他市场，`meta.warnings` 会提醒。
-   - **临时查询**：ASIN 透传时构造临时 Product 自动 LAZY fetch（消耗 1 token），但**不写入产品注册表**。返回 `meta.resolution_level=3` + `meta.warnings`（含 Keepa 产品标题）。用户确认是目标产品后应 `add_product()` 注册。
+   - **自动注册**：ASIN 透传时构造临时 Product 自动 LAZY fetch（消耗 1 token）。如果 Keepa 返回有效的 brand + title，**自动注册到 products + product_asins**。`meta.auto_registered=True` + `meta.registered_as` 包含注册信息。下次查询将直接在 DB registry 命中（level 1）。
+   - **跳过条件**：如果 Keepa 返回的 brand 或 title 为空（产品不存在或数据不完整），不注册。
 
 5. **Token awareness + 批量门控**: Keepa Pro 60 tokens, 1/min 恢复。`ensure_keepa_data()` 预估 token >= 6 时自动返回 `phase="needs_confirmation"` + 成本预览，传 `confirm=True` 后才执行。单次查询（<6 token）直接执行不拦截。
 
@@ -172,13 +175,13 @@ r = batch_discover(candidates=r["meta"]["discover_pending"], headed=True)
 
 7. **Price encoding**: Keepa time series `value` 是分为单位（除以 100）。Rating ×10（45 = 4.5 星）。Sales rank 是原始整数。value=-1 表示不可用。
 
-8. **Product registry (SQLite)**: Products 和 per-marketplace ASINs 在 `products` + `product_asins` 表。`add_product()` 注册新产品，`import_yaml()` 批量导入。ASIN status: `unverified` → `verified` / `wrong_product` / `not_listed` / `unavailable`。用 `validate_asins()` 做标题匹配验证。
+8. **Product registry (SQLite)**: 注册表是产品身份管理系统（跨市场 ASIN 关联），不是监控白名单。注册 ≠ 监控刷新。Products 和 per-marketplace ASINs 在 `products` + `product_asins` 表。产品通过三种方式注册：(a) `add_product()` 手动注册，(b) `import_yaml()` 批量导入，(c) **Keepa 数据写入时自动注册**（brand+title 非空即注册）。`sync_registry()` 可一次性注册所有已有 Keepa 数据但未注册的孤儿 ASIN。
 
 9. **project 参数可选**: 所有 query 函数的 `project` 参数为 `str | None = None`。传 None 从 SQLite 加载产品。传字符串走旧 YAML 路径（向后兼容）。
 
 10. **ASIN 验证 + 发现流程**: 用 `validate_and_discover(marketplace=)` 一站式。默认返回 `phase="pending_confirmation"` + `discover_pending` 列表。确认后用 `batch_discover(candidates=...)` 执行。也可 `auto_discover=True` 一步到位（10-30s/个）。
 
-11. **绝不猜测 ASIN**: 不在注册表的产品不要编造 ASIN。应该：(a) 问用户提供 ASIN，或 (b) 用 `discover_asin()` 浏览器搜索。现在用户直接给 ASIN 查询可以走临时查询（1 token），但结果 meta 中会标明是未注册产品。
+11. **绝不猜测 ASIN**: 不在注册表的产品不要编造 ASIN。应该：(a) 问用户提供 ASIN，或 (b) 用 `discover_asin()` 浏览器搜索。用户直接给 ASIN 查询时会自动 fetch + 自动注册（如果 Keepa 有数据），无需手动操作。
 
 12. **禁止直接调用 Keepa API（严格执行）**:
     - **绝不**用 `requests.get("https://api.keepa.com/...")` 或任何方式直接调用 Keepa API。所有 Keepa 操作必须通过 `amz_scout.api` 函数。

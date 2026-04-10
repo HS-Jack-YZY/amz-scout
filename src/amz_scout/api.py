@@ -94,10 +94,10 @@ def _build_marketplace_aliases(marketplaces: dict[str, MarketplaceConfig]) -> di
     """Build a lowercase alias → canonical code map from marketplace definitions."""
     aliases: dict[str, str] = {}
     for code, mp in marketplaces.items():
-        aliases[code.lower()] = code               # "uk" → "UK"
-        aliases[mp.keepa_domain.lower()] = code    # "gb" → "UK"
-        aliases[mp.amazon_domain.lower()] = code   # "amazon.co.uk" → "UK"
-        aliases[mp.currency_code.lower()] = code   # "gbp" → "UK"
+        aliases[code.lower()] = code  # "uk" → "UK"
+        aliases[mp.keepa_domain.lower()] = code  # "gb" → "UK"
+        aliases[mp.amazon_domain.lower()] = code  # "amazon.co.uk" → "UK"
+        aliases[mp.currency_code.lower()] = code  # "gbp" → "UK"
     return aliases
 
 
@@ -125,8 +125,14 @@ def _load_project(project: str) -> _ProjectInfo:
     db_path = resolve_db_path(config.project.output_dir)
     output_base = Path(config.project.output_dir)
 
-    return _ProjectInfo(config, marketplaces, products, db_path, output_base,
-                        _build_marketplace_aliases(marketplaces))
+    return _ProjectInfo(
+        config,
+        marketplaces,
+        products,
+        db_path,
+        output_base,
+        _build_marketplace_aliases(marketplaces),
+    )
 
 
 def _resolve_site(
@@ -168,7 +174,9 @@ def _resolve_context(
     if db_path.exists():
         with open_db(db_path) as conn:
             products = load_products_from_db(
-                conn, category=category, marketplace=marketplace,
+                conn,
+                category=category,
+                marketplace=marketplace,
             )
 
     return _ProjectInfo(
@@ -198,6 +206,7 @@ def _resolve_asin(
     # Level 1: SQLite registry (most authoritative)
     if conn is not None:
         from amz_scout.db import find_product
+
         row = find_product(conn, query_str, marketplace)
         if row and row.get("asin"):
             return row["asin"], row["model"], "db", []
@@ -238,11 +247,11 @@ def _resolve_asin(
                     "The same product may use a different ASIN on this marketplace."
                 )
 
-        # Warn that this is an unregistered ASIN
+        # Note: ASIN will be auto-registered when Keepa data is fetched
+        # (if brand and title are available from Keepa).
         warnings.append(
-            f"ASIN {candidate} is not in the product registry. "
-            "Data will be fetched but not persisted to registry. "
-            "Use add_product() to register if you want to keep tracking it."
+            f"ASIN {candidate} is not yet in the product registry. "
+            "It will be auto-registered when Keepa data is fetched."
         )
 
         return candidate, candidate, "asin", warnings
@@ -280,7 +289,10 @@ def _auto_fetch(
         from amz_scout.keepa_service import get_keepa_data
 
         result = get_keepa_data(
-            conn, products, sites, info.marketplaces,
+            conn,
+            products,
+            sites,
+            info.marketplaces,
             strategy=FreshnessStrategy.LAZY,
             output_base=info.output_base,
         )
@@ -297,7 +309,9 @@ def _auto_fetch(
 
 
 def _try_mark_not_listed(
-    conn: sqlite3.Connection, asin: str, site: str,
+    conn: sqlite3.Connection,
+    asin: str,
+    site: str,
 ) -> None:
     """If this ASIN is in the product registry, mark it as not_listed."""
     try:
@@ -309,7 +323,10 @@ def _try_mark_not_listed(
         ).fetchone()
         if row:
             update_asin_status(
-                conn, row["product_id"], site, "not_listed",
+                conn,
+                row["product_id"],
+                site,
+                "not_listed",
                 notes="Keepa returned no title or price data",
             )
     except Exception:
@@ -320,7 +337,8 @@ def _add_dates(rows: list[dict]) -> list[dict]:
     """Return new list with human-readable date field from keepa_ts."""
     return [
         {**r, "date": (KEEPA_EPOCH + timedelta(minutes=r["keepa_ts"])).strftime("%Y-%m-%d %H:%M")}
-        if "keepa_ts" in r else r
+        if "keepa_ts" in r
+        else r
         for r in rows
     ]
 
@@ -381,7 +399,10 @@ def resolve_product(
         site = _resolve_site(marketplace, info.marketplace_aliases)
         with open_db(info.db_path) as conn:
             asin, model, source, warns = _resolve_asin(
-                info.products, query_str, site, conn=conn,
+                info.products,
+                query_str,
+                site,
+                conn=conn,
             )
     except Exception as e:
         logger.exception("resolve_product failed")
@@ -434,7 +455,10 @@ def query_trends(
 
         with open_db(info.db_path) as conn:
             asin, model, source, resolve_warnings = _resolve_asin(
-                info.products, product, site, conn=conn,
+                info.products,
+                product,
+                site,
+                conn=conn,
             )
             series_type = SERIES_MAP.get(series.lower(), SERIES_NEW)
             series_name = SERIES_NAMES.get(series_type, str(series_type))
@@ -443,13 +467,16 @@ def query_trends(
                 # For ASIN pass-through, build a temporary Product so fetch works
                 if source == "asin":
                     tmp_product = Product(
-                        category="", brand="", model=asin,
+                        category="",
+                        brand="",
+                        model=asin,
                         default_asin=asin,
                     )
                     fetch_meta = _auto_fetch(conn, info, [tmp_product], [site])
                 else:
                     fetch_meta = _auto_fetch(
-                        conn, info,
+                        conn,
+                        info,
                         [p for p in info.products if p.model == model],
                         [site],
                     )
@@ -457,16 +484,32 @@ def query_trends(
                 fetch_meta = {}
             rows = query_price_trends(conn, asin, site, series_type, days)
 
-            # If ASIN pass-through fetched data, attach Keepa title for context
+            # If ASIN pass-through fetched data, check auto-registration result
             if source == "asin" and fetch_meta.get("auto_fetched"):
                 title_row = conn.execute(
                     "SELECT title FROM keepa_products WHERE asin = ? AND site = ?",
                     (asin, site),
                 ).fetchone()
                 if title_row and title_row["title"]:
-                    resolve_warnings.insert(
-                        0, f"Keepa product title: {title_row['title'][:100]}"
-                    )
+                    resolve_warnings.insert(0, f"Keepa product title: {title_row['title'][:100]}")
+                # Check if auto-registration happened
+                reg_row = conn.execute(
+                    "SELECT p.id, p.brand, p.model FROM product_asins pa "
+                    "JOIN products p ON pa.product_id = p.id "
+                    "WHERE pa.asin = ? AND pa.marketplace = ?",
+                    (asin, site),
+                ).fetchone()
+                if reg_row:
+                    fetch_meta["auto_registered"] = True
+                    fetch_meta["registered_as"] = {
+                        "product_id": reg_row["id"],
+                        "brand": reg_row["brand"],
+                        "model": reg_row["model"],
+                    }
+                    # Replace the "not yet registered" warning
+                    resolve_warnings = [
+                        w for w in resolve_warnings if "not yet in the product registry" not in w
+                    ]
 
         rows = _add_dates(rows)
     except Exception as e:
@@ -480,9 +523,14 @@ def query_trends(
         meta_extra["resolution_level"] = 3
 
     return _envelope(
-        True, data=rows,
-        asin=asin, model=model, series_name=series_name, count=len(rows),
-        **fetch_meta, **meta_extra,
+        True,
+        data=rows,
+        asin=asin,
+        model=model,
+        series_name=series_name,
+        count=len(rows),
+        **fetch_meta,
+        **meta_extra,
     )
 
 
@@ -547,7 +595,10 @@ def query_sellers(
 
         with open_db(info.db_path) as conn:
             asin, model, source, resolve_warnings = _resolve_asin(
-                info.products, product, site, conn=conn,
+                info.products,
+                product,
+                site,
+                conn=conn,
             )
             if auto_fetch:
                 if source == "asin":
@@ -555,7 +606,8 @@ def query_sellers(
                     fetch_meta = _auto_fetch(conn, info, [tmp], [site])
                 else:
                     fetch_meta = _auto_fetch(
-                        conn, info,
+                        conn,
+                        info,
                         [p for p in info.products if p.model == model],
                         [site],
                     )
@@ -571,8 +623,9 @@ def query_sellers(
     meta_extra: dict = {}
     if resolve_warnings:
         meta_extra["warnings"] = resolve_warnings
-    return _envelope(True, data=rows, asin=asin, model=model, count=len(rows),
-                     **fetch_meta, **meta_extra)
+    return _envelope(
+        True, data=rows, asin=asin, model=model, count=len(rows), **fetch_meta, **meta_extra
+    )
 
 
 def query_deals(
@@ -592,9 +645,11 @@ def query_deals(
 
         with open_db(info.db_path) as conn:
             if auto_fetch and info.products:
-                fetch_sites = [site] if site else list({
-                    s for p in info.products for s in p.marketplace_overrides
-                })
+                fetch_sites = (
+                    [site]
+                    if site
+                    else list({s for p in info.products for s in p.marketplace_overrides})
+                )
                 fetch_meta = (
                     _auto_fetch(conn, info, info.products, fetch_sites) if fetch_sites else {}
                 )
@@ -654,9 +709,11 @@ def ensure_keepa_data(
 
         info = _resolve_context(project, marketplace=marketplace)
         site = _resolve_site(marketplace, info.marketplace_aliases)
-        sites = [site] if site else list({
-            s for p in info.products for s in p.marketplace_overrides
-        }) or ["UK"]
+        sites = (
+            [site]
+            if site
+            else list({s for p in info.products for s in p.marketplace_overrides}) or ["UK"]
+        )
         products = info.products
 
         if product:
@@ -671,7 +728,11 @@ def ensure_keepa_data(
                 fetched_map = qf(conn, products, sites)
                 requested_mode = "detailed" if detailed else "basic"
                 freshness = evaluate_freshness(
-                    products, sites, fetched_map, fs, max_age_days,
+                    products,
+                    sites,
+                    fetched_map,
+                    fs,
+                    max_age_days,
                     requested_mode=requested_mode,
                 )
                 _, fetch_list, _ = partition_by_action(freshness)
@@ -680,8 +741,7 @@ def ensure_keepa_data(
 
                 if estimated_tokens >= _BATCH_TOKEN_THRESHOLD:
                     preview = [
-                        {"asin": pf.asin, "site": pf.site, "model": pf.model}
-                        for pf in fetch_list
+                        {"asin": pf.asin, "site": pf.site, "model": pf.model} for pf in fetch_list
                     ]
                     return _envelope(
                         True,
@@ -781,9 +841,11 @@ def check_freshness(
 
         info = _resolve_context(project, marketplace=marketplace)
         site = _resolve_site(marketplace, info.marketplace_aliases)
-        sites = [site] if site else list({
-            s for p in info.products for s in p.marketplace_overrides
-        }) or ["UK"]
+        sites = (
+            [site]
+            if site
+            else list({s for p in info.products for s in p.marketplace_overrides}) or ["UK"]
+        )
         products = info.products
 
         if product:
@@ -793,7 +855,10 @@ def check_freshness(
         with open_db(info.db_path) as conn:
             fetched_map = query_freshness(conn, products, sites)
             results = evaluate_freshness(
-                products, sites, fetched_map, FreshnessStrategy.MAX_AGE,
+                products,
+                sites,
+                fetched_map,
+                FreshnessStrategy.MAX_AGE,
             )
             matrix = format_freshness_matrix(results, sites)
     except Exception as e:
@@ -902,7 +967,9 @@ def add_product(
 
 
 def remove_product_by_model(
-    brand: str, model: str, db_path: Path | str | None = None,
+    brand: str,
+    model: str,
+    db_path: Path | str | None = None,
 ) -> dict:
     """Remove a product by exact brand + model match."""
     try:
@@ -1011,6 +1078,34 @@ def import_yaml(
     )
 
 
+def sync_registry(db_path: Path | str | None = None) -> dict:
+    """Register orphan ASINs from keepa_products into the product registry.
+
+    Scans ``keepa_products`` for entries not yet in ``product_asins`` and
+    auto-registers those with a valid brand and title.
+    """
+    try:
+        from amz_scout.db import sync_registry_from_keepa
+
+        path = _get_db(db_path)
+        with open_db(path) as conn:
+            results = sync_registry_from_keepa(conn)
+
+        registered = [r for r in results if r.get("registered")]
+        skipped = [r for r in results if not r.get("registered")]
+    except Exception as e:
+        logger.exception("sync_registry failed")
+        return _envelope(False, error=str(e))
+
+    return _envelope(
+        True,
+        data=registered,
+        registered=len(registered),
+        skipped=len(skipped),
+        skipped_details=skipped,
+    )
+
+
 def validate_asins(
     marketplace: str | None = None,
     db_path: Path | str | None = None,
@@ -1058,54 +1153,75 @@ def validate_asins(
                 model = row["model"].lower()
                 pid = row["product_id"]
                 kp_fetched_at = row["kp_fetched_at"]  # None → no Keepa row at all
-                kp_title = row["kp_title"]             # None → row exists, title missing
+                kp_title = row["kp_title"]  # None → row exists, title missing
 
                 if kp_fetched_at is None:
                     # No Keepa data yet — skip, don't change status
-                    results_list.append({
-                        "brand": row["brand"], "model": row["model"],
-                        "marketplace": site, "asin": asin,
-                        "status": "unverified", "reason": "no keepa data",
-                    })
+                    results_list.append(
+                        {
+                            "brand": row["brand"],
+                            "model": row["model"],
+                            "marketplace": site,
+                            "asin": asin,
+                            "status": "unverified",
+                            "reason": "no keepa data",
+                        }
+                    )
                     continue
 
                 title = (kp_title or "").lower()
 
                 if not title:
                     # Keepa returned the ASIN but with no title → not listed
-                    update_asin_status(conn, pid, site, "not_listed",
-                                       notes="Keepa returned no title")
-                    results_list.append({
-                        "brand": row["brand"], "model": row["model"],
-                        "marketplace": site, "asin": asin,
-                        "status": "not_listed", "reason": "no title in Keepa",
-                    })
+                    update_asin_status(
+                        conn, pid, site, "not_listed", notes="Keepa returned no title"
+                    )
+                    results_list.append(
+                        {
+                            "brand": row["brand"],
+                            "model": row["model"],
+                            "marketplace": site,
+                            "asin": asin,
+                            "status": "not_listed",
+                            "reason": "no title in Keepa",
+                        }
+                    )
                     continue
 
                 # Fuzzy match: check if brand OR significant model tokens appear in title
                 brand_match = brand in title
                 # Extract significant tokens from model (>2 chars, skip parentheses content)
-                model_tokens = [t for t in model.replace("(", " ").replace(")", " ").split()
-                                if len(t) > 2]
+                model_tokens = [
+                    t for t in model.replace("(", " ").replace(")", " ").split() if len(t) > 2
+                ]
                 model_match = any(t in title for t in model_tokens) if model_tokens else False
 
                 if brand_match or model_match:
-                    update_asin_status(conn, pid, site, "verified",
-                                       notes=f"title: {kp_title[:80]}")
-                    results_list.append({
-                        "brand": row["brand"], "model": row["model"],
-                        "marketplace": site, "asin": asin,
-                        "status": "verified", "reason": "title matches",
-                    })
+                    update_asin_status(conn, pid, site, "verified", notes=f"title: {kp_title[:80]}")
+                    results_list.append(
+                        {
+                            "brand": row["brand"],
+                            "model": row["model"],
+                            "marketplace": site,
+                            "asin": asin,
+                            "status": "verified",
+                            "reason": "title matches",
+                        }
+                    )
                 else:
-                    update_asin_status(conn, pid, site, "wrong_product",
-                                       notes=f"title: {kp_title[:80]}")
-                    results_list.append({
-                        "brand": row["brand"], "model": row["model"],
-                        "marketplace": site, "asin": asin,
-                        "status": "wrong_product",
-                        "reason": f"title mismatch: {kp_title[:60]}",
-                    })
+                    update_asin_status(
+                        conn, pid, site, "wrong_product", notes=f"title: {kp_title[:80]}"
+                    )
+                    results_list.append(
+                        {
+                            "brand": row["brand"],
+                            "model": row["model"],
+                            "marketplace": site,
+                            "asin": asin,
+                            "status": "wrong_product",
+                            "reason": f"title mismatch: {kp_title[:60]}",
+                        }
+                    )
     except Exception as e:
         logger.exception("validate_asins failed")
         return _envelope(False, error=str(e))
@@ -1116,9 +1232,13 @@ def validate_asins(
     skipped = sum(1 for r in results_list if r["status"] == "unverified")
 
     return _envelope(
-        True, data=results_list,
-        verified=verified, wrong_product=wrong, not_listed=not_listed,
-        skipped=skipped, total=len(results_list),
+        True,
+        data=results_list,
+        verified=verified,
+        wrong_product=wrong,
+        not_listed=not_listed,
+        skipped=skipped,
+        total=len(results_list),
     )
 
 
@@ -1134,25 +1254,35 @@ def _run_discover_batch(
         model = c.get("model", "")
         mp = c.get("marketplace", "")
         if not (brand and model and mp):
-            results.append({
-                "brand": brand, "model": model, "marketplace": mp,
-                "ok": False, "error": "Missing brand, model, or marketplace",
-            })
+            results.append(
+                {
+                    "brand": brand,
+                    "model": model,
+                    "marketplace": mp,
+                    "ok": False,
+                    "error": "Missing brand, model, or marketplace",
+                }
+            )
             continue
 
         dr = discover_asin(
-            brand=brand, model=model, marketplace=mp,
-            headed=headed, db_path=db_path,
+            brand=brand,
+            model=model,
+            marketplace=mp,
+            headed=headed,
+            db_path=db_path,
         )
-        results.append({
-            "brand": brand,
-            "model": model,
-            "marketplace": mp,
-            "old_asin": c.get("old_asin", ""),
-            "ok": dr["ok"],
-            "new_asin": dr["data"].get("asin") if dr["ok"] else None,
-            "error": dr.get("error"),
-        })
+        results.append(
+            {
+                "brand": brand,
+                "model": model,
+                "marketplace": mp,
+                "old_asin": c.get("old_asin", ""),
+                "ok": dr["ok"],
+                "new_asin": dr["data"].get("asin") if dr["ok"] else None,
+                "error": dr.get("error"),
+            }
+        )
 
     found = sum(1 for r in results if r["ok"])
     return results, found, len(results) - found
@@ -1272,7 +1402,9 @@ def discover_asin(
         from amz_scout.marketplace import setup_marketplace
 
         if not check_browser_use_installed():
-            return _envelope(False, error="browser-use CLI not installed. Install: uv tool install browser-use")
+            return _envelope(
+                False, error="browser-use CLI not installed. Install: uv tool install browser-use"
+            )
 
         # Load marketplace config
         mp_path = CONFIG_DIR / "marketplaces.yaml"
@@ -1304,7 +1436,10 @@ def discover_asin(
             from amz_scout.scraper.search import resolve_asin_via_search
 
             found_asin = resolve_asin_via_search(
-                browser, product, site, mp_config,
+                browser,
+                product,
+                site,
+                mp_config,
                 config_path=None,  # Don't write to YAML — we write to SQLite
             )
         finally:
@@ -1323,12 +1458,24 @@ def discover_asin(
 
             existing = find_product_exact(conn, brand, model)
             if existing:
-                register_asin(conn, existing["id"], site, found_asin, status="unverified",
-                              notes="discovered via browser search")
+                register_asin(
+                    conn,
+                    existing["id"],
+                    site,
+                    found_asin,
+                    status="unverified",
+                    notes="discovered via browser search",
+                )
             else:
                 pid = register_product(conn, "", brand, model, keywords)
-                register_asin(conn, pid, site, found_asin, status="unverified",
-                              notes="discovered via browser search")
+                register_asin(
+                    conn,
+                    pid,
+                    site,
+                    found_asin,
+                    status="unverified",
+                    notes="discovered via browser search",
+                )
 
     except Exception as e:
         logger.exception("discover_asin failed")

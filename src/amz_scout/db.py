@@ -63,18 +63,42 @@ SERIES_MONTHLY_SOLD = 100
 SERIES_SALES_RANK_BASE = 200  # 200 + category_index in salesRanks dict
 
 SERIES_NAMES = {
-    0: "AMAZON", 1: "NEW", 2: "USED", 3: "SALES_RANK", 4: "LISTPRICE",
-    5: "COLLECTIBLE", 6: "REFURBISHED", 7: "NEW_FBM_SHIPPING",
-    8: "LIGHTNING_DEAL", 9: "WAREHOUSE", 10: "NEW_FBA",
-    11: "COUNT_NEW", 12: "COUNT_USED", 13: "COUNT_REFURBISHED",
-    14: "COUNT_COLLECTIBLE", 15: "EXTRA_INFO", 16: "RATING",
-    17: "COUNT_REVIEWS", 18: "BUY_BOX_SHIPPING", 19: "USED_NEW_SHIPPING",
-    20: "USED_VERY_GOOD", 21: "USED_GOOD", 22: "USED_ACCEPTABLE",
-    23: "COLLECTIBLE_NEW", 24: "COLLECTIBLE_VERY_GOOD", 25: "COLLECTIBLE_GOOD",
-    26: "COLLECTIBLE_ACCEPTABLE", 27: "COUNT_NEW_FBM", 28: "NEW_PRICE_IS_MAP",
-    29: "USED_LIKE_NEW", 30: "COUNT_USED_NEW", 31: "COUNT_USED_VERY_GOOD",
-    32: "COUNT_USED_GOOD", 33: "COUNT_USED_ACCEPTABLE",
-    34: "COUNT_COLLECTIBLE_NEW", 35: "TRADE_IN",
+    0: "AMAZON",
+    1: "NEW",
+    2: "USED",
+    3: "SALES_RANK",
+    4: "LISTPRICE",
+    5: "COLLECTIBLE",
+    6: "REFURBISHED",
+    7: "NEW_FBM_SHIPPING",
+    8: "LIGHTNING_DEAL",
+    9: "WAREHOUSE",
+    10: "NEW_FBA",
+    11: "COUNT_NEW",
+    12: "COUNT_USED",
+    13: "COUNT_REFURBISHED",
+    14: "COUNT_COLLECTIBLE",
+    15: "EXTRA_INFO",
+    16: "RATING",
+    17: "COUNT_REVIEWS",
+    18: "BUY_BOX_SHIPPING",
+    19: "USED_NEW_SHIPPING",
+    20: "USED_VERY_GOOD",
+    21: "USED_GOOD",
+    22: "USED_ACCEPTABLE",
+    23: "COLLECTIBLE_NEW",
+    24: "COLLECTIBLE_VERY_GOOD",
+    25: "COLLECTIBLE_GOOD",
+    26: "COLLECTIBLE_ACCEPTABLE",
+    27: "COUNT_NEW_FBM",
+    28: "NEW_PRICE_IS_MAP",
+    29: "USED_LIKE_NEW",
+    30: "COUNT_USED_NEW",
+    31: "COUNT_USED_VERY_GOOD",
+    32: "COUNT_USED_GOOD",
+    33: "COUNT_USED_ACCEPTABLE",
+    34: "COUNT_COLLECTIBLE_NEW",
+    35: "TRADE_IN",
     100: "MONTHLY_SOLD",
 }
 
@@ -152,9 +176,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
 
     if current < 3:
         # v3: add product registry tables
-        tables = {r[0] for r in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'"
-        ).fetchall()}
+        tables = {
+            r[0]
+            for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        }
         if "products" not in tables:
             conn.executescript("""
                 CREATE TABLE products (
@@ -402,18 +427,109 @@ def store_keepa_product(
     raw: dict,
     fetched_at: str,
     fetch_mode: str = "basic",
-) -> None:
-    """Parse a full Keepa product JSON and write all tables in one transaction."""
+) -> dict | None:
+    """Parse a full Keepa product JSON and write all tables in one transaction.
+
+    Returns a dict describing auto-registration result, or *None* if the
+    ASIN was already registered.
+    """
     with conn:
         _upsert_keepa_product(conn, asin, site, raw, fetched_at, fetch_mode)
         _insert_time_series(conn, asin, site, raw, fetched_at)
         _insert_buybox_history(conn, asin, site, raw, fetched_at)
         _insert_coupon_history(conn, asin, site, raw, fetched_at)
         _insert_deals(conn, asin, site, raw, fetched_at)
+    return _auto_register_from_keepa(conn, asin, site, raw)
+
+
+def _try_register_product(
+    conn: sqlite3.Connection,
+    asin: str,
+    site: str,
+    brand: str,
+    title: str,
+    model: str,
+    category: str,
+) -> dict | None:
+    """Register a product if brand and title are present.
+
+    Normalises inputs, falls back model → ASIN, calls ``register_product``
+    + ``register_asin``.  Returns registration details or *None* when
+    validation fails (empty brand/title).
+    """
+    brand = brand.strip()
+    title = title.strip()
+    model = model.strip() or asin
+    category = category or "uncategorized"
+
+    if not brand or not title:
+        return None
+
+    product_id = register_product(conn, category, brand, model, search_keywords=title)
+    register_asin(conn, product_id, site, asin, status="unverified")
+
+    logger.info(
+        "Auto-registered %s/%s → product %d (%s %s)",
+        site,
+        asin,
+        product_id,
+        brand,
+        model,
+    )
+    return {
+        "product_id": product_id,
+        "brand": brand,
+        "model": model,
+        "category": category,
+        "asin": asin,
+        "marketplace": site,
+    }
+
+
+def _auto_register_from_keepa(
+    conn: sqlite3.Connection,
+    asin: str,
+    site: str,
+    raw: dict,
+) -> dict | None:
+    """Auto-register a product from Keepa metadata if not already registered.
+
+    Skips silently when the ASIN is already in ``product_asins`` for this
+    marketplace, or when the Keepa data lacks *brand* or *title*.
+
+    Returns a dict with registration details, or *None* if skipped.
+    """
+    existing = conn.execute(
+        "SELECT product_id FROM product_asins WHERE asin = ? AND marketplace = ?",
+        (asin, site),
+    ).fetchone()
+    if existing:
+        return None
+
+    result = _try_register_product(
+        conn,
+        asin,
+        site,
+        brand=raw.get("brand") or "",
+        title=raw.get("title") or "",
+        model=raw.get("model") or "",
+        category=raw.get("productGroup") or "",
+    )
+    if result is None:
+        logger.debug(
+            "Skip auto-register %s/%s: missing brand or title",
+            site,
+            asin,
+        )
+    return result
 
 
 def _upsert_keepa_product(
-    conn: sqlite3.Connection, asin: str, site: str, raw: dict, fetched_at: str,
+    conn: sqlite3.Connection,
+    asin: str,
+    site: str,
+    raw: dict,
+    fetched_at: str,
     fetch_mode: str = "basic",
 ) -> None:
     fba = raw.get("fbaFees") or {}
@@ -449,15 +565,26 @@ def _upsert_keepa_product(
             ?, ?
         )""",
         (
-            asin, site,
-            raw.get("title"), raw.get("brand"), raw.get("manufacturer"),
-            raw.get("model"), raw.get("partNumber"),
-            raw.get("binding"), raw.get("productGroup"),
-            raw.get("type"), raw.get("color"), raw.get("size"),
-            raw.get("itemWeight"), raw.get("itemHeight"),
-            raw.get("itemLength"), raw.get("itemWidth"),
-            raw.get("packageWeight"), raw.get("packageHeight"),
-            raw.get("packageLength"), raw.get("packageWidth"),
+            asin,
+            site,
+            raw.get("title"),
+            raw.get("brand"),
+            raw.get("manufacturer"),
+            raw.get("model"),
+            raw.get("partNumber"),
+            raw.get("binding"),
+            raw.get("productGroup"),
+            raw.get("type"),
+            raw.get("color"),
+            raw.get("size"),
+            raw.get("itemWeight"),
+            raw.get("itemHeight"),
+            raw.get("itemLength"),
+            raw.get("itemWidth"),
+            raw.get("packageWeight"),
+            raw.get("packageHeight"),
+            raw.get("packageLength"),
+            raw.get("packageWidth"),
             _json_or_none(raw.get("features")),
             raw.get("imagesCSV"),
             len(images) if images else None,
@@ -470,8 +597,10 @@ def _upsert_keepa_product(
             raw.get("salesRankReference"),
             _json_or_none(raw.get("eanList")),
             _json_or_none(raw.get("upcList")),
-            raw.get("listedSince"), raw.get("trackingSince"),
-            fba.get("pickAndPackFee"), fba.get("lastUpdate"),
+            raw.get("listedSince"),
+            raw.get("trackingSince"),
+            fba.get("pickAndPackFee"),
+            fba.get("lastUpdate"),
             raw.get("referralFeePercentage"),
             raw.get("availabilityAmazon"),
             int(raw.get("hasReviews", False)),
@@ -479,15 +608,22 @@ def _upsert_keepa_product(
             int(raw.get("isSNS", False)),
             int(raw.get("newPriceIsMAP", False)),
             _json_or_none(raw.get("buyBoxEligibleOfferCounts")),
-            raw.get("lastUpdate"), raw.get("lastPriceChange"),
-            raw.get("lastRatingUpdate"), raw.get("lastSoldUpdate"),
-            fetched_at, fetch_mode,
+            raw.get("lastUpdate"),
+            raw.get("lastPriceChange"),
+            raw.get("lastRatingUpdate"),
+            raw.get("lastSoldUpdate"),
+            fetched_at,
+            fetch_mode,
         ),
     )
 
 
 def _insert_time_series(
-    conn: sqlite3.Connection, asin: str, site: str, raw: dict, fetched_at: str,
+    conn: sqlite3.Connection,
+    asin: str,
+    site: str,
+    raw: dict,
+    fetched_at: str,
 ) -> None:
     rows: list[tuple] = []
 
@@ -528,7 +664,11 @@ def _insert_time_series(
 
 
 def _insert_buybox_history(
-    conn: sqlite3.Connection, asin: str, site: str, raw: dict, fetched_at: str,
+    conn: sqlite3.Connection,
+    asin: str,
+    site: str,
+    raw: dict,
+    fetched_at: str,
 ) -> None:
     bbh = raw.get("buyBoxSellerIdHistory")
     if not bbh or not isinstance(bbh, list):
@@ -548,7 +688,11 @@ def _insert_buybox_history(
 
 
 def _insert_coupon_history(
-    conn: sqlite3.Connection, asin: str, site: str, raw: dict, fetched_at: str,
+    conn: sqlite3.Connection,
+    asin: str,
+    site: str,
+    raw: dict,
+    fetched_at: str,
 ) -> None:
     ch = raw.get("couponHistory")
     if not ch or not isinstance(ch, list):
@@ -557,7 +701,9 @@ def _insert_coupon_history(
     for i in range(0, len(ch) - 2, 3):
         ts, amount, ctype = ch[i], ch[i + 1], ch[i + 2]
         if isinstance(ts, int) and isinstance(amount, int):
-            rows.append((asin, site, ts, amount, ctype if isinstance(ctype, int) else 0, fetched_at))
+            rows.append(
+                (asin, site, ts, amount, ctype if isinstance(ctype, int) else 0, fetched_at)
+            )
     if rows:
         conn.executemany(
             "INSERT OR IGNORE INTO keepa_coupon_history "
@@ -568,7 +714,11 @@ def _insert_coupon_history(
 
 
 def _insert_deals(
-    conn: sqlite3.Connection, asin: str, site: str, raw: dict, fetched_at: str,
+    conn: sqlite3.Connection,
+    asin: str,
+    site: str,
+    raw: dict,
+    fetched_at: str,
 ) -> None:
     deals = raw.get("deals")
     if not deals or not isinstance(deals, list):
@@ -585,10 +735,16 @@ def _insert_deals(
             "badge, percent_claimed, deal_status, fetched_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
-                asin, site, start, end if isinstance(end, int) else None,
-                d.get("dealType", "UNKNOWN"), d.get("accessType", "ALL"),
-                d.get("badge", ""), d.get("percentClaimed", 0),
-                status, fetched_at,
+                asin,
+                site,
+                start,
+                end if isinstance(end, int) else None,
+                d.get("dealType", "UNKNOWN"),
+                d.get("accessType", "ALL"),
+                d.get("badge", ""),
+                d.get("percentClaimed", 0),
+                status,
+                fetched_at,
             ),
         )
 
@@ -597,7 +753,9 @@ def _insert_deals(
 
 
 def upsert_competitive(
-    conn: sqlite3.Connection, rows: list[CompetitiveData], project: str = "",
+    conn: sqlite3.Connection,
+    rows: list[CompetitiveData],
+    project: str = "",
 ) -> int:
     """Insert or replace competitive snapshots. Returns rows affected."""
     if not rows:
@@ -671,12 +829,35 @@ def _competitive_to_db_row(r: CompetitiveData, project: str = "") -> tuple:
             qa_ct = int(m.group(1))
 
     return (
-        r.date, r.site, r.category, r.brand, r.model, r.asin, r.title,
-        price_cents, currency, rating_val, review_val,
-        bought, bsr_val, available, r.url,
-        r.stock_status, stock_ct, r.sold_by, r.other_offers,
-        r.coupon, is_prime, r.star_distribution, img_ct, qa_ct,
-        r.fulfillment, r.price, r.rating, r.review_count, r.bsr,
+        r.date,
+        r.site,
+        r.category,
+        r.brand,
+        r.model,
+        r.asin,
+        r.title,
+        price_cents,
+        currency,
+        rating_val,
+        review_val,
+        bought,
+        bsr_val,
+        available,
+        r.url,
+        r.stock_status,
+        stock_ct,
+        r.sold_by,
+        r.other_offers,
+        r.coupon,
+        is_prime,
+        r.star_distribution,
+        img_ct,
+        qa_ct,
+        r.fulfillment,
+        r.price,
+        r.rating,
+        r.review_count,
+        r.bsr,
         project,
     )
 
@@ -882,10 +1063,16 @@ def query_deals_history(
     return [dict(r) for r in conn.execute(sql, params)]
 
 
-_STAT_TABLES = frozenset({
-    "competitive_snapshots", "keepa_time_series", "keepa_buybox_history",
-    "keepa_coupon_history", "keepa_deals", "keepa_products",
-})
+_STAT_TABLES = frozenset(
+    {
+        "competitive_snapshots",
+        "keepa_time_series",
+        "keepa_buybox_history",
+        "keepa_coupon_history",
+        "keepa_deals",
+        "keepa_products",
+    }
+)
 
 
 def query_stats(conn: sqlite3.Connection) -> dict:
@@ -897,8 +1084,7 @@ def query_stats(conn: sqlite3.Connection) -> dict:
 
     # Date range
     row = conn.execute(
-        "SELECT MIN(scraped_at) AS min_date, MAX(scraped_at) AS max_date "
-        "FROM competitive_snapshots"
+        "SELECT MIN(scraped_at) AS min_date, MAX(scraped_at) AS max_date FROM competitive_snapshots"
     ).fetchone()
     stats["date_range"] = f"{row['min_date'] or '—'} to {row['max_date'] or '—'}"
 
@@ -935,9 +1121,7 @@ def query_keepa_fetched_at(
         params,
     ).fetchall()
 
-    result: dict[tuple[str, str], tuple[str, str] | None] = {
-        pair: None for pair in asin_site_pairs
-    }
+    result: dict[tuple[str, str], tuple[str, str] | None] = {pair: None for pair in asin_site_pairs}
     for row in rows:
         result[(row["asin"], row["site"])] = (row["fetched_at"], row["fetch_mode"] or "basic")
     return result
@@ -961,8 +1145,7 @@ def register_product(
         return row["id"]
     with conn:
         cur = conn.execute(
-            "INSERT INTO products (category, brand, model, search_keywords) "
-            "VALUES (?, ?, ?, ?)",
+            "INSERT INTO products (category, brand, model, search_keywords) VALUES (?, ?, ?, ?)",
             (category, brand, model, search_keywords),
         )
     return cur.lastrowid  # type: ignore[return-value]
@@ -999,6 +1182,48 @@ def tag_product(
             "INSERT OR IGNORE INTO product_tags (product_id, tag) VALUES (?, ?)",
             (product_id, tag),
         )
+
+
+def sync_registry_from_keepa(conn: sqlite3.Connection) -> list[dict]:
+    """Register orphan ASINs from keepa_products that are missing from product_asins.
+
+    Only registers products with non-empty brand and title.
+    Returns a list of dicts describing each registration.
+    """
+    orphans = conn.execute(
+        """SELECT kp.asin, kp.site, kp.brand, kp.model, kp.title,
+                  kp.product_group
+           FROM keepa_products kp
+           WHERE NOT EXISTS (
+               SELECT 1 FROM product_asins pa
+               WHERE pa.asin = kp.asin AND pa.marketplace = kp.site
+           )"""
+    ).fetchall()
+
+    results: list[dict] = []
+    for row in orphans:
+        reg = _try_register_product(
+            conn,
+            asin=row["asin"],
+            site=row["site"],
+            brand=row["brand"] or "",
+            title=row["title"] or "",
+            model=row["model"] or "",
+            category=row["product_group"] or "",
+        )
+        if reg:
+            results.append({"registered": True, **reg})
+        else:
+            results.append(
+                {
+                    "asin": row["asin"],
+                    "marketplace": row["site"],
+                    "registered": False,
+                    "reason": "missing brand or title",
+                }
+            )
+
+    return results
 
 
 def remove_product(conn: sqlite3.Connection, product_id: int) -> None:
@@ -1109,14 +1334,16 @@ def load_products_from_db(
         if overrides:
             first_asin = next(iter(overrides.values()))["asin"]
 
-        results.append(Product(
-            category=pr["category"],
-            brand=pr["brand"],
-            model=pr["model"],
-            default_asin=first_asin,
-            search_keywords=pr["search_keywords"] or "",
-            marketplace_overrides=overrides,
-        ))
+        results.append(
+            Product(
+                category=pr["category"],
+                brand=pr["brand"],
+                model=pr["model"],
+                default_asin=first_asin,
+                search_keywords=pr["search_keywords"] or "",
+                marketplace_overrides=overrides,
+            )
+        )
     return results
 
 
@@ -1193,14 +1420,15 @@ def find_product(
         if row:
             return dict(row)
 
-    # Model substring match
+    # Model or search_keywords substring match
     sql = """
         SELECT p.id, p.category, p.brand, p.model, pa.asin, pa.marketplace
         FROM products p
         LEFT JOIN product_asins pa ON p.id = pa.product_id
-        WHERE p.model LIKE ?
+        WHERE (p.model LIKE ? OR p.search_keywords LIKE ?)
     """
-    params = [f"%{query_str}%"]
+    like = f"%{query_str}%"
+    params = [like, like]
     if marketplace:
         sql += " AND pa.marketplace = ?"
         params.append(marketplace)
@@ -1222,6 +1450,7 @@ def import_from_raw_json(
 ) -> tuple[int, int]:
     """Import Keepa data from raw JSON files. Returns (ok, failed) counts."""
     from amz_scout.utils import today_iso
+
     fetched = fetched_at or today_iso()
     ok, fail = 0, 0
     for prod in products:
@@ -1246,6 +1475,7 @@ def import_from_csv(
 ) -> int:
     """Import competitive data from an existing CSV file. Returns row count."""
     from amz_scout.csv_io import read_competitive_data
+
     rows = read_competitive_data(csv_path)
     return upsert_competitive(conn, rows)
 
