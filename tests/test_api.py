@@ -224,22 +224,24 @@ class TestResolveAsin:
         ]
 
     def test_model_substring_match(self):
-        asin, model, source, _warns = _resolve_asin(self._products(), "Slate 7", "UK")
+        asin, model, brand, source, _warns = _resolve_asin(self._products(), "Slate 7", "UK")
         assert asin == "B0UKSPECIF"  # UK-specific override
         assert model == "GL-Slate 7 (GL-BE3600)"
+        assert brand == "GL.iNet"
         assert source == "config"
 
     def test_model_substring_default_asin(self):
-        asin, model, source, _warns = _resolve_asin(self._products(), "Slate 7", "DE")
+        asin, model, brand, source, _warns = _resolve_asin(self._products(), "Slate 7", "DE")
         assert asin == "B0F2MR53D6"  # Default ASIN (no DE override)
 
     def test_model_substring_no_marketplace(self):
-        asin, _, _, _ = _resolve_asin(self._products(), "RT-BE58")
+        asin, _, _, _, _ = _resolve_asin(self._products(), "RT-BE58")
         assert asin == "B0FGDRP3VZ"
 
     def test_asin_passthrough(self):
-        asin, model, source, _warns = _resolve_asin(self._products(), "B0XYZABCDE")
+        asin, model, brand, source, _warns = _resolve_asin(self._products(), "B0XYZABCDE")
         assert asin == "B0XYZABCDE"
+        assert brand == ""
         assert source == "asin"
 
     def test_not_found_raises(self):
@@ -247,7 +249,7 @@ class TestResolveAsin:
             _resolve_asin(self._products(), "NonExistent")
 
     def test_case_insensitive(self):
-        asin, _, _, _ = _resolve_asin(self._products(), "slate 7", "UK")
+        asin, _, _, _, _ = _resolve_asin(self._products(), "slate 7", "UK")
         assert asin == "B0UKSPECIF"
 
 
@@ -728,8 +730,9 @@ class TestResolveAsinDualMode:
             pid, _ = register_product(conn, "Router", "TestBrand", "TestRouter")
             register_asin(conn, pid, "UK", "B0DBFOUND1")
 
-            asin, model, source, _warns = _resolve_asin([], "TestRouter", "UK", conn=conn)
+            asin, model, brand, source, _warns = _resolve_asin([], "TestRouter", "UK", conn=conn)
             assert asin == "B0DBFOUND1"
+            assert brand == "TestBrand"
             assert source == "db"
 
     def test_config_fallback_when_not_in_db(self):
@@ -738,16 +741,18 @@ class TestResolveAsinDualMode:
             category="Router", brand="FallbackBrand", model="FallbackModel",
             default_asin="B0FALLBACK",
         )]
-        asin, _, source, _ = _resolve_asin(products, "FallbackModel")
+        asin, _, brand, source, _ = _resolve_asin(products, "FallbackModel")
         assert asin == "B0FALLBACK"
+        assert brand == "FallbackBrand"
         assert source == "config"
 
     def test_asin_passthrough_still_works(self, test_db):
         """Direct ASIN input works even with empty DB and empty config."""
         with sqlite3.connect(str(test_db)) as conn:
             conn.row_factory = sqlite3.Row
-            asin, _, source, _ = _resolve_asin([], "B0DIRECTIN", conn=conn)
+            asin, _, brand, source, _ = _resolve_asin([], "B0DIRECTIN", conn=conn)
             assert asin == "B0DIRECTIN"
+            assert brand == ""
             assert source == "asin"
 
 

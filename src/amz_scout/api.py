@@ -194,8 +194,8 @@ def _resolve_asin(
     query_str: str,
     marketplace: str | None = None,
     conn: sqlite3.Connection | None = None,
-) -> tuple[str, str, str, list[str]]:
-    """Resolve a product query to (asin, model, source, warnings).
+) -> tuple[str, str, str, str, list[str]]:
+    """Resolve a product query to (asin, model, brand, source, warnings).
 
     Four-level fallback:
     1. SQLite registry: if conn is provided, query product_asins via find_product()
@@ -209,14 +209,14 @@ def _resolve_asin(
 
         row = find_product(conn, query_str, marketplace)
         if row and row.get("asin"):
-            return row["asin"], row["model"], "db", []
+            return row["asin"], row["model"], row.get("brand", ""), "db", []
 
     # Level 2: config product list (substring match)
     query_lower = query_str.lower()
     for p in products:
         if query_lower in p.model.lower():
             asin = p.asin_for(marketplace) if marketplace else p.default_asin
-            return asin, p.model, "config", []
+            return asin, p.model, p.brand, "config", []
 
     # Level 3: direct ASIN (with format validation + cross-marketplace check)
     candidate = query_str.upper().strip()
@@ -254,7 +254,7 @@ def _resolve_asin(
             "It will be auto-registered when Keepa data is fetched."
         )
 
-        return candidate, candidate, "asin", warnings
+        return candidate, candidate, "", "asin", warnings
 
     raise ValueError(f"Product not found: {query_str}")
 
@@ -398,7 +398,7 @@ def resolve_product(
         info = _resolve_context(project, marketplace=marketplace)
         site = _resolve_site(marketplace, info.marketplace_aliases)
         with open_db(info.db_path) as conn:
-            asin, model, source, warns = _resolve_asin(
+            asin, model, brand, source, warns = _resolve_asin(
                 info.products,
                 query_str,
                 site,
@@ -411,7 +411,7 @@ def resolve_product(
     meta: dict = {"source": source}
     if warns:
         meta["warnings"] = warns
-    return _envelope(True, data={"asin": asin, "model": model, **meta})
+    return _envelope(True, data={"asin": asin, "model": model, "brand": brand, **meta})
 
 
 # ─── Public: query functions ─────────────────────────────────────────
@@ -454,7 +454,7 @@ def query_trends(
         resolve_warnings: list[str] = []
 
         with open_db(info.db_path) as conn:
-            asin, model, source, resolve_warnings = _resolve_asin(
+            asin, model, brand, source, resolve_warnings = _resolve_asin(
                 info.products,
                 product,
                 site,
@@ -513,6 +513,8 @@ def query_trends(
                     ).fetchone()[0]
                     if market_count == 1:
                         fetch_meta["new_product"] = True
+                    brand = reg_row["brand"]
+                    model = reg_row["model"]
                     # Replace the "not yet registered" warning
                     resolve_warnings = [
                         w for w in resolve_warnings if "not yet in the product registry" not in w
@@ -534,6 +536,7 @@ def query_trends(
         data=rows,
         asin=asin,
         model=model,
+        brand=brand,
         series_name=series_name,
         count=len(rows),
         **fetch_meta,
@@ -601,7 +604,7 @@ def query_sellers(
         site = _resolve_site(marketplace, info.marketplace_aliases) or marketplace
 
         with open_db(info.db_path) as conn:
-            asin, model, source, resolve_warnings = _resolve_asin(
+            asin, model, brand, source, resolve_warnings = _resolve_asin(
                 info.products,
                 product,
                 site,
@@ -631,7 +634,8 @@ def query_sellers(
     if resolve_warnings:
         meta_extra["warnings"] = resolve_warnings
     return _envelope(
-        True, data=rows, asin=asin, model=model, count=len(rows), **fetch_meta, **meta_extra
+        True, data=rows, asin=asin, model=model, brand=brand, count=len(rows),
+        **fetch_meta, **meta_extra,
     )
 
 
@@ -724,7 +728,7 @@ def ensure_keepa_data(
         products = info.products
 
         if product:
-            _, model, _, _ = _resolve_asin(products, product)
+            _, model, _, _, _ = _resolve_asin(products, product)
             products = [p for p in products if p.model == model]
 
         with open_db(info.db_path) as conn:
@@ -856,7 +860,7 @@ def check_freshness(
         products = info.products
 
         if product:
-            _, model, _, _ = _resolve_asin(products, product)
+            _, model, _, _, _ = _resolve_asin(products, product)
             products = [p for p in products if p.model == model]
 
         with open_db(info.db_path) as conn:
