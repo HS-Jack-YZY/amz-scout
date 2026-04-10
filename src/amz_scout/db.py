@@ -465,11 +465,12 @@ def _try_register_product(
     if not brand or not title:
         return None
 
-    product_id = register_product(conn, category, brand, model)
+    product_id, is_new = register_product(conn, category, brand, model)
     register_asin(conn, product_id, site, asin, status="unverified")
 
     logger.info(
-        "Auto-registered %s/%s → product %d (%s %s)",
+        "%s %s/%s → product %d (%s %s)",
+        "New product" if is_new else "Associated",
         site,
         asin,
         product_id,
@@ -483,6 +484,7 @@ def _try_register_product(
         "category": category,
         "asin": asin,
         "marketplace": site,
+        "new_product": is_new,
     }
 
 
@@ -1136,19 +1138,23 @@ def register_product(
     brand: str,
     model: str,
     search_keywords: str = "",
-) -> int:
-    """Insert a product, or return existing id if (brand, model) already exists."""
+) -> tuple[int, bool]:
+    """Insert a product, or return existing id if (brand, model) already exists.
+
+    Returns ``(product_id, is_new)`` where *is_new* is True when the row was
+    just inserted.
+    """
     row = conn.execute(
         "SELECT id FROM products WHERE brand = ? AND model = ?", (brand, model)
     ).fetchone()
     if row:
-        return row["id"]
+        return row["id"], False
     with conn:
         cur = conn.execute(
             "INSERT INTO products (category, brand, model, search_keywords) VALUES (?, ?, ?, ?)",
             (category, brand, model, search_keywords),
         )
-    return cur.lastrowid  # type: ignore[return-value]
+    return cur.lastrowid, True  # type: ignore[return-value]
 
 
 def register_asin(

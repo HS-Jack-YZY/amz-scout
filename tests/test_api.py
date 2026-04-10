@@ -725,7 +725,7 @@ class TestResolveAsinDualMode:
         """Product in DB registry is found via DB path."""
         with sqlite3.connect(str(test_db)) as conn:
             conn.row_factory = sqlite3.Row
-            pid = register_product(conn, "Router", "TestBrand", "TestRouter")
+            pid, _ = register_product(conn, "Router", "TestBrand", "TestRouter")
             register_asin(conn, pid, "UK", "B0DBFOUND1")
 
             asin, model, source, _warns = _resolve_asin([], "TestRouter", "UK", conn=conn)
@@ -814,7 +814,7 @@ class TestValidateAsins:
         with sqlite3.connect(str(test_db)) as conn:
             conn.row_factory = sqlite3.Row
             init_schema(conn)
-            pid = register_product(conn, "Router", "GL.iNet", "Slate 7 Test")
+            pid, _ = register_product(conn, "Router", "GL.iNet", "Slate 7 Test")
             register_asin(conn, pid, "UK", "B0VERIFYME")
             # Simulate Keepa data with matching title
             store_keepa_product(conn, "B0VERIFYME", "UK",
@@ -830,7 +830,7 @@ class TestValidateAsins:
         with sqlite3.connect(str(test_db)) as conn:
             conn.row_factory = sqlite3.Row
             init_schema(conn)
-            pid = register_product(conn, "Router", "GL.iNet", "Slate 7 Mismatch")
+            pid, _ = register_product(conn, "Router", "GL.iNet", "Slate 7 Mismatch")
             register_asin(conn, pid, "UK", "B0WRONGPRD")
             store_keepa_product(conn, "B0WRONGPRD", "UK",
                                 {"title": "USB-C Hub Adapter Multiport"}, "2026-04-01")
@@ -845,7 +845,7 @@ class TestValidateAsins:
         with sqlite3.connect(str(test_db)) as conn:
             conn.row_factory = sqlite3.Row
             init_schema(conn)
-            pid = register_product(conn, "Router", "GL.iNet", "NotListed Test")
+            pid, _ = register_product(conn, "Router", "GL.iNet", "NotListed Test")
             register_asin(conn, pid, "UK", "B0NOTLISTD")
             store_keepa_product(conn, "B0NOTLISTD", "UK",
                                 {"title": None}, "2026-04-01")

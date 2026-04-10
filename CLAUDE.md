@@ -52,7 +52,7 @@ from amz_scout.api import (
     sync_registry,
     # Product registry
     list_products, add_product, remove_product_by_model,
-    update_product_asin, import_yaml, discover_asin,
+    update_product_asin, register_market_asins, import_yaml, discover_asin,
     # Validate + discover workflow
     validate_and_discover, batch_discover,
     # Resolution helpers
@@ -183,13 +183,39 @@ r = batch_discover(candidates=r["meta"]["discover_pending"], headed=True)
 
 11. **绝不猜测 ASIN**: 不在注册表的产品不要编造 ASIN。应该：(a) 问用户提供 ASIN，或 (b) 用 `discover_asin()` 浏览器搜索。用户直接给 ASIN 查询时会自动 fetch + 自动注册（如果 Keepa 有数据），无需手动操作。
 
-12. **禁止直接调用 Keepa API（严格执行）**:
+12. **新产品后台 ASIN 补全（重要）**: 当 `query_trends` 返回 `meta.new_product=True` 时，说明一个全新产品刚被注册。执行以下流程：
+
+    ```
+    优先级顺序：
+    1. 先完成用户请求的所有市场查询（用户要 US+DE 就先查 US+DE）
+    2. 回答用户的问题（展示数据）
+    3. 最后静默补全其余市场的 ASIN（用户不需要知道这个过程）
+
+    补全步骤：
+    1. 从 meta.registered_as 获取 brand 和 model
+    2. 对以下 Keepa 支持的市场（排除已注册的），用 WebSearch 搜索 ASIN：
+       US, UK, DE, FR, IT, ES, CA, AU, IN, JP, MX
+       搜索格式: "{brand} {model} site:amazon.{domain}"
+       域名映射: US=com, UK=co.uk, DE=de, FR=fr, IT=it, ES=es,
+                 CA=ca, AU=com.au, IN=in, JP=co.jp, MX=com.mx
+    3. 从搜索结果的 Amazon URL 中提取 ASIN（/dp/B0XXXXXXXX 格式）
+    4. 调用 register_market_asins(product_id, {"UK": "B0XXX", "DE": "B0YYY", ...})
+    5. 注册完成后简短告知用户："已补全 X 个市场的 ASIN"
+    ```
+
+    **注意事项**：
+    - 用户的查询请求永远优先，后台补全最后做
+    - 搜不到的市场跳过，不要猜测
+    - 只写 product_asins，不调 Keepa API（0 token）
+    - 如果 WebSearch 返回的不是 Amazon 产品页（无 /dp/ 路径），跳过该市场
+
+13. **禁止直接调用 Keepa API（严格执行）**:
     - **绝不**用 `requests.get("https://api.keepa.com/...")` 或任何方式直接调用 Keepa API。所有 Keepa 操作必须通过 `amz_scout.api` 函数。
     - **绝不**调用 Keepa search endpoint (`/search`)。一次搜索消耗 10+ token，极易耗尽额度。
     - 当用户给产品名而非 ASIN 时，按此优先级找 ASIN：(1) 问用户 → (2) WebSearch 工具搜 Amazon 产品页 URL 提取 ASIN（0 token）→ (3) `discover_asin()` 浏览器搜索（0 token，慢）。
     - 违反此规则会导致 token 耗尽（60 token 上限，1/min 恢复），阻塞所有用户至少 1 小时。
 
-13. **product_tags 表暂不使用**: 表已建好但不作为功能依赖。过滤统一用 `category` / `brand` / `marketplace`。
+14. **product_tags 表暂不使用**: 表已建好但不作为功能依赖。过滤统一用 `category` / `brand` / `marketplace`。
 
 ### Available Projects
 

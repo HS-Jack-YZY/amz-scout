@@ -506,6 +506,13 @@ def query_trends(
                         "brand": reg_row["brand"],
                         "model": reg_row["model"],
                     }
+                    # Check if this is a brand-new product (only 1 market registered)
+                    market_count = conn.execute(
+                        "SELECT COUNT(*) FROM product_asins WHERE product_id = ?",
+                        (reg_row["id"],),
+                    ).fetchone()[0]
+                    if market_count == 1:
+                        fetch_meta["new_product"] = True
                     # Replace the "not yet registered" warning
                     resolve_warnings = [
                         w for w in resolve_warnings if "not yet in the product registry" not in w
@@ -947,7 +954,7 @@ def add_product(
 
         path = _get_db(db_path)
         with open_db(path) as conn:
-            pid = register_product(conn, category, brand, model, search_keywords)
+            pid, _ = register_product(conn, category, brand, model, search_keywords)
 
             if asins:
                 for marketplace, asin in asins.items():
@@ -1024,6 +1031,55 @@ def update_product_asin(
     )
 
 
+def register_market_asins(
+    product_id: int,
+    asins: dict[str, str],
+    db_path: Path | str | None = None,
+) -> dict:
+    """Batch-register ASINs for multiple marketplaces under an existing product.
+
+    *asins* maps marketplace codes to ASINs,
+    e.g. ``{"UK": "B0CT94XNX3", "DE": "B0CKPVMVMT"}``.
+    Skips marketplaces where the product already has an ASIN registered
+    (avoids overwriting verified ASINs via the upsert in ``register_asin``).
+    """
+    try:
+        path = _get_db(db_path)
+        with open_db(path) as conn:
+            # Bulk-fetch existing marketplaces in one query
+            placeholders = ",".join("?" for _ in asins)
+            existing_markets = {
+                row["marketplace"]
+                for row in conn.execute(
+                    f"SELECT marketplace FROM product_asins "
+                    f"WHERE product_id = ? AND marketplace IN ({placeholders})",
+                    (product_id, *asins.keys()),
+                )
+            }
+            to_insert = [
+                (product_id, mp, asin, "unverified", "")
+                for mp, asin in asins.items()
+                if mp not in existing_markets
+            ]
+            with conn:
+                conn.executemany(
+                    "INSERT INTO product_asins "
+                    "(product_id, marketplace, asin, status, notes) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    to_insert,
+                )
+            registered = len(to_insert)
+            skipped = len(asins) - registered
+    except Exception as e:
+        logger.exception("register_market_asins failed")
+        return _envelope(False, error=str(e))
+
+    return _envelope(
+        True,
+        data={"product_id": product_id, "registered": registered, "skipped": skipped},
+    )
+
+
 def import_yaml(
     project_config: str,
     tag: str | None = None,
@@ -1048,7 +1104,7 @@ def import_yaml(
 
         with open_db(path) as conn:
             for product in info.products:
-                pid = register_product(
+                pid, _ = register_product(
                     conn,
                     product.category,
                     product.brand,
@@ -1467,7 +1523,7 @@ def discover_asin(
                     notes="discovered via browser search",
                 )
             else:
-                pid = register_product(conn, "", brand, model, keywords)
+                pid, _ = register_product(conn, "", brand, model, keywords)
                 register_asin(
                     conn,
                     pid,
