@@ -996,6 +996,132 @@ def validate_asins(
     )
 
 
+def _run_discover_batch(
+    candidates: list[dict],
+    headed: bool = False,
+    db_path: Path | str | None = None,
+) -> tuple[list[dict], int, int]:
+    """Run discover_asin for each candidate and return (results, found, failed)."""
+    results: list[dict] = []
+    for c in candidates:
+        brand = c.get("brand", "")
+        model = c.get("model", "")
+        mp = c.get("marketplace", "")
+        if not (brand and model and mp):
+            results.append({
+                "brand": brand, "model": model, "marketplace": mp,
+                "ok": False, "error": "Missing brand, model, or marketplace",
+            })
+            continue
+
+        dr = discover_asin(
+            brand=brand, model=model, marketplace=mp,
+            headed=headed, db_path=db_path,
+        )
+        results.append({
+            "brand": brand,
+            "model": model,
+            "marketplace": mp,
+            "old_asin": c.get("old_asin", ""),
+            "ok": dr["ok"],
+            "new_asin": dr["data"].get("asin") if dr["ok"] else None,
+            "error": dr.get("error"),
+        })
+
+    found = sum(1 for r in results if r["ok"])
+    return results, found, len(results) - found
+
+
+def validate_and_discover(
+    marketplace: str | None = None,
+    auto_discover: bool = False,
+    headed: bool = False,
+    db_path: Path | str | None = None,
+) -> dict:
+    """Validate ASINs and optionally discover replacements for bad ones.
+
+    1. Runs ``validate_asins()`` to check all unverified ASINs.
+    2. Collects ``not_listed`` and ``wrong_product`` results as discover candidates.
+    3. If ``auto_discover=False`` (default): returns the candidate list for user
+       confirmation — no browser launched.
+    4. If ``auto_discover=True``: calls ``discover_asin()`` for each candidate
+       sequentially (slow, launches browser per marketplace).
+
+    Returns envelope with validation results and discover outcomes.
+    """
+    val_result = validate_asins(marketplace=marketplace, db_path=db_path)
+    if not val_result["ok"]:
+        return val_result
+
+    val_meta = val_result["meta"]
+    suggestions = [
+        {
+            "brand": r["brand"],
+            "model": r["model"],
+            "marketplace": r["marketplace"],
+            "old_asin": r["asin"],
+            "reason": r["reason"],
+        }
+        for r in val_result["data"]
+        if r["status"] in ("not_listed", "wrong_product")
+    ]
+
+    if not suggestions:
+        return _envelope(
+            True,
+            data=val_result["data"],
+            phase="validate",
+            message="All ASINs verified or pending Keepa data — nothing to discover.",
+            **val_meta,
+        )
+
+    if not auto_discover:
+        return _envelope(
+            True,
+            data=val_result["data"],
+            phase="pending_confirmation",
+            message=(
+                f"Found {len(suggestions)} ASIN(s) needing discovery. "
+                "Call with auto_discover=True or use batch_discover() to proceed."
+            ),
+            discover_pending=suggestions,
+            **val_meta,
+        )
+
+    results, found, failed = _run_discover_batch(suggestions, headed, db_path)
+    return _envelope(
+        True,
+        data=results,
+        phase="discovered",
+        message=f"Discovery complete: {found} found, {failed} failed.",
+        discovered=found,
+        failed=failed,
+        **val_meta,
+    )
+
+
+def batch_discover(
+    candidates: list[dict],
+    headed: bool = False,
+    db_path: Path | str | None = None,
+) -> dict:
+    """Execute ASIN discovery for a list of candidates.
+
+    Each candidate dict must have: ``brand``, ``model``, ``marketplace``.
+    Optional: ``old_asin`` (for tracking).
+
+    This is the "confirm and execute" step after ``validate_and_discover()``
+    returns ``phase="pending_confirmation"``.
+
+    Launches a browser for each unique marketplace — slow operation (10-30s each).
+    """
+    if not candidates:
+        return _envelope(False, error="No candidates provided.")
+
+    results, found, failed = _run_discover_batch(candidates, headed, db_path)
+    return _envelope(True, data=results, discovered=found, failed=failed)
+
+
 def discover_asin(
     brand: str,
     model: str,

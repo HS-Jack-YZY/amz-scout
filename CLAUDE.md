@@ -24,7 +24,8 @@ User asks about product data
   │   ├─ "刷新数据" / "更新"        → ensure_keepa_data(marketplace=, strategy="fresh")
   │   ├─ "数据新鲜度"              → check_freshness()
   │   ├─ "Keepa token 余额"       → keepa_budget()
-  │   └─ "验证 ASIN"              → validate_asins(marketplace=)
+  │   ├─ "验证 ASIN"              → validate_asins(marketplace=)
+  │   └─ "验证并发现"              → validate_and_discover(marketplace=)
   │
   ├─ 产品注册表管理
   │   ├─ "有哪些产品"              → list_products(category?, brand?, marketplace?)
@@ -34,7 +35,8 @@ User asks about product data
   │   └─ "导入 YAML 配置"         → import_yaml(project_config, tag?)
   │
   └─ ASIN 发现（慢操作，需要浏览器）
-      └─ "搜索正确的 ASIN"         → discover_asin(brand, model, marketplace)
+      ├─ "搜索正确的 ASIN"         → discover_asin(brand, model, marketplace)
+      └─ "批量搜索 ASIN"           → batch_discover(candidates=[...])
 ```
 
 ### Calling the API
@@ -49,6 +51,8 @@ from amz_scout.api import (
     # Product registry
     list_products, add_product, remove_product_by_model,
     update_product_asin, import_yaml, discover_asin,
+    # Validate + discover workflow
+    validate_and_discover, batch_discover,
     # Resolution helpers
     resolve_product,
 )
@@ -127,6 +131,25 @@ r = import_yaml("BE10000")
 # r["data"] = {"tag": "BE10000", "products_imported": 17, "asins_registered": 147}
 ```
 
+**"验证 ASIN 并告诉我哪些需要重新搜索"**
+```python
+r = validate_and_discover(marketplace="UK")
+# r["meta"]["phase"] = "pending_confirmation"
+# r["meta"]["discover_pending"] = [
+#     {"brand": "GL.iNet", "model": "GL-Slate 7 ...", "marketplace": "UK",
+#      "old_asin": "B0XXXXXX", "reason": "no title in Keepa"},
+# ]
+# → 展示给用户确认后再执行 batch_discover()
+```
+
+**"确认了，帮我批量搜索这些 ASIN"**
+```python
+r = batch_discover(candidates=r["meta"]["discover_pending"], headed=True)
+# r["data"] = [{"brand": "GL.iNet", "model": "...", "marketplace": "UK",
+#               "old_asin": "B0XXXXXX", "new_asin": "B0YYYYYY", "ok": True}, ...]
+# r["meta"] = {"discovered": 3, "failed": 1}
+```
+
 ### Key Behaviors to Remember
 
 1. **Auto-fetch**: `query_trends`, `query_sellers`, `query_deals` auto-fetch missing Keepa data by default (LAZY strategy: fetch only if never fetched before, zero tokens if cached). No need to call `ensure_keepa_data` manually for these.
@@ -145,7 +168,7 @@ r = import_yaml("BE10000")
 
 8. **project 参数现在是可选的**: 所有 query 函数的 `project` 参数已改为 `str | None = None`。传 None 时从 SQLite 产品注册表加载产品，不需要 YAML 配置文件。传字符串时走旧的 YAML 路径（向后兼容）。
 
-9. **ASIN 发现流程 (discover_asin)**: 当 `ensure_keepa_data` 返回 `warnings` 说 ASIN 无数据时，应该建议用户运行 `discover_asin(brand, model, marketplace)` 来搜索正确 ASIN。这是一个慢操作（10-30s，需要浏览器），所以不要自动执行，而是让用户确认后再调。发现的 ASIN 写入 DB 为 `unverified` 状态，之后可用 `validate_asins()` 确认。
+9. **ASIN 验证 + 发现流程**: 推荐用 `validate_and_discover(marketplace=)` 一站式操作。默认返回 `phase="pending_confirmation"` 和 `discover_pending` 列表，不启动浏览器。用户确认后传入 `batch_discover(candidates=...)` 执行。也可以用 `auto_discover=True` 一步到位（但会启动浏览器，10-30s/个）。单个 ASIN 仍可用 `discover_asin(brand, model, marketplace)`。
 
 10. **绝不猜测 ASIN**: 当产品不在注册表中时，不要从记忆中编造 ASIN。应该：(a) 问用户提供 ASIN，或 (b) 建议用 `discover_asin(brand, model, marketplace)` 浏览器搜索。错误的 ASIN 比没有 ASIN 更危险 — 会浪费 Keepa token 并返回空数据。
 
