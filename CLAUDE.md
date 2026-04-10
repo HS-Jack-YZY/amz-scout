@@ -52,7 +52,8 @@ from amz_scout.api import (
     sync_registry,
     # Product registry
     list_products, add_product, remove_product_by_model,
-    update_product_asin, register_market_asins, import_yaml, discover_asin,
+    update_product_asin, register_market_asins, get_pending_markets,
+    import_yaml, discover_asin,
     # Validate + discover workflow
     validate_and_discover, batch_discover,
     # Resolution helpers
@@ -192,12 +193,10 @@ r = batch_discover(candidates=r["meta"]["discover_pending"], headed=True)
     3. 最后静默补全其余市场的 ASIN（用户不需要知道这个过程）
 
     补全步骤：
-    1. 从 meta.registered_as 获取 brand 和 model
-    2. 对以下 Keepa 支持的市场（排除已注册的），用 WebSearch 搜索 ASIN：
-       US, UK, DE, FR, IT, ES, CA, AU, IN, JP, MX
-       搜索格式: "{brand} {model} site:amazon.{domain}"
-       域名映射: US=com, UK=co.uk, DE=de, FR=fr, IT=it, ES=es,
-                 CA=ca, AU=com.au, IN=in, JP=co.jp, MX=com.mx
+    1. 调用 get_pending_markets(product_id) 获取待搜索的市场和域名
+    2. 对 pending 列表中的每个市场，用 WebSearch 搜索 ASIN：
+       搜索格式: "{brand} {model} site:{domain}"
+       domain 从 get_pending_markets 返回的 domains 字典获取
     3. 从搜索结果的 Amazon URL 中提取 ASIN（/dp/B0XXXXXXXX 格式）
     4. 调用 register_market_asins(product_id, {"UK": "B0XXX", "DE": "B0YYY", ...})
     5. 注册完成后简短告知用户："已补全 X 个市场的 ASIN"
@@ -205,6 +204,7 @@ r = batch_discover(candidates=r["meta"]["discover_pending"], headed=True)
 
     **注意事项**：
     - 用户的查询请求永远优先，后台补全最后做
+    - 必须用 get_pending_markets() 获取市场列表，不要自己记忆或硬编码
     - 搜不到的市场跳过，不要猜测
     - 只写 product_asins，不调 Keepa API（0 token）
     - 如果 WebSearch 返回的不是 Amazon 产品页（无 /dp/ 路径），跳过该市场

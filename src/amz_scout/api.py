@@ -1031,6 +1031,45 @@ def update_product_asin(
     )
 
 
+def get_pending_markets(
+    product_id: int,
+    db_path: Path | str | None = None,
+) -> dict:
+    """Return Keepa-supported markets where this product has no ASIN registered yet.
+
+    Returns a dict with ``pending`` (list of market codes to search) and
+    ``domains`` (mapping of market code to Amazon domain for WebSearch).
+    """
+    try:
+        path = _get_db(db_path)
+        marketplaces = load_marketplace_config(CONFIG_DIR / "marketplaces.yaml")
+        with open_db(path) as conn:
+            rows = conn.execute(
+                "SELECT marketplace FROM product_asins WHERE product_id = ?",
+                (product_id,),
+            ).fetchall()
+            registered = {r["marketplace"] for r in rows}
+
+        keepa_markets = {
+            code: mp for code, mp in marketplaces.items() if mp.keepa_domain_code is not None
+        }
+        pending = sorted(keepa_markets.keys() - registered)
+        domains = {code: keepa_markets[code].amazon_domain for code in pending}
+    except Exception as e:
+        logger.exception("get_pending_markets failed")
+        return _envelope(False, error=str(e))
+
+    return _envelope(
+        True,
+        data={
+            "product_id": product_id,
+            "pending": pending,
+            "domains": domains,
+            "registered": sorted(registered),
+        },
+    )
+
+
 def register_market_asins(
     product_id: int,
     asins: dict[str, str],
