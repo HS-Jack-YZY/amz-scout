@@ -9,6 +9,7 @@ No exceptions are raised to the caller.  Errors are captured in the envelope.
 """
 
 import logging
+import re
 import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -72,6 +73,9 @@ KEEPA_TOKEN_MAX = 60
 KEEPA_REFILL_RATE = "1/min"
 
 BROWSER_QUERY_HINT = "No competitive data found. Run 'amz-scout scrape <config>' to populate."
+
+# Amazon ASIN: exactly 10 uppercase alphanumeric characters.
+_ASIN_RE = re.compile(r"^[A-Z0-9]{10}$")
 
 
 # ─── Internal helpers ────────────────────────────────────────────────
@@ -182,13 +186,13 @@ def _resolve_asin(
     query_str: str,
     marketplace: str | None = None,
     conn: sqlite3.Connection | None = None,
-) -> tuple[str, str, str]:
-    """Resolve a product query to (asin, model, source).
+) -> tuple[str, str, str, list[str]]:
+    """Resolve a product query to (asin, model, source, warnings).
 
     Four-level fallback:
     1. SQLite registry: if conn is provided, query product_asins via find_product()
     2. Config products: case-insensitive substring match on model name
-    3. ASIN pass-through: if query is a 10-char alphanumeric string
+    3. ASIN pass-through: validated format + cross-marketplace awareness
     4. Failure: raises ValueError
     """
     # Level 1: SQLite registry (most authoritative)
@@ -196,18 +200,52 @@ def _resolve_asin(
         from amz_scout.db import find_product
         row = find_product(conn, query_str, marketplace)
         if row and row.get("asin"):
-            return row["asin"], row["model"], "db"
+            return row["asin"], row["model"], "db", []
 
     # Level 2: config product list (substring match)
     query_lower = query_str.lower()
     for p in products:
         if query_lower in p.model.lower():
             asin = p.asin_for(marketplace) if marketplace else p.default_asin
-            return asin, p.model, "config"
+            return asin, p.model, "config", []
 
-    # Level 3: direct ASIN
-    if len(query_str) == 10 and query_str.isascii() and query_str.isalnum():
-        return query_str, query_str, "asin"
+    # Level 3: direct ASIN (with format validation + cross-marketplace check)
+    candidate = query_str.upper().strip()
+    if _ASIN_RE.match(candidate):
+        warnings: list[str] = []
+
+        # Soft warning for non-B-prefix ASINs (likely books/media ISBN)
+        if not candidate.startswith("B"):
+            warnings.append(
+                f"ASIN {candidate} does not start with 'B' — "
+                "may be a book/media ISBN, not a physical product."
+            )
+
+        # Cross-marketplace awareness: check if ASIN is registered elsewhere
+        if conn is not None and marketplace:
+            other_rows = conn.execute(
+                "SELECT pa.marketplace, p.brand, p.model "
+                "FROM product_asins pa JOIN products p ON pa.product_id = p.id "
+                "WHERE pa.asin = ? AND pa.marketplace != ?",
+                (candidate, marketplace),
+            ).fetchall()
+            if other_rows:
+                markets = ", ".join(r["marketplace"] for r in other_rows)
+                product_info = f"{other_rows[0]['brand']} {other_rows[0]['model']}"
+                warnings.append(
+                    f"ASIN {candidate} is registered for [{markets}] "
+                    f"as '{product_info}', but you are querying {marketplace}. "
+                    "The same product may use a different ASIN on this marketplace."
+                )
+
+        # Warn that this is an unregistered ASIN
+        warnings.append(
+            f"ASIN {candidate} is not in the product registry. "
+            "Data will be fetched but not persisted to registry. "
+            "Use add_product() to register if you want to keep tracking it."
+        )
+
+        return candidate, candidate, "asin", warnings
 
     raise ValueError(f"Product not found: {query_str}")
 
@@ -342,15 +380,17 @@ def resolve_product(
         info = _resolve_context(project, marketplace=marketplace)
         site = _resolve_site(marketplace, info.marketplace_aliases)
         with open_db(info.db_path) as conn:
-            asin, model, source = _resolve_asin(info.products, query_str, site, conn=conn)
+            asin, model, source, warns = _resolve_asin(
+                info.products, query_str, site, conn=conn,
+            )
     except Exception as e:
         logger.exception("resolve_product failed")
         return _envelope(False, error=str(e))
 
-    return _envelope(
-        True,
-        data={"asin": asin, "model": model, "source": source},
-    )
+    meta: dict = {"source": source}
+    if warns:
+        meta["warnings"] = warns
+    return _envelope(True, data={"asin": asin, "model": model, **meta})
 
 
 # ─── Public: query functions ─────────────────────────────────────────
@@ -390,29 +430,59 @@ def query_trends(
     try:
         info = _resolve_context(project)
         site = _resolve_site(marketplace, info.marketplace_aliases) or marketplace
+        resolve_warnings: list[str] = []
 
         with open_db(info.db_path) as conn:
-            asin, model, _ = _resolve_asin(info.products, product, site, conn=conn)
+            asin, model, source, resolve_warnings = _resolve_asin(
+                info.products, product, site, conn=conn,
+            )
             series_type = SERIES_MAP.get(series.lower(), SERIES_NEW)
             series_name = SERIES_NAMES.get(series_type, str(series_type))
 
             if auto_fetch:
-                fetch_meta = _auto_fetch(
-                    conn, info, [p for p in info.products if p.model == model], [site],
-                )
+                # For ASIN pass-through, build a temporary Product so fetch works
+                if source == "asin":
+                    tmp_product = Product(
+                        category="", brand="", model=asin,
+                        default_asin=asin,
+                    )
+                    fetch_meta = _auto_fetch(conn, info, [tmp_product], [site])
+                else:
+                    fetch_meta = _auto_fetch(
+                        conn, info,
+                        [p for p in info.products if p.model == model],
+                        [site],
+                    )
             else:
                 fetch_meta = {}
             rows = query_price_trends(conn, asin, site, series_type, days)
+
+            # If ASIN pass-through fetched data, attach Keepa title for context
+            if source == "asin" and fetch_meta.get("auto_fetched"):
+                title_row = conn.execute(
+                    "SELECT title FROM keepa_products WHERE asin = ? AND site = ?",
+                    (asin, site),
+                ).fetchone()
+                if title_row and title_row["title"]:
+                    resolve_warnings.insert(
+                        0, f"Keepa product title: {title_row['title'][:100]}"
+                    )
 
         rows = _add_dates(rows)
     except Exception as e:
         logger.exception("query_trends failed")
         return _envelope(False, error=str(e))
 
+    meta_extra: dict = {}
+    if resolve_warnings:
+        meta_extra["warnings"] = resolve_warnings
+    if source == "asin":
+        meta_extra["resolution_level"] = 3
+
     return _envelope(
         True, data=rows,
         asin=asin, model=model, series_name=series_name, count=len(rows),
-        **fetch_meta,
+        **fetch_meta, **meta_extra,
     )
 
 
@@ -476,11 +546,19 @@ def query_sellers(
         site = _resolve_site(marketplace, info.marketplace_aliases) or marketplace
 
         with open_db(info.db_path) as conn:
-            asin, model, _ = _resolve_asin(info.products, product, site, conn=conn)
+            asin, model, source, resolve_warnings = _resolve_asin(
+                info.products, product, site, conn=conn,
+            )
             if auto_fetch:
-                fetch_meta = _auto_fetch(
-                    conn, info, [p for p in info.products if p.model == model], [site],
-                )
+                if source == "asin":
+                    tmp = Product(category="", brand="", model=asin, default_asin=asin)
+                    fetch_meta = _auto_fetch(conn, info, [tmp], [site])
+                else:
+                    fetch_meta = _auto_fetch(
+                        conn, info,
+                        [p for p in info.products if p.model == model],
+                        [site],
+                    )
             else:
                 fetch_meta = {}
             rows = query_seller_history(conn, asin, site)
@@ -490,7 +568,11 @@ def query_sellers(
         logger.exception("query_sellers failed")
         return _envelope(False, error=str(e))
 
-    return _envelope(True, data=rows, asin=asin, model=model, count=len(rows), **fetch_meta)
+    meta_extra: dict = {}
+    if resolve_warnings:
+        meta_extra["warnings"] = resolve_warnings
+    return _envelope(True, data=rows, asin=asin, model=model, count=len(rows),
+                     **fetch_meta, **meta_extra)
 
 
 def query_deals(
@@ -529,6 +611,9 @@ def query_deals(
 # ─── Public: Keepa data management ──────────────────────────────────
 
 
+_BATCH_TOKEN_THRESHOLD = 6  # Require confirmation when estimated tokens >= this
+
+
 def ensure_keepa_data(
     project: str | None = None,
     marketplace: str | None = None,
@@ -536,6 +621,7 @@ def ensure_keepa_data(
     strategy: str = "lazy",
     max_age_days: int = 7,
     detailed: bool = False,
+    confirm: bool = False,
 ) -> dict:
     """Ensure Keepa data exists in the database, fetching if needed.
 
@@ -543,9 +629,17 @@ def ensure_keepa_data(
     fetch only if completely missing.  Pass ``"fresh"`` to force refresh.
 
     Valid strategies: ``"lazy"``, ``"offline"``, ``"max_age"``, ``"fresh"``.
+
+    **Batch gate**: when the estimated token cost is ≥ 6, returns
+    ``phase="needs_confirmation"`` with a cost preview instead of fetching.
+    Pass ``confirm=True`` to proceed.
     """
     try:
-        from amz_scout.freshness import FreshnessStrategy
+        from amz_scout.freshness import (
+            FreshnessStrategy,
+            evaluate_freshness,
+            partition_by_action,
+        )
         from amz_scout.keepa_service import get_keepa_data
 
         strategy_map = {
@@ -566,10 +660,42 @@ def ensure_keepa_data(
         products = info.products
 
         if product:
-            _, model, _ = _resolve_asin(products, product)
+            _, model, _, _ = _resolve_asin(products, product)
             products = [p for p in products if p.model == model]
 
         with open_db(info.db_path) as conn:
+            # Pre-flight: estimate token cost before fetching
+            if not confirm:
+                from amz_scout.freshness import query_freshness as qf
+
+                fetched_map = qf(conn, products, sites)
+                requested_mode = "detailed" if detailed else "basic"
+                freshness = evaluate_freshness(
+                    products, sites, fetched_map, fs, max_age_days,
+                    requested_mode=requested_mode,
+                )
+                _, fetch_list, _ = partition_by_action(freshness)
+                token_per = 6 if detailed else 1
+                estimated_tokens = len(fetch_list) * token_per
+
+                if estimated_tokens >= _BATCH_TOKEN_THRESHOLD:
+                    preview = [
+                        {"asin": pf.asin, "site": pf.site, "model": pf.model}
+                        for pf in fetch_list
+                    ]
+                    return _envelope(
+                        True,
+                        data={"preview": preview},
+                        phase="needs_confirmation",
+                        message=(
+                            f"This operation will fetch {len(fetch_list)} "
+                            f"product(s), estimated cost: {estimated_tokens} "
+                            f"token(s). Call with confirm=True to proceed."
+                        ),
+                        estimated_tokens=estimated_tokens,
+                        products_to_fetch=len(fetch_list),
+                    )
+
             result = get_keepa_data(
                 conn,
                 products,
@@ -661,7 +787,7 @@ def check_freshness(
         products = info.products
 
         if product:
-            _, model, _ = _resolve_asin(products, product)
+            _, model, _, _ = _resolve_asin(products, product)
             products = [p for p in products if p.model == model]
 
         with open_db(info.db_path) as conn:
