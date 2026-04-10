@@ -11,6 +11,7 @@ import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from amz_scout.config import MarketplaceConfig
 from amz_scout.csv_io import merge_price_history, read_price_history, write_price_history
@@ -35,7 +36,7 @@ class KeepaProductOutcome:
     asin: str
     site: str
     model: str
-    source: str  # "cache" | "fetched" | "skipped"
+    source: Literal["cache", "fetched", "skipped"]
     price_history: PriceHistory | None
     freshness: ProductFreshness
 

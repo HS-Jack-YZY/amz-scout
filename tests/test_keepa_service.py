@@ -13,15 +13,7 @@ from amz_scout.freshness import FreshnessStrategy
 from amz_scout.keepa_service import _read_from_cache, get_keepa_data
 from amz_scout.models import PriceHistory, Product
 
-RAW_JSON_PATH = (
-    Path(__file__).parent.parent
-    / "output"
-    / "BE10000"
-    / "data"
-    / "eu"
-    / "raw"
-    / "uk_B0F2MR53D6.json"
-)
+# raw_data fixture is provided by conftest.py (synthetic + real fallback)
 
 
 def _product() -> Product:
@@ -56,14 +48,6 @@ def conn():
     init_schema(c)
     yield c
     c.close()
-
-
-@pytest.fixture
-def raw_data():
-    if not RAW_JSON_PATH.exists():
-        pytest.skip("Raw JSON fixture not found")
-    with open(RAW_JSON_PATH) as f:
-        return json.load(f)
 
 
 class TestReadFromCache:

@@ -8,17 +8,6 @@ import pytest
 
 from amz_scout.db import init_schema, query_keepa_fetched_at, store_keepa_product
 
-RAW_JSON_PATH = (
-    Path(__file__).parent.parent
-    / "output"
-    / "BE10000"
-    / "data"
-    / "eu"
-    / "raw"
-    / "uk_B0F2MR53D6.json"
-)
-
-
 @pytest.fixture
 def conn():
     c = sqlite3.connect(":memory:")
@@ -30,12 +19,7 @@ def conn():
     c.close()
 
 
-@pytest.fixture
-def raw_data():
-    if not RAW_JSON_PATH.exists():
-        pytest.skip("Raw JSON fixture not found")
-    with open(RAW_JSON_PATH) as f:
-        return json.load(f)
+# raw_data fixture is provided by conftest.py (synthetic + real fallback)
 
 
 class TestQueryKeepaFetchedAt:

@@ -88,15 +88,7 @@ PROJECT_YAML = {
     ],
 }
 
-RAW_JSON_PATH = (
-    Path(__file__).parent.parent
-    / "output"
-    / "BE10000"
-    / "data"
-    / "eu"
-    / "raw"
-    / "uk_B0F2MR53D6.json"
-)
+# raw_data fixture is provided by conftest.py (synthetic + real fallback)
 
 
 @pytest.fixture
@@ -168,14 +160,6 @@ def seeded_config(config_dir):
     conn.close()
 
     return tmp_path, proj_path
-
-
-@pytest.fixture
-def raw_data():
-    if not RAW_JSON_PATH.exists():
-        pytest.skip("Raw JSON fixture not found")
-    with open(RAW_JSON_PATH) as f:
-        return json.load(f)
 
 
 # ─── Internal helpers ────────────────────────────────────────────────

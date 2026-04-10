@@ -34,9 +34,6 @@ from amz_scout.db import (
 )
 from amz_scout.models import CompetitiveData
 
-RAW_JSON_PATH = Path(__file__).parent.parent / "output" / "BE10000" / "data" / "eu" / "raw" / "uk_B0F2MR53D6.json"
-
-
 @pytest.fixture
 def conn():
     """In-memory SQLite connection with schema initialized."""
@@ -49,13 +46,7 @@ def conn():
     c.close()
 
 
-@pytest.fixture
-def raw_data():
-    """Load real Keepa raw JSON."""
-    if not RAW_JSON_PATH.exists():
-        pytest.skip("Raw JSON fixture not found")
-    with open(RAW_JSON_PATH) as f:
-        return json.load(f)
+# raw_data fixture is provided by conftest.py (synthetic + real fallback)
 
 
 # ─── Schema tests ────────────────────────────────────────────────────
@@ -103,20 +94,20 @@ class TestStoreKeepaProduct:
         assert row is not None
         assert row["brand"] == "GL.iNet"
         assert row["model"] == "GL-BE3600"
-        assert row["item_weight"] == 300
-        assert row["has_reviews"] == 1
+        assert row["item_weight"] == raw_data.get("itemWeight")
+        assert row["has_reviews"] == int(raw_data.get("hasReviews", False))
         assert row["fetched_at"] == "2026-03-31"
 
     def test_store_time_series(self, conn, raw_data):
         store_keepa_product(conn, "B0F2MR53D6", "UK", raw_data, "2026-03-31")
 
-        # csv[3] = SALES_RANK should have many data points
+        # csv[3] = SALES_RANK should have data points
         row = conn.execute(
             "SELECT COUNT(*) AS cnt FROM keepa_time_series "
             "WHERE asin = 'B0F2MR53D6' AND site = 'UK' AND series_type = ?",
             (SERIES_SALES_RANK,),
         ).fetchone()
-        assert row["cnt"] > 100  # Sales rank has ~1109 data points
+        assert row["cnt"] > 0
 
         # csv[1] = NEW should exist
         row = conn.execute(

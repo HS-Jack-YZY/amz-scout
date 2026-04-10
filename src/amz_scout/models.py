@@ -92,6 +92,8 @@ class PriceHistory:
     # Seller count (from offers)
     seller_count: int | None = None
     fba_seller_count: int | None = None
+    # Fetch error indicator (empty = success or no data, non-empty = fetch failed)
+    fetch_error: str = ""
 
 
 @dataclass(frozen=True)

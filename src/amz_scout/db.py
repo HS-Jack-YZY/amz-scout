@@ -143,95 +143,144 @@ def resolve_db_path(output_dir: str | None = None) -> Path:
     return Path("output") / "amz_scout.db"
 
 
+_schema_initialized: set[str] = set()  # cache: file-backed db paths that passed migration check
+
+
 def init_schema(conn: sqlite3.Connection) -> None:
     """Create all tables and indexes if they don't exist. Idempotent."""
+    db_path = conn.execute("PRAGMA database_list").fetchone()[2] or ""
+    # Only cache file-backed databases; skip :memory: and temp DBs
+    if db_path and db_path in _schema_initialized:
+        return
+
     cur = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_migrations'"
     )
     if cur.fetchone() is not None:
         _migrate(conn)
-        return  # Already initialized
+        if db_path:
+            _schema_initialized.add(db_path)
+        return  # Schema exists — migrations applied if needed
 
     conn.executescript(_SCHEMA_SQL)
+    if db_path:
+        _schema_initialized.add(db_path)
     logger.info("Database schema initialized (version %d)", SCHEMA_VERSION)
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
     """Apply incremental schema migrations."""
     row = conn.execute("SELECT MAX(version) AS v FROM schema_migrations").fetchone()
-    current = row["v"] if row else 0
+    current = row["v"] if row and row["v"] is not None else 0
 
-    if current < 2:
-        # v2: add project column to competitive_snapshots
-        cols = [r["name"] for r in conn.execute("PRAGMA table_info(competitive_snapshots)")]
-        if "project" not in cols:
-            conn.execute(
-                "ALTER TABLE competitive_snapshots ADD COLUMN project TEXT NOT NULL DEFAULT ''"
-            )
-        conn.execute(
-            "INSERT OR IGNORE INTO schema_migrations (version, description) "
-            "VALUES (2, 'add project column to competitive_snapshots')"
-        )
-        logger.info("Migrated schema to version 2")
+    if current >= SCHEMA_VERSION:
+        return
 
-    if current < 3:
-        # v3: add product registry tables
-        tables = {
-            r[0]
-            for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
-        }
-        if "products" not in tables:
-            conn.executescript("""
-                CREATE TABLE products (
-                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                    category        TEXT NOT NULL,
-                    brand           TEXT NOT NULL,
-                    model           TEXT NOT NULL,
-                    search_keywords TEXT NOT NULL DEFAULT '',
-                    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
-                    updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
-                    UNIQUE(brand, model)
-                );
-                CREATE TABLE product_asins (
-                    product_id      INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
-                    marketplace     TEXT NOT NULL,
-                    asin            TEXT NOT NULL,
-                    status          TEXT NOT NULL DEFAULT 'unverified'
-                        CHECK(status IN (
-                            'unverified','verified','wrong_product','not_listed','unavailable'
-                        )),
-                    notes           TEXT NOT NULL DEFAULT '',
-                    last_checked    TEXT,
-                    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
-                    updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
-                    PRIMARY KEY (product_id, marketplace)
-                );
-                CREATE INDEX idx_pa_asin ON product_asins(asin);
-                CREATE TABLE product_tags (
-                    product_id  INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
-                    tag         TEXT NOT NULL,
-                    PRIMARY KEY (product_id, tag)
-                ) WITHOUT ROWID;
-                CREATE INDEX idx_pt_tag ON product_tags(tag);
-            """)
-        conn.execute(
-            "INSERT OR IGNORE INTO schema_migrations (version, description) "
-            "VALUES (3, 'add product registry tables')"
-        )
-        logger.info("Migrated schema to version 3")
+    try:
+        with conn:
+            if current < 2:
+                # v2: add project column to competitive_snapshots
+                cols = [
+                    r["name"]
+                    for r in conn.execute("PRAGMA table_info(competitive_snapshots)")
+                ]
+                if "project" not in cols:
+                    conn.execute(
+                        "ALTER TABLE competitive_snapshots "
+                        "ADD COLUMN project TEXT NOT NULL DEFAULT ''"
+                    )
+                conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations (version, description) "
+                    "VALUES (2, 'add project column to competitive_snapshots')"
+                )
+                logger.info("Migrated schema to version 2")
 
-    if current < 4:
-        # v4: add fetch_mode to keepa_products
-        cols = [r["name"] for r in conn.execute("PRAGMA table_info(keepa_products)")]
-        if "fetch_mode" not in cols:
-            conn.execute(
-                "ALTER TABLE keepa_products ADD COLUMN fetch_mode TEXT NOT NULL DEFAULT 'basic'"
-            )
-        conn.execute(
-            "INSERT OR IGNORE INTO schema_migrations (version, description) "
-            "VALUES (4, 'add fetch_mode to keepa_products')"
+            if current < 3:
+                # v3: add product registry tables
+                tables = {
+                    r[0]
+                    for r in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    ).fetchall()
+                }
+                if "products" not in tables:
+                    conn.execute("""
+                        CREATE TABLE products (
+                            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                            category        TEXT NOT NULL,
+                            brand           TEXT NOT NULL,
+                            model           TEXT NOT NULL,
+                            search_keywords TEXT NOT NULL DEFAULT '',
+                            created_at      TEXT NOT NULL
+                                DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                            updated_at      TEXT NOT NULL
+                                DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                            UNIQUE(brand, model)
+                        )
+                    """)
+                    conn.execute("""
+                        CREATE TABLE product_asins (
+                            product_id      INTEGER NOT NULL
+                                REFERENCES products(id) ON DELETE CASCADE,
+                            marketplace     TEXT NOT NULL,
+                            asin            TEXT NOT NULL,
+                            status          TEXT NOT NULL DEFAULT 'unverified'
+                                CHECK(status IN (
+                                    'unverified','verified','wrong_product',
+                                    'not_listed','unavailable'
+                                )),
+                            notes           TEXT NOT NULL DEFAULT '',
+                            last_checked    TEXT,
+                            created_at      TEXT NOT NULL
+                                DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                            updated_at      TEXT NOT NULL
+                                DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                            PRIMARY KEY (product_id, marketplace)
+                        )
+                    """)
+                    conn.execute(
+                        "CREATE INDEX idx_pa_asin ON product_asins(asin)"
+                    )
+                    conn.execute("""
+                        CREATE TABLE product_tags (
+                            product_id  INTEGER NOT NULL
+                                REFERENCES products(id) ON DELETE CASCADE,
+                            tag         TEXT NOT NULL,
+                            PRIMARY KEY (product_id, tag)
+                        ) WITHOUT ROWID
+                    """)
+                    conn.execute(
+                        "CREATE INDEX idx_pt_tag ON product_tags(tag)"
+                    )
+                conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations (version, description) "
+                    "VALUES (3, 'add product registry tables')"
+                )
+                logger.info("Migrated schema to version 3")
+
+            if current < 4:
+                # v4: add fetch_mode to keepa_products
+                cols = [
+                    r["name"]
+                    for r in conn.execute("PRAGMA table_info(keepa_products)")
+                ]
+                if "fetch_mode" not in cols:
+                    conn.execute(
+                        "ALTER TABLE keepa_products "
+                        "ADD COLUMN fetch_mode TEXT NOT NULL DEFAULT 'basic'"
+                    )
+                conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations (version, description) "
+                    "VALUES (4, 'add fetch_mode to keepa_products')"
+                )
+                logger.info("Migrated schema to version 4")
+    except Exception:
+        logger.exception(
+            "Schema migration failed at version %d. "
+            "Database may need manual repair.",
+            current,
         )
-        logger.info("Migrated schema to version 4")
+        raise
 
 
 _SCHEMA_SQL = """

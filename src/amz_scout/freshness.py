@@ -1,13 +1,15 @@
 """Keepa data freshness strategy evaluation.
 
-Pure-function core: evaluate_freshness() takes data in, returns decisions out.
-No side effects, no DB access — enabling trivial unit testing.
+Contains both DB query helpers (query_freshness) and a pure-function core
+(evaluate_freshness) that takes data in, returns decisions out with no
+side effects — enabling trivial unit testing of the decision logic.
 """
 
 import sqlite3
 from dataclasses import dataclass
 from datetime import date
 from enum import Enum
+from typing import Literal
 
 from amz_scout.db import query_keepa_fetched_at
 from amz_scout.models import Product
@@ -32,7 +34,7 @@ class ProductFreshness:
     brand: str
     fetched_at: str | None  # ISO date from DB, or None if never fetched
     age_days: int | None  # Days since last fetch, or None if never
-    action: str  # "use_cache" | "fetch" | "skip"
+    action: Literal["use_cache", "fetch", "skip"]
     reason: str  # Human-readable explanation
 
 
@@ -104,7 +106,7 @@ def _decide(
     max_age_days: int,
     requested_mode: str = "basic",
     cached_mode: str | None = None,
-) -> tuple[str, str]:
+) -> tuple[Literal["use_cache", "fetch", "skip"], str]:
     """Return (action, reason) for a single product/site pair."""
     has_data = fetched_at is not None
 

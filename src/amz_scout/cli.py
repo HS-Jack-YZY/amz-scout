@@ -325,18 +325,21 @@ def _scrape_amazon(
             browser.close()
 
 
-def _save_discovered_asin(db_conn, product: Product, site: str, asin: str) -> None:
-    """Register a discovered ASIN so browser search results enrich the product database."""
+def _save_discovered_asin(db_conn, product: Product, site: str, asin: str) -> bool:
+    """Register a discovered ASIN. Returns True on success, False on failure."""
     try:
         row = find_product_exact(db_conn, product.brand, product.model)
         if row:
             register_asin(db_conn, row["id"], site, asin, status="unverified",
                           notes="discovered via browser search")
+            return True
+        return False
     except Exception:
-        logging.getLogger(__name__).debug(
+        logging.getLogger(__name__).warning(
             "Failed to save discovered ASIN %s for %s %s on %s",
             asin, product.brand, product.model, site, exc_info=True,
         )
+        return False
 
 
 def _save_competitive(
@@ -434,8 +437,11 @@ def discover(
                                 browser, prod, site, mp_config, config_path=None,
                             )
                             if found:
-                                _save_discovered_asin(db_conn, prod, site, found)
-                                console.print(f"  {prod.model}: [green]Found[/] {found} (saved to DB)")
+                                saved = _save_discovered_asin(db_conn, prod, site, found)
+                                if saved:
+                                    console.print(f"  {prod.model}: [green]Found[/] {found} (saved to DB)")
+                                else:
+                                    console.print(f"  {prod.model}: [yellow]Found[/] {found} (DB save failed)")
                                 found_count += 1
                             else:
                                 console.print(f"  {prod.model}: [red]Not found[/]")
@@ -603,11 +609,15 @@ def _store_raw_to_db(db_conn, raw_dir: Path, products: list[Product], site: str)
 def _store_competitive_to_db(
     db_conn, results: list[CompetitiveData], project: str = "",
 ) -> None:
-    """Write browser snapshots to DB. Failures are logged, not raised."""
+    """Write browser snapshots to DB. Failures are logged and shown to user."""
     try:
         upsert_competitive(db_conn, results, project=project)
     except Exception:
         logging.getLogger(__name__).exception("DB write failed for competitive data")
+        console.print(
+            f"  [red]Warning: Failed to save {len(results)} competitive snapshots to DB. "
+            "CSV data was saved but database may be stale.[/]"
+        )
 
 
 # ─── Admin subcommand group (one-time operations) ────────────────────
@@ -732,7 +742,7 @@ def _count_lines(path: Path) -> int:
     if not path.exists():
         return 0
     with open(path) as f:
-        return sum(1 for _ in f) - 1  # Subtract header
+        return max(0, sum(1 for _ in f) - 1)  # Subtract header, floor at 0
 
 
 # ─── Query subcommand group ───────────────────────────────────────────

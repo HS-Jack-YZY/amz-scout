@@ -58,10 +58,16 @@ class KeepaClient:
         return self._tokens_left
 
     def _check_tokens(self) -> None:
-        resp = requests.get(f"{API_BASE}/token", params={"key": self._key}, timeout=10)
-        data = resp.json()
-        self._tokens_left = data.get("tokensLeft", 0)
-        self._refill_rate = data.get("refillRate", 1)
+        try:
+            resp = requests.get(f"{API_BASE}/token", params={"key": self._key}, timeout=10)
+            data = resp.json()
+            self._tokens_left = data.get("tokensLeft", 0)
+            self._refill_rate = data.get("refillRate", 1)
+        except (requests.exceptions.RequestException, ValueError) as e:
+            logger.warning("Token check failed (%s), using last known count: %d",
+                           e, max(self._tokens_left, 0))
+            if self._tokens_left == -1:
+                self._tokens_left = 0
 
     def _wait_for_tokens(self, needed: int) -> None:
         if self._tokens_left >= needed:
@@ -147,24 +153,24 @@ class KeepaClient:
                                      site, asin, refill_in, attempt + 1, max_retries)
                         time.sleep(refill_in)
                         continue
-                    return _empty_history(product, site)
+                    return _empty_history(product, site, fetch_error="rate_limited")
 
                 try:
                     data = resp.json()
                 except (ValueError, requests.exceptions.JSONDecodeError):
                     logger.warning("[%s] Non-JSON response for %s", site, asin)
-                    return _empty_history(product, site)
+                    return _empty_history(product, site, fetch_error="invalid_response")
 
                 self._tokens_left = data.get("tokensLeft", self._tokens_left)
 
                 if resp.status_code != 200 or "error" in data:
-                    logger.warning("[%s] Keepa error for %s: %s",
-                                    site, asin, data.get("error", resp.status_code))
-                    return _empty_history(product, site)
+                    err_msg = data.get("error", str(resp.status_code))
+                    logger.warning("[%s] Keepa error for %s: %s", site, asin, err_msg)
+                    return _empty_history(product, site, fetch_error=f"api_error: {err_msg}")
 
                 raw_products = data.get("products", [])
                 if not raw_products:
-                    return _empty_history(product, site)
+                    return _empty_history(product, site)  # genuinely no data
 
                 # Save raw JSON
                 if raw_dir:
@@ -178,12 +184,12 @@ class KeepaClient:
 
             except requests.exceptions.RequestException as e:
                 logger.error("[%s] Network error for %s: %s", site, asin, e)
-                return _empty_history(product, site)
+                return _empty_history(product, site, fetch_error=f"network: {e}")
             except Exception as e:
                 logger.error("[%s] Unexpected error for %s: %s", site, asin, e)
-                return _empty_history(product, site)
+                return _empty_history(product, site, fetch_error=f"unexpected: {e}")
 
-        return _empty_history(product, site)
+        return _empty_history(product, site, fetch_error="max_retries_exhausted")
 
 
 # ─── Raw data storage ───────────────────────────────────────────────────
@@ -351,7 +357,9 @@ def _latest_value(csv_data: list, type_index: int, as_int: bool = False):
     return None
 
 
-def _empty_history(product: Product, site: str) -> PriceHistory:
+def _empty_history(
+    product: Product, site: str, fetch_error: str = "",
+) -> PriceHistory:
     """Create an empty PriceHistory for a product with no data."""
     return PriceHistory(
         date=today_iso(),
@@ -360,4 +368,5 @@ def _empty_history(product: Product, site: str) -> PriceHistory:
         brand=product.brand,
         model=product.model,
         asin=product.asin_for(site),
+        fetch_error=fetch_error,
     )

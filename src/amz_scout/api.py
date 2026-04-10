@@ -13,7 +13,7 @@ import re
 import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import NamedTuple
+from typing import Any, NamedTuple, TypedDict
 
 from amz_scout.config import (
     MarketplaceConfig,
@@ -78,6 +78,15 @@ BROWSER_QUERY_HINT = "No competitive data found. Run 'amz-scout scrape <config>'
 _ASIN_RE = re.compile(r"^[A-Z0-9]{10}$")
 
 
+class ApiResponse(TypedDict):
+    """Standard response envelope for all public API functions."""
+
+    ok: bool
+    data: list | dict
+    error: str | None
+    meta: dict[str, Any]
+
+
 # ─── Internal helpers ────────────────────────────────────────────────
 
 
@@ -97,7 +106,10 @@ def _build_marketplace_aliases(marketplaces: dict[str, MarketplaceConfig]) -> di
         aliases[code.lower()] = code  # "uk" → "UK"
         aliases[mp.keepa_domain.lower()] = code  # "gb" → "UK"
         aliases[mp.amazon_domain.lower()] = code  # "amazon.co.uk" → "UK"
-        aliases[mp.currency_code.lower()] = code  # "gbp" → "UK"
+        # Only map currency code if unique (EUR is shared by DE/FR/IT/ES/NL)
+        currency_key = mp.currency_code.lower()
+        if currency_key not in aliases:
+            aliases[currency_key] = code
     return aliases
 
 
@@ -139,10 +151,23 @@ def _resolve_site(
     marketplace: str | None,
     aliases: dict[str, str],
 ) -> str | None:
-    """Resolve a marketplace query to canonical code, or pass through as-is."""
+    """Resolve a marketplace query to canonical code.
+
+    Logs a warning when the input does not match any known alias and is
+    passed through unchanged — this likely indicates a typo.
+    """
     if marketplace is None:
         return None
-    return aliases.get(marketplace.lower()) or marketplace
+    resolved = aliases.get(marketplace.lower())
+    if resolved is None:
+        logger.warning(
+            "Unknown marketplace '%s' — passing through as-is. "
+            "Known aliases: %s",
+            marketplace,
+            ", ".join(sorted({v for v in aliases.values()})),
+        )
+        return marketplace
+    return resolved
 
 
 def _resolve_context(
@@ -264,8 +289,8 @@ def _envelope(
     data: list | dict | None = None,
     error: str | None = None,
     hint_if_empty: str | None = None,
-    **meta: object,
-) -> dict:
+    **meta: Any,
+) -> ApiResponse:
     """Build the standard response envelope."""
     if hint_if_empty and not data:
         meta["hint"] = hint_if_empty
@@ -303,9 +328,9 @@ def _auto_fetch(
                 "tokens_remaining": result.tokens_remaining,
             }
         return {"auto_fetched": False}
-    except Exception:
-        logger.warning("auto_fetch failed, proceeding with cached data")
-        return {"auto_fetched": False, "auto_fetch_error": True}
+    except Exception as e:
+        logger.exception("auto_fetch failed, proceeding with cached data")
+        return {"auto_fetched": False, "auto_fetch_error": True, "auto_fetch_detail": str(e)}
 
 
 def _try_mark_not_listed(
@@ -330,7 +355,7 @@ def _try_mark_not_listed(
                 notes="Keepa returned no title or price data",
             )
     except Exception:
-        logger.warning("Failed to mark ASIN %s/%s as not_listed", asin, site)
+        logger.exception("Failed to mark ASIN %s/%s as not_listed", asin, site)
 
 
 def _add_dates(rows: list[dict]) -> list[dict]:
@@ -727,11 +752,11 @@ def ensure_keepa_data(
         )
         products = info.products
 
-        if product:
-            _, model, _, _, _ = _resolve_asin(products, product)
-            products = [p for p in products if p.model == model]
-
         with open_db(info.db_path) as conn:
+            if product:
+                _, model, _, _, _ = _resolve_asin(products, product, conn=conn)
+                products = [p for p in products if p.model == model]
+
             # Pre-flight: estimate token cost before fetching
             if not confirm:
                 from amz_scout.freshness import query_freshness as qf
@@ -859,11 +884,11 @@ def check_freshness(
         )
         products = info.products
 
-        if product:
-            _, model, _, _, _ = _resolve_asin(products, product)
-            products = [p for p in products if p.model == model]
-
         with open_db(info.db_path) as conn:
+            if product:
+                _, model, _, _, _ = _resolve_asin(products, product, conn=conn)
+                products = [p for p in products if p.model == model]
+
             fetched_map = query_freshness(conn, products, sites)
             results = evaluate_freshness(
                 products,
