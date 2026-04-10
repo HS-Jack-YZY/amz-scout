@@ -465,7 +465,7 @@ def _try_register_product(
     if not brand or not title:
         return None
 
-    product_id = register_product(conn, category, brand, model, search_keywords=title)
+    product_id = register_product(conn, category, brand, model)
     register_asin(conn, product_id, site, asin, status="unverified")
 
     logger.info(
@@ -1420,15 +1420,23 @@ def find_product(
         if row:
             return dict(row)
 
-    # Model or search_keywords substring match
+    # Model, search_keywords, or Keepa title substring match
+    like = f"%{query_str}%"
     sql = """
         SELECT p.id, p.category, p.brand, p.model, pa.asin, pa.marketplace
         FROM products p
         LEFT JOIN product_asins pa ON p.id = pa.product_id
-        WHERE (p.model LIKE ? OR p.search_keywords LIKE ?)
+        WHERE (
+            p.model LIKE ?
+            OR p.search_keywords LIKE ?
+            OR EXISTS (
+                SELECT 1 FROM keepa_products kp
+                JOIN product_asins pa2 ON kp.asin = pa2.asin
+                WHERE pa2.product_id = p.id AND kp.title LIKE ?
+            )
+        )
     """
-    like = f"%{query_str}%"
-    params = [like, like]
+    params: list = [like, like, like]
     if marketplace:
         sql += " AND pa.marketplace = ?"
         params.append(marketplace)
