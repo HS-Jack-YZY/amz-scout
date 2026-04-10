@@ -184,7 +184,13 @@ r = batch_discover(candidates=r["meta"]["discover_pending"], headed=True)
 
 11. **绝不猜测 ASIN**: 不在注册表的产品不要编造 ASIN。应该：(a) 问用户提供 ASIN，或 (b) 用 `discover_asin()` 浏览器搜索。用户直接给 ASIN 查询时会自动 fetch + 自动注册（如果 Keepa 有数据），无需手动操作。
 
-12. **新产品后台 ASIN 补全（重要）**: 当 `query_trends` 返回 `meta.new_product=True` 时，说明一个全新产品刚被注册。执行以下流程：
+12. **新产品后台 ASIN 补全（重要，所有注册路径均适用）**:
+
+    **触发条件（满足任意一条即执行补全）**：
+    - `query_trends` 返回 `meta.new_product=True`
+    - `add_product()` 返回 `meta.new_product=True`（现已内置，所有 add_product 调用均返回）
+    - `import_yaml()` 导入后（导入完成后统一对新产品执行）
+    - 批量操作（如循环调用 `add_product`）：**循环结束后**对所有新产品统一执行一次
 
     ```
     优先级顺序：
@@ -193,10 +199,11 @@ r = batch_discover(candidates=r["meta"]["discover_pending"], headed=True)
     3. 最后静默补全其余市场的 ASIN（用户不需要知道这个过程）
 
     补全步骤：
-    1. 调用 get_pending_markets(product_id) 获取待搜索的市场和域名
+    1. 从 add_product 返回的 meta.pending_markets 直接读取待搜索市场
+       （或调用 get_pending_markets(product_id) 重新获取）
     2. 对 pending 列表中的每个市场，用 WebSearch 搜索 ASIN：
        搜索格式: "{brand} {model} site:{domain}"
-       domain 从 get_pending_markets 返回的 domains 字典获取
+       domain 从 meta.pending_domains（或 get_pending_markets）获取
     3. 从搜索结果的 Amazon URL 中提取 ASIN（/dp/B0XXXXXXXX 格式）
     4. 调用 register_market_asins(product_id, {"UK": "B0XXX", "DE": "B0YYY", ...})
     5. 注册完成后简短告知用户："已补全 X 个市场的 ASIN"
@@ -204,10 +211,11 @@ r = batch_discover(candidates=r["meta"]["discover_pending"], headed=True)
 
     **注意事项**：
     - 用户的查询请求永远优先，后台补全最后做
-    - 必须用 get_pending_markets() 获取市场列表，不要自己记忆或硬编码
+    - 批量注册（多个产品）时，并行发起 WebSearch，最后统一 register_market_asins
     - 搜不到的市场跳过，不要猜测
     - 只写 product_asins，不调 Keepa API（0 token）
     - 如果 WebSearch 返回的不是 Amazon 产品页（无 /dp/ 路径），跳过该市场
+    - **禁止跳过此步骤**：无论是直接 add_product 还是通过 query_trends 触发，补全都必须执行
 
 13. **禁止直接调用 Keepa API（严格执行）**:
     - **绝不**用 `requests.get("https://api.keepa.com/...")` 或任何方式直接调用 Keepa API。所有 Keepa 操作必须通过 `amz_scout.api` 函数。

@@ -983,7 +983,8 @@ def add_product(
 
         path = _get_db(db_path)
         with open_db(path) as conn:
-            pid, _ = register_product(conn, category, brand, model, search_keywords)
+            # is_new=True only on genuine INSERT; False on idempotent re-registration.
+            pid, is_new = register_product(conn, category, brand, model, search_keywords)
 
             if asins:
                 for marketplace, asin in asins.items():
@@ -991,6 +992,15 @@ def add_product(
 
             if tag:
                 tag_product(conn, pid, tag)
+
+        # Compute pending markets without a second DB open: the registered set is
+        # already known from `asins`. Parse marketplaces.yaml once here.
+        registered = set(asins.keys()) if asins else set()
+        marketplaces = load_marketplace_config(CONFIG_DIR / "marketplaces.yaml")
+        keepa_markets = {c: m for c, m in marketplaces.items() if m.keepa_domain_code is not None}
+        pending = sorted(keepa_markets.keys() - registered)
+        domains = {c: keepa_markets[c].amazon_domain for c in pending}
+        warnings: list[str] = []
     except Exception as e:
         logger.exception("add_product failed")
         return _envelope(False, error=str(e))
@@ -999,6 +1009,10 @@ def add_product(
         True,
         data={"id": pid, "brand": brand, "model": model},
         asins_registered=len(asins) if asins else 0,
+        new_product=is_new,
+        pending_markets=pending if is_new else [],
+        pending_domains=domains if is_new else {},
+        warnings=warnings,
     )
 
 
