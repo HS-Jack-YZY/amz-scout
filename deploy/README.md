@@ -348,6 +348,75 @@ docker compose restart webapp
 Lightsail 2 GB 套餐可能不够用。升到 4 GB 套餐（约 \$20/月）。Lightsail
 支持从快照在线变更套餐。
 
+### 块存储磁盘找不到 `/dev/xvdf`（NVMe 实例）
+
+Lightsail 的 Nitro NVMe 一代之后的实例上，块存储实际路径是 `/dev/nvme1n1`，
+不是控制台 UI 显示的 `/dev/xvdf`。用 `lsblk` 确认实际路径：
+
+```bash
+lsblk
+# 系统盘: nvme0n1 (40G, 已分区)
+# 数据盘: nvme1n1 (20G, 未分区) ← 就是这个
+```
+
+然后用 `BLOCK_DEVICE` 环境变量覆盖默认值再跑 bootstrap：
+
+```bash
+sudo BLOCK_DEVICE=/dev/nvme1n1 bash deploy/first-time-setup.sh
+```
+
+### Docker 构建第一次失败："playwright: not found" 或 "uvx not found"
+
+如果你照着早期版本的这份 README 手工写过 Dockerfile 并看到这两个错误之一，
+原因是 browser-use 0.12+ 放弃了对 playwright 的依赖，改用自己的 `cdp-use`
+客户端。正确的 layer A 是：
+
+```dockerfile
+# 装 uv + browser-use 到系统 Python
+RUN pip install --no-cache-dir uv browser-use
+# 用 browser-use 自己的 installer 拉 Chromium + OS deps
+RUN browser-use install
+```
+
+⚠️ **`browser-use install` 内部会 spawn `uvx` 子进程** 来 bootstrap Chromium，
+所以 `uv` 必须和 `browser-use` 一起装 —— 只装 browser-use 会在 layer 运行时
+报 `FileNotFoundError: uvx`。
+
+诊断命令：`browser-use doctor`（在容器里跑）会打印所有依赖的健康状态。
+
+### 静态 IP 绑定后 IP 地址变了
+
+Lightsail 给实例分配的 dynamic IP 和你创建的 static IP 并不是同一个。
+绑定 static IP 之后，实例的 Public IPv4 会**切到新的 IP**，原来的 dynamic IP
+立即失效。第一次 SSH 前一定要回实例页确认「当前 Public IPv4」显示什么，
+而不是记住你开机那一刻看到的 IP。
+
+### docker compose 启动时反复报 "variable is not set"
+
+如果 `.env` 里某个 secret 的值含有 `$` 字符（例如 `CHAINLIT_AUTH_SECRET`），
+docker compose 会把 `$xxx` 当成变量替换尝试，触发 "variable is not set"
+warning。**这个 warning 是无害的** —— 在 `env_file` 模式下 docker compose
+会把原值透传给容器，容器内部拿到的还是包含 `$` 的完整值。
+
+如果想消除 warning，把 `.env` 里的 `$` 转义成 `$$`：
+
+```
+APP_PASSWORD=my$secret$pass       ← 报 warning
+APP_PASSWORD=my$$secret$$pass     ← 静默通过
+```
+
+### apt-get install 过程中出现 perl locale 警告
+
+`deploy/first-time-setup.sh` 跑 `apt-get install docker-ce` 时你会看到一堆：
+
+```
+perl: warning: Setting locale failed.
+perl: warning: Please check that your locale settings...
+```
+
+**无害**。Ubuntu 24.04 slim 基础镜像没装完整 locale 数据，Perl 脚本
+(debian 的维护脚本) fallback 到 C.UTF-8 继续跑。不影响 Docker 安装。
+
 ### 验证 secret 没有泄露到日志里
 
 ```bash
@@ -362,9 +431,36 @@ docker compose logs webapp | grep -c 'sk-ant-' || true
 把每次真实 Lightsail 演练的事故笔记按日期追加在这里，给后续的运维
 留下「实际发生过什么」的真实记录，而不只是「计划应该发生什么」。
 
-```
-YYYY-MM-DD <名字>: <发生了什么 / 怎么修的 / 花了多久>
-```
+### 2026-04-13 Jack：首次 Phase 6 演练
+
+**实例**：us-east-1a，\$7 套餐（1 GB RAM，2 vCPU），Ubuntu 24.04 LTS，20 GB 数据盘。
+账户未开放 \$12 套餐，所以降级 + 手工加 2 GB swap 兜底。
+
+**踩坑 + 总用时**：约 90 分钟，其中 ~30 分钟花在 3 次 Dockerfile 构建迭代。
+
+1. **Lightsail UI 显示 `/dev/xvdf`，实际是 `/dev/nvme1n1`**。Nitro 一代之后都这样，
+   用 `lsblk` 确认后用 `BLOCK_DEVICE=/dev/nvme1n1` 覆盖脚本默认值解决。
+2. **静态 IP 绑定后 IP 换了**（从 dynamic 的 44.192.131.98 变成 52.45.8.186）。
+   第一次用旧 IP SSH 超时才发现。
+3. **Dockerfile 连续 3 次失败**，每次都是 `playwright install chromium` 相关：
+   - 第 1 次：`uv tool install browser-use` 只暴露 browser-use，不暴露 playwright
+   - 第 2 次：现代 browser-use (0.12+) 根本没用 playwright，改用 cdp-use
+   - 第 3 次：`browser-use install` 内部 spawn uvx，但 uv 没装
+   - 最终修复：`pip install --no-cache-dir uv browser-use` + `RUN browser-use install`
+4. **Chromium 启动 OOM 风险**：1 GB 物理内存 + 2 GB swap 刚好够用，构建过程吃满 swap。
+   如果账户能开 \$12 套餐（2 GB RAM），就不需要 swap 兜底。
+
+**golden path 验证**：成功。用「ASIN 透传」路径验证端到端：
+- Chainlit 登录 → tool dispatch → query_trends(product="B0XXXXXXXX", marketplace="UK")
+- 4-level resolution → LAZY fetch Keepa（消耗 1 token）
+- SQLite 自动写入 `keepa_time_series` + 自动注册到 `products` + `product_asins`
+- Webapp 拿到时间序列并渲染
+- 这比 scp 本地 DB 过去验证强度高 —— 同时覆盖读路径 + 写路径 + 外部 API 出向
+
+**HTTP-only 模式**：`DOMAIN=:80`，Caddy 绑 80 跳过 ACME。演练结束后如果拿到正式
+域名，只需改 `.env` 一行 + `docker compose up -d` 即可获得 TLS。
+
+**演练后动作**：实例 + static IP + data disk 全部在演练完成后 Delete，避免账单。
 
 ---
 
