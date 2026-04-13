@@ -23,6 +23,22 @@ from amz_scout.api import query_trends as _api_query_trends
 logger = logging.getLogger(__name__)
 
 
+def _missing_required(tool_name: str, field: str) -> dict[str, Any]:
+    """Envelope-shaped validation error for a required tool field the LLM dropped.
+
+    The Anthropic tool schema marks some fields as `required`, but LLMs occasionally
+    omit them. Returning this envelope (instead of falling through to the API with an
+    empty string) gives the model a clear "you dropped a required field" signal rather
+    than a cryptic downstream resolution error.
+    """
+    return {
+        "ok": False,
+        "data": [],
+        "error": f"{field} is required for {tool_name}",
+        "meta": {},
+    }
+
+
 # ─── Anthropic tool schemas ──────────────────────────────────────
 # IMPORTANT: cache_control goes on the LAST tool only — it caches all
 # preceding tools. Scattered cache_control = cache hit rate of 0.
@@ -335,8 +351,11 @@ async def dispatch_tool(name: str, args: dict) -> dict:
     consume meta/error/hint fields directly.
     """
     if name == "query_latest":
+        marketplace = args.get("marketplace")
+        if not marketplace:
+            return _missing_required("query_latest", "marketplace")
         return await _step_query_latest(
-            marketplace=args.get("marketplace", ""),
+            marketplace=marketplace,
             category=args.get("category"),
         )
     if name == "check_freshness":
@@ -349,22 +368,34 @@ async def dispatch_tool(name: str, args: dict) -> dict:
     if name == "query_availability":
         return await _step_query_availability()
     if name == "query_compare":
-        return await _step_query_compare(product=args.get("product", ""))
+        product = args.get("product")
+        if not product:
+            return _missing_required("query_compare", "product")
+        return await _step_query_compare(product=product)
     if name == "query_deals":
         return await _step_query_deals(marketplace=args.get("marketplace"))
     if name == "query_ranking":
+        marketplace = args.get("marketplace")
+        if not marketplace:
+            return _missing_required("query_ranking", "marketplace")
         return await _step_query_ranking(
-            marketplace=args.get("marketplace", ""),
+            marketplace=marketplace,
             category=args.get("category"),
         )
     if name == "query_sellers":
+        product = args.get("product")
+        if not product:
+            return _missing_required("query_sellers", "product")
         return await _step_query_sellers(
-            product=args.get("product", ""),
+            product=product,
             marketplace=args.get("marketplace", "UK"),
         )
     if name == "query_trends":
+        product = args.get("product")
+        if not product:
+            return _missing_required("query_trends", "product")
         return await _step_query_trends(
-            product=args.get("product", ""),
+            product=product,
             marketplace=args.get("marketplace", "UK"),
             series=args.get("series", "new"),
             days=args.get("days", 90),
