@@ -47,9 +47,7 @@ class BrowserSession:
 
         logger.debug("Running: %s", " ".join(full_cmd))
         try:
-            proc = subprocess.run(
-                full_cmd, capture_output=True, text=True, timeout=timeout
-            )
+            proc = subprocess.run(full_cmd, capture_output=True, text=True, timeout=timeout)
         except subprocess.TimeoutExpired as e:
             raise BrowserError(f"Timeout ({timeout}s) running: {' '.join(cmd_args)}") from e
 

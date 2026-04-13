@@ -161,8 +161,7 @@ def _resolve_site(
     resolved = aliases.get(marketplace.lower())
     if resolved is None:
         logger.warning(
-            "Unknown marketplace '%s' — passing through as-is. "
-            "Known aliases: %s",
+            "Unknown marketplace '%s' — passing through as-is. Known aliases: %s",
             marketplace,
             ", ".join(sorted({v for v in aliases.values()})),
         )
@@ -659,8 +658,14 @@ def query_sellers(
     if resolve_warnings:
         meta_extra["warnings"] = resolve_warnings
     return _envelope(
-        True, data=rows, asin=asin, model=model, brand=brand, count=len(rows),
-        **fetch_meta, **meta_extra,
+        True,
+        data=rows,
+        asin=asin,
+        model=model,
+        brand=brand,
+        count=len(rows),
+        **fetch_meta,
+        **meta_extra,
     )
 
 

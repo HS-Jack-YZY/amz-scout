@@ -58,8 +58,15 @@ def read_price_history(path: Path) -> list[PriceHistory]:
             # Convert numeric fields
             parsed = {}
             _STR_FIELDS = {
-                "date", "site", "category", "brand", "model", "asin",
-                "buybox_is_amazon", "buybox_is_fba", "buybox_seller_id",
+                "date",
+                "site",
+                "category",
+                "brand",
+                "model",
+                "asin",
+                "buybox_is_amazon",
+                "buybox_is_fba",
+                "buybox_seller_id",
             }
             _INT_FIELDS = {"sales_rank", "monthly_sold", "seller_count", "fba_seller_count"}
             for fld in PRICE_HISTORY_FIELDS:
@@ -67,7 +74,9 @@ def read_price_history(path: Path) -> list[PriceHistory]:
                 if fld in _STR_FIELDS:
                     parsed[fld] = val
                 elif fld in _INT_FIELDS:
-                    parsed[fld] = int(float(val)) if val and val not in ("", "None", "N/A") else None
+                    parsed[fld] = (
+                        int(float(val)) if val and val not in ("", "None", "N/A") else None
+                    )
                 else:
                     parsed[fld] = _to_float(val)
             rows.append(PriceHistory(**parsed))

@@ -20,7 +20,6 @@ from amz_scout.db import (
 )
 from amz_scout.models import Product
 
-
 # ─── Fixtures ────────────────────────────────────────────────────────
 
 
@@ -36,9 +35,13 @@ def conn():
     c.close()
 
 
-def _make_keepa_raw(brand: str = "GL.iNet", title: str = "Slate 7 Router",
-                     model: str = "GL-BE3600", asin: str = "B0TEST12345",
-                     product_group: str = "Router") -> dict:
+def _make_keepa_raw(
+    brand: str = "GL.iNet",
+    title: str = "Slate 7 Router",
+    model: str = "GL-BE3600",
+    asin: str = "B0TEST12345",
+    product_group: str = "Router",
+) -> dict:
     """Create minimal Keepa raw product JSON for testing."""
     return {
         "asin": asin,
@@ -86,9 +89,7 @@ class TestAutoRegisterFromKeepa:
 
         assert result is None
 
-        row = conn.execute(
-            "SELECT * FROM product_asins WHERE asin = ?", ("B0NOBRND01",)
-        ).fetchone()
+        row = conn.execute("SELECT * FROM product_asins WHERE asin = ?", ("B0NOBRND01",)).fetchone()
         assert row is None
 
     def test_skips_when_title_empty(self, conn):
@@ -98,9 +99,7 @@ class TestAutoRegisterFromKeepa:
 
         assert result is None
 
-        row = conn.execute(
-            "SELECT * FROM product_asins WHERE asin = ?", ("B0NOTITL01",)
-        ).fetchone()
+        row = conn.execute("SELECT * FROM product_asins WHERE asin = ?", ("B0NOTITL01",)).fetchone()
         assert row is None
 
     def test_skips_when_already_registered(self, conn):
@@ -142,12 +141,14 @@ class TestEnsureKeepaDataConfirmation:
     def test_returns_confirmation_when_tokens_exceed_threshold(
         self, mock_open_db, mock_resolve_ctx
     ):
-        from amz_scout.api import ensure_keepa_data, _BATCH_TOKEN_THRESHOLD
+        from amz_scout.api import _BATCH_TOKEN_THRESHOLD, ensure_keepa_data
 
         # Create 10 products — should exceed the 6-token threshold
         products = [
             Product(
-                category="Router", brand="Test", model=f"Model-{i}",
+                category="Router",
+                brand="Test",
+                model=f"Model-{i}",
                 default_asin=f"B0TEST{i:05d}",
                 marketplace_overrides={"UK": {"asin": f"B0TEST{i:05d}"}},
             )
@@ -169,14 +170,14 @@ class TestEnsureKeepaDataConfirmation:
         mock_open_db.return_value = mock_conn
 
         # Patch at the source modules (lazy imports inside function body)
-        with patch("amz_scout.freshness.evaluate_freshness") as mock_eval, \
-             patch("amz_scout.freshness.partition_by_action") as mock_partition, \
-             patch("amz_scout.freshness.query_freshness", return_value={}):
-
+        with (
+            patch("amz_scout.freshness.evaluate_freshness") as mock_eval,
+            patch("amz_scout.freshness.partition_by_action") as mock_partition,
+            patch("amz_scout.freshness.query_freshness", return_value={}),
+        ):
             # All 10 products need fetching
             mock_freshness_items = [
-                MagicMock(asin=f"B0TEST{i:05d}", site="UK", model=f"Model-{i}")
-                for i in range(10)
+                MagicMock(asin=f"B0TEST{i:05d}", site="UK", model=f"Model-{i}") for i in range(10)
             ]
             mock_eval.return_value = mock_freshness_items
             mock_partition.return_value = ([], mock_freshness_items, [])
@@ -192,14 +193,14 @@ class TestEnsureKeepaDataConfirmation:
     @patch("amz_scout.api._resolve_context")
     @patch("amz_scout.api.open_db")
     @patch("amz_scout.keepa_service.get_keepa_data")
-    def test_confirm_true_proceeds_with_fetch(
-        self, mock_get_keepa, mock_open_db, mock_resolve_ctx
-    ):
+    def test_confirm_true_proceeds_with_fetch(self, mock_get_keepa, mock_open_db, mock_resolve_ctx):
         from amz_scout.api import ensure_keepa_data
 
         products = [
             Product(
-                category="Router", brand="Test", model="Model-1",
+                category="Router",
+                brand="Test",
+                model="Model-1",
                 default_asin="B0TEST00001",
                 marketplace_overrides={"UK": {"asin": "B0TEST00001"}},
             )
@@ -253,8 +254,11 @@ class TestQueryTrendsNewProduct:
 
         # Insert Keepa product data with brand+title for auto-registration
         raw = _make_keepa_raw(
-            asin="B0NEWASIN1", brand="NewBrand", title="New Router X1",
-            model="X1", product_group="Router",
+            asin="B0NEWASIN1",
+            brand="NewBrand",
+            title="New Router X1",
+            model="X1",
+            product_group="Router",
         )
         store_keepa_product(conn, "B0NEWASIN1", "US", raw, "2026-04-10T00:00:00Z")
         conn.close()
@@ -287,8 +291,14 @@ class TestValidateAndDiscoverPhases:
         mock_validate.return_value = {
             "ok": True,
             "data": [
-                {"brand": "GL.iNet", "model": "Slate 7", "marketplace": "UK",
-                 "asin": "B0F2MR53D6", "status": "verified", "reason": "title matches"},
+                {
+                    "brand": "GL.iNet",
+                    "model": "Slate 7",
+                    "marketplace": "UK",
+                    "asin": "B0F2MR53D6",
+                    "status": "verified",
+                    "reason": "title matches",
+                },
             ],
             "error": None,
             "meta": {"verified": 1, "not_listed": 0, "wrong_product": 0},
@@ -307,12 +317,22 @@ class TestValidateAndDiscoverPhases:
         mock_validate.return_value = {
             "ok": True,
             "data": [
-                {"brand": "GL.iNet", "model": "Slate 7", "marketplace": "UK",
-                 "asin": "B0WRONG001", "status": "not_listed",
-                 "reason": "no title in Keepa"},
-                {"brand": "ASUS", "model": "RT-BE58", "marketplace": "UK",
-                 "asin": "B0FGDRP3VZ", "status": "verified",
-                 "reason": "title matches"},
+                {
+                    "brand": "GL.iNet",
+                    "model": "Slate 7",
+                    "marketplace": "UK",
+                    "asin": "B0WRONG001",
+                    "status": "not_listed",
+                    "reason": "no title in Keepa",
+                },
+                {
+                    "brand": "ASUS",
+                    "model": "RT-BE58",
+                    "marketplace": "UK",
+                    "asin": "B0FGDRP3VZ",
+                    "status": "verified",
+                    "reason": "title matches",
+                },
             ],
             "error": None,
             "meta": {"verified": 1, "not_listed": 1, "wrong_product": 0},
@@ -349,18 +369,32 @@ class TestValidateAndDiscoverPhases:
         mock_validate.return_value = {
             "ok": True,
             "data": [
-                {"brand": "GL.iNet", "model": "Slate 7", "marketplace": "UK",
-                 "asin": "B0WRONG001", "status": "wrong_product",
-                 "reason": "title mismatch"},
+                {
+                    "brand": "GL.iNet",
+                    "model": "Slate 7",
+                    "marketplace": "UK",
+                    "asin": "B0WRONG001",
+                    "status": "wrong_product",
+                    "reason": "title mismatch",
+                },
             ],
             "error": None,
             "meta": {"verified": 0, "not_listed": 0, "wrong_product": 1},
         }
 
         mock_batch.return_value = (
-            [{"brand": "GL.iNet", "model": "Slate 7", "marketplace": "UK",
-              "old_asin": "B0WRONG001", "new_asin": "B0CORRECT1", "ok": True}],
-            1, 0,
+            [
+                {
+                    "brand": "GL.iNet",
+                    "model": "Slate 7",
+                    "marketplace": "UK",
+                    "old_asin": "B0WRONG001",
+                    "new_asin": "B0CORRECT1",
+                    "ok": True,
+                }
+            ],
+            1,
+            0,
         )
 
         r = validate_and_discover(marketplace="UK", auto_discover=True)

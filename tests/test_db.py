@@ -1,23 +1,14 @@
 """Tests for amz_scout.db module using :memory: SQLite and real raw JSON."""
 
-import json
 import sqlite3
-from pathlib import Path
 
 import pytest
 
 from amz_scout.db import (
-    SERIES_AMAZON,
-    SERIES_COUNT_NEW,
-    SERIES_COUNT_REVIEWS,
     SERIES_MONTHLY_SOLD,
     SERIES_NEW,
-    SERIES_RATING,
     SERIES_SALES_RANK,
     SERIES_SALES_RANK_BASE,
-    get_connection,
-    import_from_csv,
-    import_from_raw_json,
     init_schema,
     query_availability,
     query_bsr_ranking,
@@ -27,12 +18,12 @@ from amz_scout.db import (
     query_monthly_sales,
     query_price_trends,
     query_review_growth,
-    query_seller_history,
     query_stats,
     store_keepa_product,
     upsert_competitive,
 )
 from amz_scout.models import CompetitiveData
+
 
 @pytest.fixture
 def conn():
@@ -55,10 +46,7 @@ def conn():
 class TestSchema:
     def test_init_schema_creates_tables(self, conn):
         tables = {
-            row[0]
-            for row in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            )
+            row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
         }
         expected = {
             "schema_migrations",
@@ -142,17 +130,14 @@ class TestStoreKeepaProduct:
         store_keepa_product(conn, "B0F2MR53D6", "UK", raw_data, "2026-03-31")
 
         row = conn.execute(
-            "SELECT COUNT(*) AS cnt FROM keepa_coupon_history "
-            "WHERE asin = 'B0F2MR53D6'"
+            "SELECT COUNT(*) AS cnt FROM keepa_coupon_history WHERE asin = 'B0F2MR53D6'"
         ).fetchone()
         assert row["cnt"] > 0
 
     def test_store_deals(self, conn, raw_data):
         store_keepa_product(conn, "B0F2MR53D6", "UK", raw_data, "2026-03-31")
 
-        row = conn.execute(
-            "SELECT * FROM keepa_deals WHERE asin = 'B0F2MR53D6'"
-        ).fetchone()
+        row = conn.execute("SELECT * FROM keepa_deals WHERE asin = 'B0F2MR53D6'").fetchone()
         assert row is not None
         assert row["deal_type"] == "COUNTDOWN_ENDS_IN"
 
@@ -187,11 +172,20 @@ class TestStoreKeepaProduct:
 class TestUpsertCompetitive:
     def _make_row(self, **overrides) -> CompetitiveData:
         defaults = dict(
-            date="2026-03-31", site="UK", category="Travel Router",
-            brand="GL.iNet", model="GL-BE3600", asin="B0F2MR53D6",
-            title="Slate 7 Router", price="£117.29", rating="4.6 out of 5 stars",
-            review_count="(1,117)", bought_past_month="100+ bought in past month",
-            bsr="#2,719 in Routers", available="Yes", url="https://amazon.co.uk/dp/B0F2MR53D6",
+            date="2026-03-31",
+            site="UK",
+            category="Travel Router",
+            brand="GL.iNet",
+            model="GL-BE3600",
+            asin="B0F2MR53D6",
+            title="Slate 7 Router",
+            price="£117.29",
+            rating="4.6 out of 5 stars",
+            review_count="(1,117)",
+            bought_past_month="100+ bought in past month",
+            bsr="#2,719 in Routers",
+            available="Yes",
+            url="https://amazon.co.uk/dp/B0F2MR53D6",
         )
         defaults.update(overrides)
         return CompetitiveData(**defaults)
@@ -221,10 +215,18 @@ class TestUpsertCompetitive:
         assert row["price_cents"] == 12000
 
     def test_na_values_stored_as_null(self, conn):
-        upsert_competitive(conn, [self._make_row(
-            price="N/A", rating="N/A", review_count="N/A", bsr="N/A",
-            available="Not listed",
-        )])
+        upsert_competitive(
+            conn,
+            [
+                self._make_row(
+                    price="N/A",
+                    rating="N/A",
+                    review_count="N/A",
+                    bsr="N/A",
+                    available="Not listed",
+                )
+            ],
+        )
         row = conn.execute("SELECT * FROM competitive_snapshots").fetchone()
         assert row["price_cents"] is None
         assert row["rating"] is None
@@ -245,13 +247,27 @@ class TestQueries:
     def setup(self, conn, raw_data):
         self.conn = conn
         store_keepa_product(conn, "B0F2MR53D6", "UK", raw_data, "2026-03-31")
-        upsert_competitive(conn, [CompetitiveData(
-            date="2026-03-31", site="UK", category="Travel Router",
-            brand="GL.iNet", model="GL-BE3600", asin="B0F2MR53D6",
-            title="Slate 7", price="£117.29", rating="4.6 out of 5 stars",
-            review_count="(1,117)", bought_past_month="100+",
-            bsr="#2719 in Routers", available="Yes", url="",
-        )])
+        upsert_competitive(
+            conn,
+            [
+                CompetitiveData(
+                    date="2026-03-31",
+                    site="UK",
+                    category="Travel Router",
+                    brand="GL.iNet",
+                    model="GL-BE3600",
+                    asin="B0F2MR53D6",
+                    title="Slate 7",
+                    price="£117.29",
+                    rating="4.6 out of 5 stars",
+                    review_count="(1,117)",
+                    bought_past_month="100+",
+                    bsr="#2719 in Routers",
+                    available="Yes",
+                    url="",
+                )
+            ],
+        )
 
     def test_query_latest(self):
         rows = query_latest(self.conn)

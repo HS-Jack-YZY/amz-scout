@@ -43,17 +43,17 @@ class CompetitiveData:
     available: str
     url: str
     # Inventory fields
-    stock_status: str = ""        # "In stock", "Only 2 left in stock", "Currently unavailable"
-    stock_count: str = ""         # "2", "6", "" (empty = plenty or unavailable)
-    sold_by: str = ""             # Seller name
-    other_offers: str = ""        # "New & Used (26) from £81.78"
+    stock_status: str = ""  # "In stock", "Only 2 left in stock", "Currently unavailable"
+    stock_count: str = ""  # "2", "6", "" (empty = plenty or unavailable)
+    sold_by: str = ""  # Seller name
+    other_offers: str = ""  # "New & Used (26) from £81.78"
     # Listing quality fields
-    coupon: str = ""              # "Save 5% with coupon" or ""
-    is_prime: str = ""            # "True" / "False"
-    star_distribution: str = ""   # JSON: {"5_star": "70%", "4_star": "15%", ...}
-    image_count: str = ""         # "7"
-    qa_count: str = ""            # "24 answered questions"
-    fulfillment: str = ""         # "FBA" / "FBM" / ""
+    coupon: str = ""  # "Save 5% with coupon" or ""
+    is_prime: str = ""  # "True" / "False"
+    star_distribution: str = ""  # JSON: {"5_star": "70%", "4_star": "15%", ...}
+    image_count: str = ""  # "7"
+    qa_count: str = ""  # "24 answered questions"
+    fulfillment: str = ""  # "FBA" / "FBM" / ""
 
 
 @dataclass(frozen=True)
@@ -86,9 +86,9 @@ class PriceHistory:
     # Monthly sold (from Keepa monthlySoldHistory — much more precise than Amazon's "100+ bought")
     monthly_sold: int | None = None
     # Buy Box info
-    buybox_is_amazon: str = ""    # "True" / "False"
-    buybox_is_fba: str = ""       # "True" / "False"
-    buybox_seller_id: str = ""    # Keepa seller ID
+    buybox_is_amazon: str = ""  # "True" / "False"
+    buybox_is_fba: str = ""  # "True" / "False"
+    buybox_seller_id: str = ""  # Keepa seller ID
     # Seller count (from offers)
     seller_count: int | None = None
     fba_seller_count: int | None = None

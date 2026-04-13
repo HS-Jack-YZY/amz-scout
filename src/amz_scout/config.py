@@ -43,8 +43,7 @@ class MarketplaceConfig(BaseModel):
     def validate_keepa_domain_code(cls, v: int | None) -> int | None:
         if v is not None and v not in KEEPA_VALID_DOMAINS:
             raise ValueError(
-                f"Invalid keepa_domain_code: {v}. "
-                f"Valid codes: {sorted(KEEPA_VALID_DOMAINS.keys())}"
+                f"Invalid keepa_domain_code: {v}. Valid codes: {sorted(KEEPA_VALID_DOMAINS.keys())}"
             )
         return v
 
@@ -134,15 +133,11 @@ def validate_config(
         for mp, override in p.marketplace_overrides.items():
             asin = override.get("asin", "")
             if asin and (len(asin) != 10 or not asin.isalnum()):
-                errors.append(
-                    f"Product {p.model}: invalid ASIN '{asin}' for marketplace {mp}"
-                )
+                errors.append(f"Product {p.model}: invalid ASIN '{asin}' for marketplace {mp}")
     return errors
 
 
-def update_marketplace_override(
-    config_path: Path, model: str, marketplace: str, asin: str
-) -> None:
+def update_marketplace_override(config_path: Path, model: str, marketplace: str, asin: str) -> None:
     """Update a product's marketplace_overrides in the YAML config file.
 
     Uses atomic temp-file write to prevent data loss on crash.
@@ -160,9 +155,7 @@ def update_marketplace_override(
             break
 
     # Atomic write: write to temp file, then rename
-    tmp_fd, tmp_path = tempfile.mkstemp(
-        dir=config_path.parent, suffix=".yaml.tmp"
-    )
+    tmp_fd, tmp_path = tempfile.mkstemp(dir=config_path.parent, suffix=".yaml.tmp")
     try:
         with os.fdopen(tmp_fd, "w") as f:
             yaml.dump(raw, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
