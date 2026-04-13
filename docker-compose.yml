@@ -1,0 +1,46 @@
+# amz-scout webapp — Phase 6 production stack.
+# Two services: chainlit webapp + caddy TLS reverse proxy.
+# Only Caddy publishes 80/443 on the host. Webapp is intra-network only.
+
+services:
+  webapp:
+    build: .
+    image: amz-scout-web:latest
+    env_file:
+      - ./.env
+    volumes:
+      # Mount the entire output/ directory so SQLite WAL + SHM files land
+      # alongside amz_scout.db. Mounting the single .db file would corrupt WAL.
+      - ./output:/app/output
+      # Mount .env read-only so webapp/config.py can re-read it via dotenv.
+      - ./.env:/app/.env:ro
+    expose:
+      - "8000"  # intra-compose only; never published on the host
+    restart: unless-stopped
+    networks:
+      - app
+
+  caddy:
+    image: caddy:2-alpine
+    depends_on:
+      - webapp
+    environment:
+      - DOMAIN=${DOMAIN}
+      - DEPLOY_EMAIL=${DEPLOY_EMAIL}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data       # ACME certs + account keys (NEVER bind-mount)
+      - caddy_config:/config   # Caddy autosaved config
+    ports:
+      - "80:80"
+      - "443:443"
+    restart: unless-stopped
+    networks:
+      - app
+
+networks:
+  app: {}
+
+volumes:
+  caddy_data: {}
+  caddy_config: {}

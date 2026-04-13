@@ -280,6 +280,13 @@ pytest --cov=amz_scout        # With coverage
 ruff check src/ tests/        # Check
 ruff check --fix src/ tests/  # Auto-fix
 ruff format src/ tests/       # Format
+
+# ── Deployment (Phase 6, production) ──
+docker compose up -d --build          # Build + start webapp + Caddy edge
+docker compose logs -f webapp         # Tail webapp logs
+docker compose logs -f caddy          # Tail TLS / ACME logs
+scripts/smoke_deploy.sh "$DOMAIN"     # End-to-end deploy smoke test
+# Full runbook: deploy/README.md
 ```
 
 ### Architecture
