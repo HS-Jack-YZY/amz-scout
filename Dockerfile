@@ -17,7 +17,11 @@ RUN apt-get update \
 # Install browser-use directly via pip into the system Python so the
 # `browser-use` CLI is on PATH at /usr/local/bin/browser-use. This is what
 # src/amz_scout/browser.py invokes via subprocess.run(["browser-use", ...]).
-RUN pip install --no-cache-dir browser-use
+#
+# Also install `uv` alongside it: `browser-use install` (next layer) spawns
+# `uvx` internally as a subprocess to bootstrap its Chromium provisioner.
+# Without `uvx` on PATH, `browser-use install` fails with FileNotFoundError.
+RUN pip install --no-cache-dir uv browser-use
 
 # Install Chromium + all OS deps using browser-use's own installer. browser-use
 # 0.12+ replaced its playwright dependency with a native CDP client (cdp-use),
