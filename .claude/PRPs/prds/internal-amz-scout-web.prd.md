@@ -250,7 +250,7 @@ The other 4 colleagues (PMs + market analysts). Their specific use cases are for
 | # | Phase | Description | Status | Parallel | Depends | PRP Plan |
 |---|---|---|---|---|---|---|
 | 1 | **Scaffolding** | `webapp/` module, Chainlit hello-world, password auth callback with `@gl-inet.com` whitelist, 1 tool (`query_latest`) wired end-to-end, local dev run verified | in-progress | - | - | [phase1-webapp-scaffolding.plan.md](../plans/phase1-webapp-scaffolding.plan.md) |
-| 2 | **Query tools** | Wrap 9 read-only query functions as Chainlit tools with bilingual docstrings + `amz_scout.api` marketplace aliasing support | pending | with 3 | 1 | - |
+| 2 | **Query tools** | Wrap 9 read-only query functions as Chainlit tools with bilingual docstrings + `amz_scout.api` marketplace aliasing support | complete | with 3 | 1 | [phase2-query-tools.plan.md](../plans/completed/phase2-query-tools.plan.md) |
 | 3 | **Management tools** | Wrap 6 product registry functions (`list_products`, `add_product`, `remove_product_by_model`, `update_product_asin`, `register_market_asins`, `import_yaml`); honor `phase="needs_confirmation"` protocol in UI | pending | with 2 | 1 | - |
 | 4 | **High-risk tools + long task UX** | Wrap `ensure_keepa_data`, `validate_and_discover`, `batch_discover`, `discover_asin`, `validate_asins`, `sync_registry` with `cl.Step` progress + explicit confirmation dialogs for token-consuming / long-running operations | pending | - | 2, 3 | - |
 | 5 | **Excel export layer** | `webapp/export.py`: pandas-based XLSX builder (multi-sheet where appropriate), attached via `cl.File` to every query tool reply. **Requires Q3 answer from 小李.** | pending | with 4 | 2 | - |
