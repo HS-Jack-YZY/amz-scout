@@ -757,31 +757,50 @@ class TestResolveContext:
         assert "UK" in ctx.marketplaces
 
 
+@pytest.fixture
+def db_in_cwd(tmp_path, monkeypatch):
+    """Redirect the default DB path (``output/amz_scout.db``, relative to cwd)
+    to a fresh temp DB seeded with a Slate 7 product.
+
+    ``_resolve_context(None)`` resolves the DB via cwd, so this isolates the
+    project=None query tests from the real production DB.
+    """
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "output").mkdir()
+    db_path = tmp_path / "output" / "amz_scout.db"
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.row_factory = sqlite3.Row
+        init_schema(conn)
+        pid, _ = register_product(conn, "Router", "GL.iNet", "GL-Slate 7 (GL-BE3600)")
+        register_asin(conn, pid, "UK", "B0F2MR53D6")
+    return db_path
+
+
 class TestQueryWithoutProject:
     """Test that query functions work with project=None (DB-backed)."""
 
-    def test_query_latest_without_project(self):
+    def test_query_latest_without_project(self, db_in_cwd):
         r = query_latest()
         assert r["ok"] is True
 
-    def test_query_trends_without_project(self):
+    def test_query_trends_without_project(self, db_in_cwd):
         """query_trends with project=None should work if product is in DB."""
         r = query_trends(product="Slate 7", marketplace="UK", auto_fetch=False)
         assert r["ok"] is True
 
-    def test_query_compare_without_project(self):
+    def test_query_compare_without_project(self, db_in_cwd):
         r = query_compare(product="Slate 7")
         assert r["ok"] is True
 
-    def test_query_ranking_without_project(self):
+    def test_query_ranking_without_project(self, db_in_cwd):
         r = query_ranking(marketplace="UK")
         assert r["ok"] is True
 
-    def test_query_availability_without_project(self):
+    def test_query_availability_without_project(self, db_in_cwd):
         r = query_availability()
         assert r["ok"] is True
 
-    def test_query_deals_without_project(self):
+    def test_query_deals_without_project(self, db_in_cwd):
         r = query_deals(marketplace="UK", auto_fetch=False)
         assert r["ok"] is True
 
