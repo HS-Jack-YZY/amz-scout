@@ -14,18 +14,17 @@ RUN apt-get update \
         git \
     && rm -rf /var/lib/apt/lists/*
 
-# Install browser-use directly via pip into the system Python. This pulls
-# `playwright` as a transitive dependency, putting BOTH `browser-use` and
-# `playwright` on PATH via the system Python's bin/ dir. We deliberately do
-# NOT use `uv tool install browser-use` here: that would isolate browser-use
-# into its own venv and only expose `browser-use` (not `playwright`) on PATH,
-# making the next layer's `playwright install` fail with exit 127.
+# Install browser-use directly via pip into the system Python so the
+# `browser-use` CLI is on PATH at /usr/local/bin/browser-use. This is what
+# src/amz_scout/browser.py invokes via subprocess.run(["browser-use", ...]).
 RUN pip install --no-cache-dir browser-use
 
-# Install Chromium that matches the playwright version pip just pulled in
-# alongside browser-use. Because both come from the same install, the
-# revision matches at runtime — no cryptic launch failures.
-RUN playwright install chromium --with-deps
+# Install Chromium + all OS deps using browser-use's own installer. browser-use
+# 0.12+ replaced its playwright dependency with a native CDP client (cdp-use),
+# so `playwright install` no longer applies — the modern equivalent is
+# `browser-use install`, which provisions a matching Chromium and all the
+# shared libs Chromium needs to launch headless on a slim Debian base.
+RUN browser-use install
 
 # ── Layer group B: Python dependencies + source ────────────────────────
 # Medium speed (~1 min). Triggered by pyproject.toml or source changes.
