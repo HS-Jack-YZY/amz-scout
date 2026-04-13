@@ -55,10 +55,19 @@ class TestMarketplaceConfig:
     def test_all_sites(self):
         mp = load_marketplace_config(CONFIG_DIR / "marketplaces.yaml")
         assert set(mp.keys()) == {
-            "UK", "DE", "FR", "IT", "ES", "NL",
-            "US", "CA", "MX",
-            "IN", "BR",
-            "JP", "AU",
+            "UK",
+            "DE",
+            "FR",
+            "IT",
+            "ES",
+            "NL",
+            "US",
+            "CA",
+            "MX",
+            "IN",
+            "BR",
+            "JP",
+            "AU",
         }
 
 

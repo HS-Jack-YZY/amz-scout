@@ -47,3 +47,12 @@ line-length = 100
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W"]
+
+[tool.ruff.lint.per-file-ignores]
+# These files contain long embedded JavaScript string literals passed to
+# `browser.evaluate()`. Splitting the JS to fit the 100-char line limit would
+# either break the injected syntax (JS is not whitespace-insensitive inside
+# template literals, regex, or string literals) or hurt readability for zero
+# gain. All other lint rules still apply to these files.
+"src/amz_scout/scraper/amazon.py" = ["E501"]
+"src/amz_scout/cli.py" = ["E501"]

@@ -80,8 +80,12 @@ def evaluate_freshness(
                 age_days = (ref_date - fetched_date).days
 
             action, reason = _decide(
-                strategy, fetched_at, age_days, max_age_days,
-                requested_mode, cached_mode,
+                strategy,
+                fetched_at,
+                age_days,
+                max_age_days,
+                requested_mode,
+                cached_mode,
             )
             results.append(
                 ProductFreshness(

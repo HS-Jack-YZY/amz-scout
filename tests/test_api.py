@@ -1,8 +1,6 @@
 """Tests for amz_scout.api — programmatic API layer."""
 
-import json
 import sqlite3
-from pathlib import Path
 
 import pytest
 import yaml
@@ -16,6 +14,7 @@ from amz_scout.api import (
     _resolve_site,
     add_product,
     check_freshness,
+    discover_asin,
     ensure_keepa_data,
     import_yaml,
     keepa_budget,
@@ -32,7 +31,6 @@ from amz_scout.api import (
     resolve_project,
     update_product_asin,
     validate_asins,
-    discover_asin,
 )
 from amz_scout.db import (
     init_schema,
@@ -141,22 +139,43 @@ def seeded_config(config_dir):
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
 
-    upsert_competitive(conn, [
-        CompetitiveData(
-            date="2026-04-01", site="UK", category="Router",
-            brand="GL.iNet", model="GL-Slate 7 (GL-BE3600)",
-            asin="B0F2MR53D6", title="Slate 7", price="£150.99",
-            rating="4.5", review_count="120", bought_past_month="100+",
-            bsr="2591", available="Yes", url="https://amazon.co.uk/dp/B0F2MR53D6",
-        ),
-        CompetitiveData(
-            date="2026-04-01", site="UK", category="Router",
-            brand="ASUS", model="RT-BE58",
-            asin="B0FGDRP3VZ", title="RT-BE58", price="£99.97",
-            rating="4.3", review_count="45", bought_past_month="50+",
-            bsr="4952", available="Yes", url="https://amazon.co.uk/dp/B0FGDRP3VZ",
-        ),
-    ])
+    upsert_competitive(
+        conn,
+        [
+            CompetitiveData(
+                date="2026-04-01",
+                site="UK",
+                category="Router",
+                brand="GL.iNet",
+                model="GL-Slate 7 (GL-BE3600)",
+                asin="B0F2MR53D6",
+                title="Slate 7",
+                price="£150.99",
+                rating="4.5",
+                review_count="120",
+                bought_past_month="100+",
+                bsr="2591",
+                available="Yes",
+                url="https://amazon.co.uk/dp/B0F2MR53D6",
+            ),
+            CompetitiveData(
+                date="2026-04-01",
+                site="UK",
+                category="Router",
+                brand="ASUS",
+                model="RT-BE58",
+                asin="B0FGDRP3VZ",
+                title="RT-BE58",
+                price="£99.97",
+                rating="4.3",
+                review_count="45",
+                bought_past_month="50+",
+                bsr="4952",
+                available="Yes",
+                url="https://amazon.co.uk/dp/B0FGDRP3VZ",
+            ),
+        ],
+    )
     conn.close()
 
     return tmp_path, proj_path
@@ -200,11 +219,14 @@ class TestLoadProject:
 class TestResolveAsin:
     def _products(self):
         return [
-            Product(category="Router", brand="GL.iNet",
-                    model="GL-Slate 7 (GL-BE3600)", default_asin="B0F2MR53D6",
-                    marketplace_overrides={"UK": {"asin": "B0UKSPECIF"}}),
-            Product(category="Router", brand="ASUS",
-                    model="RT-BE58", default_asin="B0FGDRP3VZ"),
+            Product(
+                category="Router",
+                brand="GL.iNet",
+                model="GL-Slate 7 (GL-BE3600)",
+                default_asin="B0F2MR53D6",
+                marketplace_overrides={"UK": {"asin": "B0UKSPECIF"}},
+            ),
+            Product(category="Router", brand="ASUS", model="RT-BE58", default_asin="B0FGDRP3VZ"),
         ]
 
     def test_model_substring_match(self):
@@ -561,7 +583,9 @@ class TestAddProduct:
 
     def test_add_with_asins(self, test_db):
         r = add_product(
-            "Router", "TestBrand", "WithASINs",
+            "Router",
+            "TestBrand",
+            "WithASINs",
             asins={"UK": "B0TESTUK01", "DE": "B0TESTDE01"},
             db_path=test_db,
         )
@@ -653,8 +677,12 @@ class TestUpdateProductAsin:
     def test_update_with_status(self, test_db):
         add_product("Router", "StatusTest", "Model3", db_path=test_db)
         r = update_product_asin(
-            "StatusTest", "Model3", "UK", "B0STATUS01",
-            status="verified", notes="confirmed on amazon.co.uk",
+            "StatusTest",
+            "Model3",
+            "UK",
+            "B0STATUS01",
+            status="verified",
+            notes="confirmed on amazon.co.uk",
             db_path=test_db,
         )
         assert r["ok"] is True
@@ -721,10 +749,14 @@ class TestResolveAsinDualMode:
 
     def test_config_fallback_when_not_in_db(self):
         """Falls back to config products when DB has no match."""
-        products = [Product(
-            category="Router", brand="FallbackBrand", model="FallbackModel",
-            default_asin="B0FALLBACK",
-        )]
+        products = [
+            Product(
+                category="Router",
+                brand="FallbackBrand",
+                model="FallbackModel",
+                default_asin="B0FALLBACK",
+            )
+        ]
         asin, _, brand, source, _ = _resolve_asin(products, "FallbackModel")
         assert asin == "B0FALLBACK"
         assert brand == "FallbackBrand"
@@ -825,8 +857,13 @@ class TestValidateAsins:
             pid, _ = register_product(conn, "Router", "GL.iNet", "Slate 7 Test")
             register_asin(conn, pid, "UK", "B0VERIFYME")
             # Simulate Keepa data with matching title
-            store_keepa_product(conn, "B0VERIFYME", "UK",
-                                {"title": "GL.iNet Slate 7 WiFi Travel Router"}, "2026-04-01")
+            store_keepa_product(
+                conn,
+                "B0VERIFYME",
+                "UK",
+                {"title": "GL.iNet Slate 7 WiFi Travel Router"},
+                "2026-04-01",
+            )
 
         r = validate_asins(marketplace="UK", db_path=test_db)
         verified = [x for x in r["data"] if x["asin"] == "B0VERIFYME"]
@@ -840,8 +877,9 @@ class TestValidateAsins:
             init_schema(conn)
             pid, _ = register_product(conn, "Router", "GL.iNet", "Slate 7 Mismatch")
             register_asin(conn, pid, "UK", "B0WRONGPRD")
-            store_keepa_product(conn, "B0WRONGPRD", "UK",
-                                {"title": "USB-C Hub Adapter Multiport"}, "2026-04-01")
+            store_keepa_product(
+                conn, "B0WRONGPRD", "UK", {"title": "USB-C Hub Adapter Multiport"}, "2026-04-01"
+            )
 
         r = validate_asins(marketplace="UK", db_path=test_db)
         wrong = [x for x in r["data"] if x["asin"] == "B0WRONGPRD"]
@@ -855,8 +893,7 @@ class TestValidateAsins:
             init_schema(conn)
             pid, _ = register_product(conn, "Router", "GL.iNet", "NotListed Test")
             register_asin(conn, pid, "UK", "B0NOTLISTD")
-            store_keepa_product(conn, "B0NOTLISTD", "UK",
-                                {"title": None}, "2026-04-01")
+            store_keepa_product(conn, "B0NOTLISTD", "UK", {"title": None}, "2026-04-01")
 
         r = validate_asins(marketplace="UK", db_path=test_db)
         not_listed = [x for x in r["data"] if x["asin"] == "B0NOTLISTD"]
@@ -872,6 +909,7 @@ class TestValidateAsins:
 class TestDiscoverAsin:
     def test_unknown_marketplace_returns_error(self):
         from amz_scout.api import discover_asin
+
         r = discover_asin("GL.iNet", "TestModel", "XX_INVALID")
         assert r["ok"] is False
         assert "unknown" in r["error"].lower() or "not found" in r["error"].lower()

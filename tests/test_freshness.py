@@ -225,8 +225,12 @@ class TestFetchModeUpgrade:
         sites = ["UK"]
         fetched = {("B0FGDRP3VZ", "UK"): ("2026-04-01", "basic")}
         results = evaluate_freshness(
-            products, sites, fetched, FreshnessStrategy.LAZY,
-            today="2026-04-01", requested_mode="detailed",
+            products,
+            sites,
+            fetched,
+            FreshnessStrategy.LAZY,
+            today="2026-04-01",
+            requested_mode="detailed",
         )
         assert results[0].action == "fetch"
         assert "basic" in results[0].reason and "detailed" in results[0].reason
@@ -236,8 +240,12 @@ class TestFetchModeUpgrade:
         sites = ["UK"]
         fetched = {("B0FGDRP3VZ", "UK"): ("2026-04-01", "detailed")}
         results = evaluate_freshness(
-            products, sites, fetched, FreshnessStrategy.LAZY,
-            today="2026-04-01", requested_mode="detailed",
+            products,
+            sites,
+            fetched,
+            FreshnessStrategy.LAZY,
+            today="2026-04-01",
+            requested_mode="detailed",
         )
         assert results[0].action == "use_cache"
 
@@ -246,8 +254,12 @@ class TestFetchModeUpgrade:
         sites = ["UK"]
         fetched = {("B0FGDRP3VZ", "UK"): ("2026-04-01", "basic")}
         results = evaluate_freshness(
-            products, sites, fetched, FreshnessStrategy.LAZY,
-            today="2026-04-01", requested_mode="basic",
+            products,
+            sites,
+            fetched,
+            FreshnessStrategy.LAZY,
+            today="2026-04-01",
+            requested_mode="basic",
         )
         assert results[0].action == "use_cache"
 
@@ -256,7 +268,11 @@ class TestFetchModeUpgrade:
         sites = ["UK"]
         fetched = {("B0FGDRP3VZ", "UK"): ("2026-04-01", "detailed")}
         results = evaluate_freshness(
-            products, sites, fetched, FreshnessStrategy.LAZY,
-            today="2026-04-01", requested_mode="basic",
+            products,
+            sites,
+            fetched,
+            FreshnessStrategy.LAZY,
+            today="2026-04-01",
+            requested_mode="basic",
         )
         assert results[0].action == "use_cache"

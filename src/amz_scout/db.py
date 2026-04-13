@@ -180,10 +180,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
         with conn:
             if current < 2:
                 # v2: add project column to competitive_snapshots
-                cols = [
-                    r["name"]
-                    for r in conn.execute("PRAGMA table_info(competitive_snapshots)")
-                ]
+                cols = [r["name"] for r in conn.execute("PRAGMA table_info(competitive_snapshots)")]
                 if "project" not in cols:
                     conn.execute(
                         "ALTER TABLE competitive_snapshots "
@@ -238,9 +235,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
                             PRIMARY KEY (product_id, marketplace)
                         )
                     """)
-                    conn.execute(
-                        "CREATE INDEX idx_pa_asin ON product_asins(asin)"
-                    )
+                    conn.execute("CREATE INDEX idx_pa_asin ON product_asins(asin)")
                     conn.execute("""
                         CREATE TABLE product_tags (
                             product_id  INTEGER NOT NULL
@@ -249,9 +244,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
                             PRIMARY KEY (product_id, tag)
                         ) WITHOUT ROWID
                     """)
-                    conn.execute(
-                        "CREATE INDEX idx_pt_tag ON product_tags(tag)"
-                    )
+                    conn.execute("CREATE INDEX idx_pt_tag ON product_tags(tag)")
                 conn.execute(
                     "INSERT OR IGNORE INTO schema_migrations (version, description) "
                     "VALUES (3, 'add product registry tables')"
@@ -260,10 +253,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
 
             if current < 4:
                 # v4: add fetch_mode to keepa_products
-                cols = [
-                    r["name"]
-                    for r in conn.execute("PRAGMA table_info(keepa_products)")
-                ]
+                cols = [r["name"] for r in conn.execute("PRAGMA table_info(keepa_products)")]
                 if "fetch_mode" not in cols:
                     conn.execute(
                         "ALTER TABLE keepa_products "
@@ -276,8 +266,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
                 logger.info("Migrated schema to version 4")
     except Exception:
         logger.exception(
-            "Schema migration failed at version %d. "
-            "Database may need manual repair.",
+            "Schema migration failed at version %d. Database may need manual repair.",
             current,
         )
         raise
@@ -290,7 +279,8 @@ CREATE TABLE schema_migrations (
     applied_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
 );
 INSERT INTO schema_migrations (version, description) VALUES (1, 'initial schema');
-INSERT INTO schema_migrations (version, description) VALUES (2, 'add project column to competitive_snapshots');
+INSERT INTO schema_migrations (version, description)
+    VALUES (2, 'add project column to competitive_snapshots');
 INSERT INTO schema_migrations (version, description) VALUES (3, 'add product registry tables');
 INSERT INTO schema_migrations (version, description) VALUES (4, 'add fetch_mode to keepa_products');
 
@@ -448,7 +438,9 @@ CREATE TABLE product_asins (
     marketplace     TEXT NOT NULL,
     asin            TEXT NOT NULL,
     status          TEXT NOT NULL DEFAULT 'unverified'
-                    CHECK(status IN ('unverified','verified','wrong_product','not_listed','unavailable')),
+                    CHECK(status IN (
+                        'unverified','verified','wrong_product','not_listed','unavailable'
+                    )),
     notes           TEXT NOT NULL DEFAULT '',
     last_checked    TEXT,
     created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),

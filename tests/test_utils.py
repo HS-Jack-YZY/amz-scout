@@ -1,7 +1,5 @@
 """Tests for utility functions."""
 
-import pytest
-
 from amz_scout.utils import (
     cents_to_price,
     parse_bsr_routers,
@@ -75,9 +73,9 @@ class TestParseReviews:
 
 class TestParseBsrRouters:
     def test_standard(self):
-        assert parse_bsr_routers(
-            "6,546 in Computers & Accessories (See Top 100)  51 in Routers"
-        ) == 51
+        assert (
+            parse_bsr_routers("6,546 in Computers & Accessories (See Top 100)  51 in Routers") == 51
+        )
 
     def test_network_routers(self):
         assert parse_bsr_routers("#125 in Network Routers") == 125
@@ -86,9 +84,7 @@ class TestParseBsrRouters:
         assert parse_bsr_routers("#14,209 in Electronics  #125 in Network Routers") == 125
 
     def test_truncated(self):
-        assert parse_bsr_routers(
-            "10,947 in Computer & Accessories (See Top 100)  85 i"
-        ) == 85
+        assert parse_bsr_routers("10,947 in Computer & Accessories (See Top 100)  85 i") == 85
 
     def test_na(self):
         assert parse_bsr_routers("N/A") is None

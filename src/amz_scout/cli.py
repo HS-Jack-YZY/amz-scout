@@ -67,19 +67,27 @@ def _setup_logging(verbose: bool = False) -> None:
 
 def _resolve_target_sites(info, products: list[Product], marketplace: str | None) -> list[str]:
     """Compute target marketplaces from CLI flag, YAML config, or DB product overrides."""
-    return [marketplace] if marketplace else (
-        info.config.target_marketplaces if info.config
-        else list({s for p in products for s in p.marketplace_overrides})
+    return (
+        [marketplace]
+        if marketplace
+        else (
+            info.config.target_marketplaces
+            if info.config
+            else list({s for p in products for s in p.marketplace_overrides})
+        )
     )
 
 
 @app.command()
 def scrape(
     config: str | None = typer.Option(
-        None, "--config", help="Project YAML config (optional, uses DB if omitted)"),
+        None, "--config", help="Project YAML config (optional, uses DB if omitted)"
+    ),
     marketplace: str | None = typer.Option(None, "-m", "--marketplace", help="Single marketplace"),
     product: str | None = typer.Option(None, "-p", "--product", help="Single product model"),
-    exclude: str | None = typer.Option(None, "-x", "--exclude", help="Exclude product (substring match)"),
+    exclude: str | None = typer.Option(
+        None, "-x", "--exclude", help="Exclude product (substring match)"
+    ),
     category: str | None = typer.Option(None, "-c", "--category", help="Filter by category"),
     data_only: bool = typer.Option(False, help="Skip Keepa price history"),
     history_only: bool = typer.Option(False, help="Only fetch Keepa price history"),
@@ -123,22 +131,34 @@ def scrape(
         # ── Price history (Keepa) ──
         if not data_only:
             _scrape_price_history(
-                products, target_sites, marketplaces, output_base,
-                detailed=detailed, db_conn=db_conn,
+                products,
+                target_sites,
+                marketplaces,
+                output_base,
+                detailed=detailed,
+                db_conn=db_conn,
             )
 
         # ── Amazon product pages (browser needed) ──
         if not history_only:
             if not check_browser_use_installed():
-                console.print("[red]browser-use CLI not found.[/] Install: uv tool install browser-use")
+                console.print(
+                    "[red]browser-use CLI not found.[/] Install: uv tool install browser-use"
+                )
                 raise typer.Exit(1)
 
             project_name = info.config.project.name if info.config else ""
             _scrape_amazon(
-                products, target_sites, marketplaces,
-                output_base, headed, db_conn=db_conn,
+                products,
+                target_sites,
+                marketplaces,
+                output_base,
+                headed,
+                db_conn=db_conn,
                 project_name=project_name,
-                retry_count=retry, page_load_wait=wait, inter_product_delay=delay,
+                retry_count=retry,
+                page_load_wait=wait,
+                inter_product_delay=delay,
             )
 
     console.print("\n[green bold]Done![/]")
@@ -181,7 +201,9 @@ def _scrape_price_history(
 
         raw_dir = output_base / "data" / mp_config.region / "raw"
         histories = keepa.fetch_price_history(
-            products, site, mp_config.keepa_domain,
+            products,
+            site,
+            mp_config.keepa_domain,
             keepa_domain_code=mp_config.keepa_domain_code,
             detailed=detailed,
             raw_dir=raw_dir,
@@ -205,7 +227,7 @@ def _scrape_price_history(
         tokens_used = total_products * tok_per
         console.print(f"  Keepa: ~{tokens_used} tokens used, {remaining} remaining")
         if remaining < total_products * tok_per:
-            refill_mins = (total_products * tok_per - remaining)
+            refill_mins = total_products * tok_per - remaining
             console.print(f"  [dim]Next full run needs ~{refill_mins} min refill[/]")
 
 
@@ -240,21 +262,37 @@ def _scrape_amazon(
                 # Check for warning notes
                 note = prod.note_for(site)
                 if note and "not listed" in note.lower():
-                    console.print(f"  [{i}/{len(products)}] {prod.brand} {prod.model}: [dim]skipped ({note})[/]")
-                    results.append(CompetitiveData(
-                        date=today_iso(), site=site, category=prod.category,
-                        brand=prod.brand, model=prod.model, asin=prod.asin_for(site),
-                        title="", price="N/A", rating="N/A", review_count="N/A",
-                        bought_past_month="N/A", bsr="N/A", available="Not listed",
-                        url="",
-                    ))
+                    console.print(
+                        f"  [{i}/{len(products)}] {prod.brand} {prod.model}: [dim]skipped ({note})[/]"
+                    )
+                    results.append(
+                        CompetitiveData(
+                            date=today_iso(),
+                            site=site,
+                            category=prod.category,
+                            brand=prod.brand,
+                            model=prod.model,
+                            asin=prod.asin_for(site),
+                            title="",
+                            price="N/A",
+                            rating="N/A",
+                            review_count="N/A",
+                            bought_past_month="N/A",
+                            bsr="N/A",
+                            available="Not listed",
+                            url="",
+                        )
+                    )
                     continue
 
                 # Scrape with retry
                 data = None
                 for attempt in range(retry_count):
                     data = scrape_product_page(
-                        browser, prod, site, mp_config,
+                        browser,
+                        prod,
+                        site,
+                        mp_config,
                         page_load_wait=page_load_wait,
                     )
                     if data is not None:
@@ -264,32 +302,57 @@ def _scrape_amazon(
 
                 if data is None:
                     # Try search fallback
-                    console.print(f"  [{i}/{len(products)}] {prod.brand} {prod.model}: [yellow]ASIN not found, searching...[/]")
+                    console.print(
+                        f"  [{i}/{len(products)}] {prod.brand} {prod.model}: [yellow]ASIN not found, searching...[/]"
+                    )
                     found_asin = resolve_asin_via_search(
-                        browser, prod, site, mp_config, config_path=None,
+                        browser,
+                        prod,
+                        site,
+                        mp_config,
+                        config_path=None,
                     )
                     if found_asin:
                         _save_discovered_asin(db_conn, prod, site, found_asin)
                         # Retry with found ASIN
                         updated = Product(
-                            category=prod.category, brand=prod.brand, model=prod.model,
-                            default_asin=found_asin, search_keywords=prod.search_keywords,
+                            category=prod.category,
+                            brand=prod.brand,
+                            model=prod.model,
+                            default_asin=found_asin,
+                            search_keywords=prod.search_keywords,
                             marketplace_overrides=prod.marketplace_overrides,
                         )
                         data = scrape_product_page(
-                            browser, updated, site, mp_config,
+                            browser,
+                            updated,
+                            site,
+                            mp_config,
                             page_load_wait=page_load_wait,
                         )
 
                 if data is None:
-                    console.print(f"  [{i}/{len(products)}] {prod.brand} {prod.model}: [red]Not found[/]")
-                    results.append(CompetitiveData(
-                        date=today_iso(), site=site, category=prod.category,
-                        brand=prod.brand, model=prod.model, asin=prod.asin_for(site),
-                        title="", price="N/A", rating="N/A", review_count="N/A",
-                        bought_past_month="N/A", bsr="N/A", available="Not listed",
-                        url="",
-                    ))
+                    console.print(
+                        f"  [{i}/{len(products)}] {prod.brand} {prod.model}: [red]Not found[/]"
+                    )
+                    results.append(
+                        CompetitiveData(
+                            date=today_iso(),
+                            site=site,
+                            category=prod.category,
+                            brand=prod.brand,
+                            model=prod.model,
+                            asin=prod.asin_for(site),
+                            title="",
+                            price="N/A",
+                            rating="N/A",
+                            review_count="N/A",
+                            bought_past_month="N/A",
+                            bsr="N/A",
+                            available="Not listed",
+                            url="",
+                        )
+                    )
                 else:
                     console.print(
                         f"  [{i}/{len(products)}] {data.brand} {data.model}: "
@@ -302,10 +365,16 @@ def _scrape_amazon(
 
             # Final write
             _save_competitive(
-                results, output_base, mp_config, site,
-                db_conn=db_conn, project=project_name,
+                results,
+                output_base,
+                mp_config,
+                site,
+                db_conn=db_conn,
+                project=project_name,
             )
-            has_price = sum(1 for r in results if r.price not in ("N/A", "", "Currently unavailable"))
+            has_price = sum(
+                1 for r in results if r.price not in ("N/A", "", "Currently unavailable")
+            )
             console.print(f"  [green]{site}: {has_price}/{len(results)} with price[/]")
 
             # Data validation
@@ -315,10 +384,16 @@ def _scrape_amazon(
             # Save whatever we have so far on unexpected crash
             if results:
                 _save_competitive(
-                    results, output_base, mp_config, site,
-                    db_conn=db_conn, project=project_name,
+                    results,
+                    output_base,
+                    mp_config,
+                    site,
+                    db_conn=db_conn,
+                    project=project_name,
                 )
-                console.print(f"  [yellow]{site}: saved {len(results)} partial results before error[/]")
+                console.print(
+                    f"  [yellow]{site}: saved {len(results)} partial results before error[/]"
+                )
             console.print(f"  [red]{site}: {e}[/]")
 
         finally:
@@ -330,14 +405,24 @@ def _save_discovered_asin(db_conn, product: Product, site: str, asin: str) -> bo
     try:
         row = find_product_exact(db_conn, product.brand, product.model)
         if row:
-            register_asin(db_conn, row["id"], site, asin, status="unverified",
-                          notes="discovered via browser search")
+            register_asin(
+                db_conn,
+                row["id"],
+                site,
+                asin,
+                status="unverified",
+                notes="discovered via browser search",
+            )
             return True
         return False
     except Exception:
         logging.getLogger(__name__).warning(
             "Failed to save discovered ASIN %s for %s %s on %s",
-            asin, product.brand, product.model, site, exc_info=True,
+            asin,
+            product.brand,
+            product.model,
+            site,
+            exc_info=True,
         )
         return False
 
@@ -363,7 +448,8 @@ def _save_competitive(
 @app.command()
 def discover(
     config: str | None = typer.Option(
-        None, "--config", help="Project YAML config (optional, uses DB if omitted)"),
+        None, "--config", help="Project YAML config (optional, uses DB if omitted)"
+    ),
     marketplace: str | None = typer.Option(None, "-m", "--marketplace"),
     product: str | None = typer.Option(None, "-p", "--product", help="Single product model"),
     headed: bool = typer.Option(False),
@@ -388,7 +474,9 @@ def discover(
         console.print("[red]browser-use CLI not found.[/]")
         raise typer.Exit(1)
 
-    console.print(f"[bold]ASIN Discovery: {len(products)} products × {len(target_sites)} markets[/]")
+    console.print(
+        f"[bold]ASIN Discovery: {len(products)} products × {len(target_sites)} markets[/]"
+    )
 
     for site in target_sites:
         mp_config = marketplaces.get(site)
@@ -434,14 +522,22 @@ def discover(
                             reason = result.get("reason", "unknown")
                             console.print(f"  {prod.model}: [yellow]{reason}[/] — searching...")
                             found = resolve_asin_via_search(
-                                browser, prod, site, mp_config, config_path=None,
+                                browser,
+                                prod,
+                                site,
+                                mp_config,
+                                config_path=None,
                             )
                             if found:
                                 saved = _save_discovered_asin(db_conn, prod, site, found)
                                 if saved:
-                                    console.print(f"  {prod.model}: [green]Found[/] {found} (saved to DB)")
+                                    console.print(
+                                        f"  {prod.model}: [green]Found[/] {found} (saved to DB)"
+                                    )
                                 else:
-                                    console.print(f"  {prod.model}: [yellow]Found[/] {found} (DB save failed)")
+                                    console.print(
+                                        f"  {prod.model}: [yellow]Found[/] {found} (DB save failed)"
+                                    )
                                 found_count += 1
                             else:
                                 console.print(f"  {prod.model}: [red]Not found[/]")
@@ -502,7 +598,8 @@ def _render_db_stats(stats: dict, title: str = "Database", show_meta: bool = Tru
 @app.command()
 def status(
     config: str | None = typer.Option(
-        None, "--config", help="Project YAML config (optional, uses DB if omitted)"),
+        None, "--config", help="Project YAML config (optional, uses DB if omitted)"
+    ),
     marketplace: str | None = typer.Option(None, "-m", "--marketplace"),
 ) -> None:
     """Check data completeness: CSV files, database, and Keepa freshness."""
@@ -548,11 +645,14 @@ def status(
             format_freshness_matrix,
             query_freshness,
         )
+
         with open_db(info.db_path) as conn:
             stats = query_stats(conn)
             fetched_map = query_freshness(conn, products, target_sites)
             fresh_results = evaluate_freshness(
-                products, target_sites, fetched_map,
+                products,
+                target_sites,
+                fetched_map,
                 FreshnessStrategy.MAX_AGE,
             )
             fresh_rows = format_freshness_matrix(fresh_results, target_sites)
@@ -607,7 +707,9 @@ def _store_raw_to_db(db_conn, raw_dir: Path, products: list[Product], site: str)
 
 
 def _store_competitive_to_db(
-    db_conn, results: list[CompetitiveData], project: str = "",
+    db_conn,
+    results: list[CompetitiveData],
+    project: str = "",
 ) -> None:
     """Write browser snapshots to DB. Failures are logged and shown to user."""
     try:
@@ -730,6 +832,7 @@ def migrate(
                 console.print(f"  [cyan]{site}[/] Competitive: [green]{count} rows[/]")
 
         from amz_scout.db import query_stats
+
         stats = query_stats(db_conn)
 
     console.print("\n[green bold]Migration complete![/]")
@@ -781,6 +884,7 @@ def _render_output(rows: list[dict], fmt: str, columns: list[str] | None = None)
     if fmt == "csv":
         import csv
         import io
+
         cols = columns or list(rows[0].keys())
         buf = io.StringIO()
         writer = csv.writer(buf)
@@ -804,14 +908,26 @@ def _render_output(rows: list[dict], fmt: str, columns: list[str] | None = None)
 def query_latest_cmd(
     marketplace: str | None = typer.Option(None, "-m", "--marketplace"),
     category: str | None = typer.Option(None, "-c", "--category"),
-    config: str | None = typer.Option(None, "--config", help="Project YAML config (optional, uses DB if omitted)"),
+    config: str | None = typer.Option(
+        None, "--config", help="Project YAML config (optional, uses DB if omitted)"
+    ),
     fmt: str = typer.Option("table", "--format", help="Output format: table|csv|json"),
 ) -> None:
     """Show latest competitive data per product."""
     result = query_latest(config, marketplace=marketplace, category=category)
     _check_result(result)
-    cols = ["site", "brand", "model", "price_cents", "currency", "rating",
-            "review_count", "bsr", "available", "fulfillment"]
+    cols = [
+        "site",
+        "brand",
+        "model",
+        "price_cents",
+        "currency",
+        "rating",
+        "review_count",
+        "bsr",
+        "available",
+        "fulfillment",
+    ]
     _render_output(result["data"], fmt, cols)
 
 
@@ -821,7 +937,8 @@ def query_trends_cmd(
     marketplace: str = typer.Option("UK", "-m", "--marketplace"),
     days: int = typer.Option(90, "--days"),
     series: str = typer.Option(
-        "new", "--series",
+        "new",
+        "--series",
         help="Series: amazon|new|used|sales_rank|rating|reviews",
     ),
     config: str | None = typer.Option(None, "--config", help="Project YAML config (optional)"),
@@ -829,8 +946,11 @@ def query_trends_cmd(
 ) -> None:
     """Show price/data trends for a product over time."""
     result = query_trends(
-        config, product=product, marketplace=marketplace,
-        series=series, days=days,
+        config,
+        product=product,
+        marketplace=marketplace,
+        series=series,
+        days=days,
     )
     _check_result(result)
     meta = result["meta"]
@@ -850,8 +970,17 @@ def query_compare_cmd(
     """Compare one product across all marketplaces."""
     result = query_compare(config, product=product)
     _check_result(result)
-    cols = ["site", "brand", "model", "price_cents", "currency", "rating",
-            "review_count", "bsr", "available"]
+    cols = [
+        "site",
+        "brand",
+        "model",
+        "price_cents",
+        "currency",
+        "rating",
+        "review_count",
+        "bsr",
+        "available",
+    ]
     _render_output(result["data"], fmt, cols)
 
 
@@ -865,8 +994,7 @@ def query_ranking_cmd(
     """Products ranked by BSR for a marketplace."""
     result = query_ranking(config, marketplace=marketplace, category=category)
     _check_result(result)
-    cols = ["bsr", "brand", "model", "price_cents", "currency", "rating",
-            "review_count"]
+    cols = ["bsr", "brand", "model", "price_cents", "currency", "rating", "review_count"]
     _render_output(result["data"], fmt, cols)
 
 
@@ -908,7 +1036,6 @@ def query_deals_cmd(
     _render_output(result["data"], fmt)
 
 
-
 @admin_app.command("merge-dbs")
 def merge_dbs(
     output_dir: str = typer.Option("output", help="Root output directory to scan"),
@@ -937,8 +1064,11 @@ def merge_dbs(
         return
 
     tables_keepa = [
-        "keepa_products", "keepa_time_series",
-        "keepa_buybox_history", "keepa_coupon_history", "keepa_deals",
+        "keepa_products",
+        "keepa_time_series",
+        "keepa_buybox_history",
+        "keepa_coupon_history",
+        "keepa_deals",
     ]
 
     with open_db(shared_path) as conn:
@@ -972,7 +1102,8 @@ def merge_dbs(
                 ).fetchone()
                 if exists:
                     src_cols = [
-                        r["name"] for r in conn.execute("PRAGMA src.table_info(competitive_snapshots)")
+                        r["name"]
+                        for r in conn.execute("PRAGMA src.table_info(competitive_snapshots)")
                     ]
                     if "project" in src_cols:
                         conn.execute(
@@ -999,6 +1130,7 @@ def merge_dbs(
 
         # Summary
         from amz_scout.db import query_stats
+
         stats = query_stats(conn)
 
     console.print("\n[green bold]Merge complete![/]")
@@ -1011,25 +1143,24 @@ def merge_dbs(
 @app.command()
 def keepa(
     project_config: str | None = typer.Option(
-        None, "--config", help="Project YAML config (optional, uses DB if omitted)"),
+        None, "--config", help="Project YAML config (optional, uses DB if omitted)"
+    ),
     marketplace: str | None = typer.Option(None, "-m", "--marketplace"),
     product: str | None = typer.Option(None, "-p", "--product"),
-    lazy: bool = typer.Option(False, "--lazy",
-        help="Use cache no matter how old; fetch only if missing"),
-    offline: bool = typer.Option(False, "--offline",
-        help="DB only; skip if missing (zero API calls). Also regenerates CSV from cache."),
-    max_age: int | None = typer.Option(None, "--max-age",
-        help="Max cache age in days (default 7)"),
-    fresh: bool = typer.Option(False, "--fresh",
-        help="Always re-fetch from Keepa API"),
-    check: bool = typer.Option(False, "--check",
-        help="Show data freshness matrix only (no fetch)"),
-    budget: bool = typer.Option(False, "--budget",
-        help="Show Keepa API token balance only"),
-    detailed: bool = typer.Option(False, "--detailed",
-        help="Keepa detailed mode (~6 tok/product)"),
-    fmt: str = typer.Option("table", "--format",
-        help="Output format: table|csv|json"),
+    lazy: bool = typer.Option(
+        False, "--lazy", help="Use cache no matter how old; fetch only if missing"
+    ),
+    offline: bool = typer.Option(
+        False,
+        "--offline",
+        help="DB only; skip if missing (zero API calls). Also regenerates CSV from cache.",
+    ),
+    max_age: int | None = typer.Option(None, "--max-age", help="Max cache age in days (default 7)"),
+    fresh: bool = typer.Option(False, "--fresh", help="Always re-fetch from Keepa API"),
+    check: bool = typer.Option(False, "--check", help="Show data freshness matrix only (no fetch)"),
+    budget: bool = typer.Option(False, "--budget", help="Show Keepa API token balance only"),
+    detailed: bool = typer.Option(False, "--detailed", help="Keepa detailed mode (~6 tok/product)"),
+    fmt: str = typer.Option("table", "--format", help="Output format: table|csv|json"),
     verbose: bool = typer.Option(False, "-v", "--verbose"),
 ) -> None:
     """Smart Keepa data fetch with cache-first freshness control.
@@ -1079,6 +1210,7 @@ def keepa(
             format_freshness_matrix,
             query_freshness,
         )
+
         with open_db(info.db_path) as conn:
             fetched_map = query_freshness(conn, products, target_sites)
             results = evaluate_freshness(
@@ -1104,9 +1236,14 @@ def keepa(
 
     with open_db(db_path) as conn:
         result = get_keepa_data(
-            conn, products, target_sites, marketplaces,
-            strategy=strategy, max_age_days=age_days,
-            detailed=detailed, output_base=output_base,
+            conn,
+            products,
+            target_sites,
+            marketplaces,
+            strategy=strategy,
+            max_age_days=age_days,
+            detailed=detailed,
+            output_base=output_base,
             on_progress=lambda msg: console.print(msg),
         )
 
@@ -1127,8 +1264,17 @@ def keepa(
             row["monthly_sold"] = h.monthly_sold or ""
         rows.append(row)
 
-    cols = ["site", "model", "source", "age", "buybox", "amazon", "new",
-            "sales_rank", "monthly_sold"]
+    cols = [
+        "site",
+        "model",
+        "source",
+        "age",
+        "buybox",
+        "amazon",
+        "new",
+        "sales_rank",
+        "monthly_sold",
+    ]
     _render_output(rows, fmt, cols)
 
     console.print(
@@ -1137,8 +1283,7 @@ def keepa(
     )
     if result.tokens_used > 0:
         console.print(
-            f"  [dim]Tokens: {result.tokens_used} used, "
-            f"{result.tokens_remaining} remaining[/]"
+            f"  [dim]Tokens: {result.tokens_used} used, {result.tokens_remaining} remaining[/]"
         )
 
 

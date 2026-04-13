@@ -86,7 +86,11 @@ def get_keepa_data(
     requested_mode = "detailed" if detailed else "basic"
     fetched_at_map = query_freshness(conn, products, sites)
     freshness_results = evaluate_freshness(
-        products, sites, fetched_at_map, strategy, max_age_days,
+        products,
+        sites,
+        fetched_at_map,
+        strategy,
+        max_age_days,
         requested_mode=requested_mode,
     )
     cache_list, fetch_list, skip_list = partition_by_action(freshness_results)
@@ -96,9 +100,7 @@ def get_keepa_data(
     tokens_after = 0
 
     # Build O(1) lookup: (asin, site) → Product
-    product_by_asin = {
-        (p.asin_for(s), s): p for p in products for s in sites
-    }
+    product_by_asin = {(p.asin_for(s), s): p for p in products for s in sites}
 
     # Step 2: read cached data from raw JSON files
     for pf in cache_list:
@@ -163,8 +165,7 @@ def get_keepa_data(
 
             # Store to DB
             if raw_dir:
-                _store_fetched_to_db(conn, raw_dir, site_products, site,
-                                     fetch_mode=requested_mode)
+                _store_fetched_to_db(conn, raw_dir, site_products, site, fetch_mode=requested_mode)
 
             # Build outcomes
             history_map = {h.asin: h for h in histories}

@@ -26,72 +26,100 @@ def make_raw_keepa_product() -> dict:
 
     # Amazon price (csv[0]): 3 data points in cents
     csv[0] = [
-        _TS_BASE, 11729,
-        _TS_BASE + 1440, 11999,
-        _TS_BASE + 2880, 11729,
+        _TS_BASE,
+        11729,
+        _TS_BASE + 1440,
+        11999,
+        _TS_BASE + 2880,
+        11729,
     ]
 
     # New price (csv[1]): 3 data points
     csv[1] = [
-        _TS_BASE, 11729,
-        _TS_BASE + 1440, 12499,
-        _TS_BASE + 2880, 11500,
+        _TS_BASE,
+        11729,
+        _TS_BASE + 1440,
+        12499,
+        _TS_BASE + 2880,
+        11500,
     ]
 
     # Sales rank (csv[3]): 4 data points
     csv[3] = [
-        _TS_BASE, 2591,
-        _TS_BASE + 720, 2100,
-        _TS_BASE + 1440, 3050,
-        _TS_BASE + 2160, 2800,
+        _TS_BASE,
+        2591,
+        _TS_BASE + 720,
+        2100,
+        _TS_BASE + 1440,
+        3050,
+        _TS_BASE + 2160,
+        2800,
     ]
 
     # New offer count (csv[7]): 2 data points
     csv[7] = [
-        _TS_BASE, 5,
-        _TS_BASE + 1440, 6,
+        _TS_BASE,
+        5,
+        _TS_BASE + 1440,
+        6,
     ]
 
     # Rating (csv[16]): 2 data points (value = rating * 10, so 46 = 4.6)
     csv[16] = [
-        _TS_BASE, 46,
-        _TS_BASE + 1440, 46,
+        _TS_BASE,
+        46,
+        _TS_BASE + 1440,
+        46,
     ]
 
     # Review count (csv[17]): 2 data points
     csv[17] = [
-        _TS_BASE, 1100,
-        _TS_BASE + 1440, 1117,
+        _TS_BASE,
+        1100,
+        _TS_BASE + 1440,
+        1117,
     ]
 
     # monthlySoldHistory: [ts, units, ts, units, ...]
     monthly_sold = [
-        _TS_BASE, 150,
-        _TS_BASE + 43200, 180,  # ~1 month later
+        _TS_BASE,
+        150,
+        _TS_BASE + 43200,
+        180,  # ~1 month later
     ]
 
     # salesRanks: dict of category_id → [ts, rank, ...]
     sales_ranks = {
         "11052681": [
-            _TS_BASE, 2591,
-            _TS_BASE + 1440, 2100,
+            _TS_BASE,
+            2591,
+            _TS_BASE + 1440,
+            2100,
         ],
         "430568031": [
-            _TS_BASE, 45,
-            _TS_BASE + 1440, 38,
+            _TS_BASE,
+            45,
+            _TS_BASE + 1440,
+            38,
         ],
     }
 
     # couponHistory: [ts, discount_type, discount_value, ...]  (triples)
     coupon_history = [
-        _TS_BASE, 0, 500,       # 500 cents off
-        _TS_BASE + 1440, 1, 5,  # 5% off
+        _TS_BASE,
+        0,
+        500,  # 500 cents off
+        _TS_BASE + 1440,
+        1,
+        5,  # 5% off
     ]
 
     # buyBoxSellerIdHistory: [ts, seller_id, ...]
     buybox_seller_history = [
-        _TS_BASE, "A3P5ROKL5A1OLE",
-        _TS_BASE + 1440, "A3P5ROKL5A1OLE",
+        _TS_BASE,
+        "A3P5ROKL5A1OLE",
+        _TS_BASE + 1440,
+        "A3P5ROKL5A1OLE",
     ]
 
     # deals (Keepa format: startTime/endTime as ints, dealType, accessType)

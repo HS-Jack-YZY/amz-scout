@@ -9,9 +9,7 @@ from amz_scout.config import MarketplaceConfig
 logger = logging.getLogger(__name__)
 
 
-def setup_marketplace(
-    browser: BrowserSession, site: str, config: MarketplaceConfig
-) -> bool:
+def setup_marketplace(browser: BrowserSession, site: str, config: MarketplaceConfig) -> bool:
     """Initialize browser for a specific Amazon marketplace.
 
     Steps:
@@ -53,9 +51,7 @@ def _dismiss_cookie_consent(browser: BrowserSession) -> None:
         pass  # No popup — expected
 
 
-def _set_delivery_address(
-    browser: BrowserSession, site: str, config: MarketplaceConfig
-) -> bool:
+def _set_delivery_address(browser: BrowserSession, site: str, config: MarketplaceConfig) -> bool:
     """Set delivery address via the location popover.
 
     Retries by navigating to a product page if the homepage layout
@@ -143,7 +139,8 @@ def _set_ca_address(browser: BrowserSession, config: MarketplaceConfig) -> bool:
         return False
 
     state = browser.state()
-    raw_text = state.get("data", {}).get("_raw_text", "")
+    # Underscore prefix: kept for debug visibility of the pre-injection page state.
+    _raw_text = state.get("data", {}).get("_raw_text", "")
 
     # Find the two input fields
     js = f"""(function() {{
