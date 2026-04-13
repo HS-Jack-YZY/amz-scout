@@ -8,19 +8,45 @@ from pydantic import BaseModel, field_validator
 
 from amz_scout.models import Product
 
+# Keepa API official domain codes
+# Source: https://github.com/keepacom/api_backend (AmazonLocale enum)
+KEEPA_VALID_DOMAINS: dict[int, str] = {
+    1: "US",
+    2: "GB",
+    3: "DE",
+    4: "FR",
+    5: "JP",
+    6: "CA",
+    8: "IT",
+    9: "ES",
+    10: "IN",
+    11: "MX",
+    12: "BR",
+}
+
 
 class MarketplaceConfig(BaseModel):
     """Configuration for one Amazon marketplace."""
 
     amazon_domain: str
     keepa_domain: str
-    keepa_domain_code: int  # Numeric Keepa API domain code
+    keepa_domain_code: int | None = None  # Numeric Keepa API domain code; None = unsupported
     currency_code: str
     currency_symbol: str
     price_format: str = "standard"
     region: str  # e.g. "eu", "na", "apac"
     delivery_postcode: str
     delivery_city: str | None = None  # AU needs city selection
+
+    @field_validator("keepa_domain_code")
+    @classmethod
+    def validate_keepa_domain_code(cls, v: int | None) -> int | None:
+        if v is not None and v not in KEEPA_VALID_DOMAINS:
+            raise ValueError(
+                f"Invalid keepa_domain_code: {v}. "
+                f"Valid codes: {sorted(KEEPA_VALID_DOMAINS.keys())}"
+            )
+        return v
 
 
 class Settings(BaseModel):

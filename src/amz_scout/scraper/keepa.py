@@ -3,8 +3,8 @@
 Strategy:
 - Default mode (1 token/product): basic query → csv[] + monthlySoldHistory + buyBoxSellerIdHistory
   All stats (min/max/avg/current) computed locally from the raw csv arrays.
-- Detailed mode (--detailed, ~5 tokens/product): adds offers + stats + buybox parameters
-  for seller count, FBA breakdown, and pre-computed stats.
+- Detailed mode (--detailed, ~6 tokens/product): adds offers + stats + buybox + rating
+  for seller count, FBA breakdown, pre-computed stats, rating and review count history.
 """
 
 import json as json
@@ -58,10 +58,16 @@ class KeepaClient:
         return self._tokens_left
 
     def _check_tokens(self) -> None:
-        resp = requests.get(f"{API_BASE}/token", params={"key": self._key}, timeout=10)
-        data = resp.json()
-        self._tokens_left = data.get("tokensLeft", 0)
-        self._refill_rate = data.get("refillRate", 1)
+        try:
+            resp = requests.get(f"{API_BASE}/token", params={"key": self._key}, timeout=10)
+            data = resp.json()
+            self._tokens_left = data.get("tokensLeft", 0)
+            self._refill_rate = data.get("refillRate", 1)
+        except (requests.exceptions.RequestException, ValueError) as e:
+            logger.warning("Token check failed (%s), using last known count: %d",
+                           e, max(self._tokens_left, 0))
+            if self._tokens_left == -1:
+                self._tokens_left = 0
 
     def _wait_for_tokens(self, needed: int) -> None:
         if self._tokens_left >= needed:
@@ -85,7 +91,7 @@ class KeepaClient:
         """Fetch price history for products.
 
         Args:
-            detailed: If True, request offers+stats+buybox (~5 tokens/product).
+            detailed: If True, request offers+stats+buybox+rating (~6 tokens/product).
             raw_dir: If provided, save raw Keepa JSON responses to this directory.
         """
         domain_code = keepa_domain_code
@@ -100,12 +106,12 @@ class KeepaClient:
         if not valid_pairs:
             return []
 
-        mode = "detailed (~5 tok/product)" if detailed else "basic (1 tok/product)"
+        mode = "detailed (~6 tok/product)" if detailed else "basic (1 tok/product)"
         logger.info("[%s] Fetching Keepa data for %d products [%s]",
                      site, len(valid_pairs), mode)
 
         self._check_tokens()
-        tokens_per = 5 if detailed else 1
+        tokens_per = 6 if detailed else 1
         self._wait_for_tokens(len(valid_pairs) * tokens_per)
 
         results = []
@@ -130,7 +136,7 @@ class KeepaClient:
         """Fetch one product with retry on 429."""
         params: dict = {"key": self._key, "domain": domain_code, "asin": asin}
         if detailed:
-            params.update({"stats": 90, "offers": 20, "buybox": 1})
+            params.update({"stats": 90, "offers": 20, "buybox": 1, "rating": 1})
 
         for attempt in range(max_retries + 1):
             try:
@@ -147,24 +153,24 @@ class KeepaClient:
                                      site, asin, refill_in, attempt + 1, max_retries)
                         time.sleep(refill_in)
                         continue
-                    return _empty_history(product, site)
+                    return _empty_history(product, site, fetch_error="rate_limited")
 
                 try:
                     data = resp.json()
                 except (ValueError, requests.exceptions.JSONDecodeError):
                     logger.warning("[%s] Non-JSON response for %s", site, asin)
-                    return _empty_history(product, site)
+                    return _empty_history(product, site, fetch_error="invalid_response")
 
                 self._tokens_left = data.get("tokensLeft", self._tokens_left)
 
                 if resp.status_code != 200 or "error" in data:
-                    logger.warning("[%s] Keepa error for %s: %s",
-                                    site, asin, data.get("error", resp.status_code))
-                    return _empty_history(product, site)
+                    err_msg = data.get("error", str(resp.status_code))
+                    logger.warning("[%s] Keepa error for %s: %s", site, asin, err_msg)
+                    return _empty_history(product, site, fetch_error=f"api_error: {err_msg}")
 
                 raw_products = data.get("products", [])
                 if not raw_products:
-                    return _empty_history(product, site)
+                    return _empty_history(product, site)  # genuinely no data
 
                 # Save raw JSON
                 if raw_dir:
@@ -178,12 +184,12 @@ class KeepaClient:
 
             except requests.exceptions.RequestException as e:
                 logger.error("[%s] Network error for %s: %s", site, asin, e)
-                return _empty_history(product, site)
+                return _empty_history(product, site, fetch_error=f"network: {e}")
             except Exception as e:
                 logger.error("[%s] Unexpected error for %s: %s", site, asin, e)
-                return _empty_history(product, site)
+                return _empty_history(product, site, fetch_error=f"unexpected: {e}")
 
-        return _empty_history(product, site)
+        return _empty_history(product, site, fetch_error="max_retries_exhausted")
 
 
 # ─── Raw data storage ───────────────────────────────────────────────────
@@ -307,7 +313,7 @@ def _prices_from_stats(stats: dict) -> tuple[dict, dict]:
 
 def _summarize_csv(csv_data: list, type_index: int) -> dict[str, float | None]:
     """Compute stats from a single csv price type array."""
-    empty = {"current": None, "lowest": None, "highest": None, "avg90": None}
+    empty: dict[str, float | None] = {"current": None, "lowest": None, "highest": None, "avg90": None}
     if type_index >= len(csv_data) or not csv_data[type_index]:
         return empty
 
@@ -336,7 +342,8 @@ def _stat_price(stat_array: list, idx: int) -> float | None:
         v = stat_array[idx]
         if isinstance(v, (list, tuple)) and len(v) >= 2:
             return cents_to_price(v[1])
-        return cents_to_price(v)
+        if isinstance(v, int):
+            return cents_to_price(v)
     return None
 
 
@@ -350,7 +357,9 @@ def _latest_value(csv_data: list, type_index: int, as_int: bool = False):
     return None
 
 
-def _empty_history(product: Product, site: str) -> PriceHistory:
+def _empty_history(
+    product: Product, site: str, fetch_error: str = "",
+) -> PriceHistory:
     """Create an empty PriceHistory for a product with no data."""
     return PriceHistory(
         date=today_iso(),
@@ -359,4 +368,5 @@ def _empty_history(product: Product, site: str) -> PriceHistory:
         brand=product.brand,
         model=product.model,
         asin=product.asin_for(site),
+        fetch_error=fetch_error,
     )

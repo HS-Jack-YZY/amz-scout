@@ -17,21 +17,21 @@ csv[] 数组包含 36 种价格类型的完整历史记录（[时间戳, 价格(
 | 2 | 二手品最低价 | 是否存在大量二手/翻新流通 |
 | 3 | Sales Rank | 销量排名趋势（可做"排名-价格"关联分析） |
 | 4 | List Price (RRP) | 参考零售价，计算实际折扣率 |
-| 8 | FBM 新品价 | 自发货卖家的定价 vs FBA 价差 |
+| 7 | FBM 新品运费 | 自发货卖家的运费（basic 模式下通常为空，需 offers 参数） |
 | 11 | 新品卖家数量 | 卖家竞争程度时间序列 |
 | 12 | 二手卖家数量 | 二手市场活跃度 |
-| 33 | 评分 (rating × 10) | 评分随时间变化趋势 |
-| 34 | 评论数 | 评论增长速度 |
+| 16 | 评分 (rating × 10) | 评分随时间变化趋势（需 rating=1，+1 token） |
+| 17 | 评论数 | 评论增长速度（需 rating=1，+1 token） |
 
 **可做分析：**
 - **价格战检测**：当卖家数(csv[11])增加 + 价格(csv[1])下降 → 新卖家入场引发价格战
 - **促销效果**：价格骤降 + 排名骤升(csv[3]) → 计算促销的 BSR 提升弹性
 - **季节性定价**：按月聚合价格，找出全年最低价时间窗口（黑五/Prime Day/圣诞等）
 - **价格弹性曲线**：价格变化百分比 vs 排名变化百分比，量化价格敏感度
-- **FBA vs FBM 价差**：csv[0]或csv[1] vs csv[8]，分析 FBA 溢价空间
+- **FBA vs FBM 价差**：csv[1](新品价) vs csv[7](FBM运费)，分析 FBA 溢价空间（需 --detailed 模式获取 csv[7]）
 
 ### 1.2 优惠券历史（couponHistory）
-格式：[时间戳, 优惠券类型, 金额, ...]
+格式：[时间戳, 金额, 0] 三元组交替排列。金额含义：负数=百分比折扣（-10 → 10% off），正数=金额折扣（单位：分，1500 → £15.00 off），0=优惠券取消。
 - 竞品多久发一次券？每次发多少？
 - 优惠券和价格下降是否同步？（叠加促销 vs 单独用券）
 
@@ -69,7 +69,7 @@ csv[] 数组包含 36 种价格类型的完整历史记录（[时间戳, 价格(
 ## 三、卖家生态分析（buyBox + offers + fbaFees）
 
 ### 3.1 Buy Box 卖家历史
-`buyBoxSellerIdHistory` 记录了谁在什么时间赢得 Buy Box。
+`buyBoxSellerIdHistory` 记录了谁在什么时间赢得 Buy Box（basic 模式下可能为 null，需 --detailed 模式确保获取）。
 - **Buy Box 争夺频率**：一天换几次卖家？
 - **Amazon 自营占比**：Amazon 多少时间拥有 Buy Box？
 - **FBA vs FBM**：FBA 卖家赢 Buy Box 的概率
@@ -82,7 +82,7 @@ csv[] 数组包含 36 种价格类型的完整历史记录（[时间戳, 价格(
 - **FBA 占比**：FBA 卖家 / 总卖家 — 市场成熟度指标
 
 ### 3.3 FBA 费用（fbaFees）
-- 物流成本 + 配送成本
+- `pickAndPackFee`：拣货打包费（单位：分），如 304 → £3.04
 - 计算各竞品的 FBA 费率（FBA费/售价）— 利润率粗估
 
 ---
@@ -114,7 +114,7 @@ csv[] 数组包含 36 种价格类型的完整历史记录（[时间戳, 价格(
 ## 五、竞争格局分析
 
 ### 5.1 评分 vs 评论增长对比
-csv[33]=评分, csv[34]=评论数，按时间对比：
+csv[16]=评分, csv[17]=评论数（需 rating=1 参数），按时间对比：
 - **评分恶化预警**：评分持续下降的产品可能有质量问题（竞争对手的软肋）
 - **评论增长速度**：每月新增评论数 → 推算每月销量（评论率约 1-3%）
 - **新品冷启动**：从 0 评论到 100 评论用了多久
@@ -181,7 +181,7 @@ csv[33]=评分, csv[34]=评论数，按时间对比：
 | 价格走势折线图 | csv[0,1] | 竞品定价策略一目了然 |
 | 销量柱状图（月度） | monthlySoldHistory | 销售趋势 |
 | 卖家数量变化图 | csv[11,12] | 竞争加剧/减弱 |
-| 评分趋势 | csv[33] | 产品质量变化 |
+| 评分趋势 | csv[16] | 产品质量变化 |
 | 价格-排名散点图 | csv[0] vs csv[3] | 价格弹性可视化 |
 | 品牌市场份额饼图 | monthlySold 聚合 | 竞争格局 |
 | 跨站价格热力图 | 各站 csv[0] | 定价差异 |
@@ -198,4 +198,71 @@ csv[33]=评分, csv[34]=评论数，按时间对比：
 
 ---
 
-*以上所有分析均可从 1 token/产品 的基础 raw JSON 中完成，无需额外 API 调用。*
+*大部分分析可从 1 token/产品的基础 raw JSON 中完成。使用 `--detailed` 模式可获取全部 csv 字段 + offers + stats + rating（~6 token/产品）。*
+
+---
+
+## 附录 A：Keepa 时间戳格式
+
+csv 数组和其他历史字段中的时间戳是 **Keepa 分钟数**：从 **2011-01-01 00:00 UTC** 起算的分钟数。
+
+转换公式：`实际时间 = 2011-01-01 00:00 UTC + keepa_timestamp 分钟`
+
+示例：`7549036` → 2011-01-01 + 7549036 分钟 = **2025-05-09 09:16 UTC**
+
+---
+
+## 附录 B：API Token 消耗汇总
+
+| 模式 | 参数 | Token/产品 | amz-scout 用法 | 可获取的数据 |
+|------|------|:---:|------|------|
+| Basic | 无额外参数 | 1 | 默认 | csv[0-6,11-14,33-34], monthlySoldHistory, buyBoxSellerIdHistory, salesRanks, couponHistory, deals, fbaFees |
+| Detailed | `stats=90&offers=20&buybox=1&rating=1` | ~6 | `--detailed` | 以上全部 + csv[7-10,15-32,35], csv[16] 评分历史, csv[17] 评论数历史, offers 列表, 预计算统计数据, Buy Box 详情 |
+
+---
+
+## 附录 C：csv[] 完整索引参考
+
+● = Basic 默认可获取（1 token/产品） | ◆ = 需 `--detailed`（~6 token/产品）
+
+| 索引 | 名称 | 含义 | 模式 |
+|:---:|------|------|:---:|
+| 0 | AMAZON | 亚马逊自营价格 | ● |
+| 1 | NEW | 第三方新品最低价 | ● |
+| 2 | USED | 二手最低价 | ● |
+| 3 | SALES | 销售排名 (Sales Rank) | ● |
+| 4 | LISTPRICE | 标签价 / 建议零售价 | ● |
+| 5 | COLLECTIBLE | 收藏品最低价 | ● |
+| 6 | REFURBISHED | 翻新品最低价 | ● |
+| 7 | NEW_FBM_SHIPPING | FBM 新品运费 | ◆ |
+| 8 | LIGHTNING_DEAL | 闪购价格 | ◆ |
+| 9 | WAREHOUSE | Warehouse Deals 价格 | ◆ |
+| 10 | NEW_FBA | FBA 新品最低价 | ◆ |
+| 11 | COUNT_NEW | 新品 Offer 数量 | ● |
+| 12 | COUNT_USED | 二手 Offer 数量 | ● |
+| 13 | COUNT_REFURBISHED | 翻新品 Offer 数量 | ● |
+| 14 | COUNT_COLLECTIBLE | 收藏品 Offer 数量 | ● |
+| 15 | EXTRA_INFO_UPDATES | 额外信息更新时间戳 | ◆ |
+| 16 | RATING | 商品评分 (×10，如 45=4.5星) | ◆ |
+| 17 | COUNT_REVIEWS | 评论总数 | ◆ |
+| 18 | BUY_BOX_SHIPPING | Buy Box 价格（含运费） | ◆ |
+| 19 | USED_NEW_SHIPPING | 二手新品运费 | ◆ |
+| 20 | USED_VERY_GOOD | 二手-非常好 最低价 | ◆ |
+| 21 | USED_GOOD | 二手-好 最低价 | ◆ |
+| 22 | USED_ACCEPTABLE | 二手-可接受 最低价 | ◆ |
+| 23 | COLLECTIBLE_NEW | 收藏品-新 最低价 | ◆ |
+| 24 | COLLECTIBLE_VERY_GOOD | 收藏品-非常好 | ◆ |
+| 25 | COLLECTIBLE_GOOD | 收藏品-好 | ◆ |
+| 26 | COLLECTIBLE_ACCEPTABLE | 收藏品-可接受 | ◆ |
+| 27 | COUNT_NEW_FBM | FBM 新品 Offer 数量 | ◆ |
+| 28 | NEW_PRICE_IS_MAP | 新品价格是否为 MAP | ◆ |
+| 29 | USED_LIKE_NEW | 二手-几乎全新 最低价 | ◆ |
+| 30 | COUNT_USED_NEW | 二手-几乎全新 数量 | ◆ |
+| 31 | COUNT_USED_VERY_GOOD | 二手-非常好 数量 | ◆ |
+| 32 | COUNT_USED_GOOD | 二手-好 数量 | ◆ |
+| 33 | COUNT_USED_ACCEPTABLE | 二手-可接受 数量 | ● |
+| 34 | COUNT_COLLECTIBLE_NEW | 收藏品-新 数量 | ● |
+| 35 | TRADE_IN | 以旧换新价格 | ◆ |
+
+> 价格单位为**分**（如 14399 = \$143.99 / £143.99），值为 **-1** 表示该时间点无数据/缺货。
+> 即使获取模式满足，若产品本身没有对应类型的 Offer（如电子产品无收藏品），该字段仍为 null。
