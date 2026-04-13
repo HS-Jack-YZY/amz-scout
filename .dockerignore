@@ -1,0 +1,57 @@
+# Mirror of .gitignore plus Docker-specific exclusions.
+# Goal: keep the build context small (<5MB) and keep secrets/data out of image layers.
+
+# ── Secrets — MUST never enter an image layer ──
+.env
+*.env
+!.env.example
+
+# ── Generated data — must live in the bind mount, not the image ──
+output/
+
+# ── VCS ──
+.git/
+.gitignore
+.gitattributes
+
+# ── Python build/cache ──
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+.venv/
+venv/
+env/
+pip-wheel-metadata/
+
+# ── Test / lint / coverage caches ──
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# ── Chainlit runtime (per-session uploads) ──
+.files/
+.chainlit/.files/
+
+# ── IDE / OS ──
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# ── Docs / planning artifacts not needed at runtime ──
+.claude/
+docs/
+
+# ── Misc dev tooling ──
+.envrc
+.direnv/
+node_modules/

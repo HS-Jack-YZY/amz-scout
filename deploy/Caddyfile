@@ -1,0 +1,8 @@
+# amz-scout Caddy reverse proxy — Phase 6.
+# {$DOMAIN} substitutes the DOMAIN env var at startup. Caddy auto-issues a
+# Let's Encrypt cert when DOMAIN is a real public hostname; for "localhost"
+# it serves plain HTTP on :80 (no ACME).
+{$DOMAIN}
+
+encode zstd gzip
+reverse_proxy webapp:8000
