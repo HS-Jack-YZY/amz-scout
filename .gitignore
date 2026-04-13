@@ -27,3 +27,7 @@ Thumbs.db
 .ruff_cache/
 .coverage
 htmlcov/
+
+# Chainlit runtime (user uploads, per-session files)
+.files/
+.chainlit/.files/

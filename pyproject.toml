@@ -21,12 +21,18 @@ dev = [
     "pytest-cov>=5.0",
     "ruff>=0.4",
 ]
+web = [
+    "chainlit>=2.7,<3",
+    "anthropic>=0.40",
+    "python-dotenv>=1.0",
+    "openpyxl>=3.1",
+]
 
 [project.scripts]
 amz-scout = "amz_scout.cli:app"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/amz_scout"]
+packages = ["src/amz_scout", "webapp"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
