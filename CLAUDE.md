@@ -225,6 +225,13 @@ r = batch_discover(candidates=r["meta"]["discover_pending"], headed=True)
 
 14. **product_tags 表暂不使用**: 表已建好但不作为功能依赖。过滤统一用 `category` / `brand` / `marketplace`。
 
+15. **Webapp 信封已精简（trimmed envelopes）**: `webapp/tools.py` 路由的所有查询都经过 `amz_scout._llm_trim` 过滤字段，LLM 只看到分析师会引用的字段：核心产品身份（brand/model/asin）、价格/评分/BSR、可用性、时间戳。CLI 调用方（`amz-scout query`、`amz-scout scrape`）仍看到完整信封。具体白名单：
+    - `trim_competitive_rows`: 13 个字段（site/category/brand/model/asin/price_cents/currency/rating/review_count/bought_past_month/bsr/available/scraped_at）。丢弃 `*_raw`、`title`、`url`、`stock_*`、`sold_by`、`other_offers`、`coupon`、`is_prime`、`star_distribution`、`image_count`、`qa_count`、`fulfillment`、`id`、`project`、`created_at`。
+    - `trim_timeseries_rows`: 仅保留 `date` + `value`（query_trends）。
+    - `trim_seller_rows`: 仅保留 `date` + `seller_id`（query_sellers）。
+    - `trim_deals_rows`: 8 字段（asin/site/deal_type/badge/percent_claimed/deal_status/start_time/end_time）。
+    - 若 LLM 需要一个当前被过滤掉的字段，在 `src/amz_scout/_llm_trim.py` 中对应 frozenset 添加，然后跑 `pytest tests/test_token_audit.py` 确认 cost delta 可接受。**meta 从不过滤** —— `auto_fetched`/`tokens_used`/`warnings` 等保持原样。
+
 ### Available Projects
 
 产品数据在 SQLite 产品注册表中（`products` + `product_asins` 表）。用 `import_yaml("BE10000")` 从 YAML 导入，或用 `add_product()` 直接注册。
