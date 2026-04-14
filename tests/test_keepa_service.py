@@ -74,6 +74,33 @@ class TestReadFromCache:
         result = _read_from_cache(_product(), "UK", None)
         assert result is None
 
+    def test_detects_detailed_mode_from_offers(self, raw_data):
+        """A cached raw JSON with a non-empty `offers` array must be parsed
+        in detailed mode so detailed-only seller fields survive the round-trip.
+
+        Regression guard for the keepa_service correctness fix: previously
+        `_read_from_cache` hardcoded `detailed=False`, which silently dropped
+        `seller_count` and `fba_seller_count` whenever the original Keepa
+        fetch had been a `--detailed` request.
+        """
+        import copy
+
+        raw = copy.deepcopy(raw_data)
+        raw["offers"] = [
+            {"sellerId": "AXX", "isFBA": True},
+            {"sellerId": "AYY", "isFBA": False},
+        ]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            raw_dir = Path(tmpdir)
+            with open(raw_dir / "uk_B0F2MR53D6.json", "w") as f:
+                json.dump(raw, f)
+
+            result = _read_from_cache(_product(), "UK", raw_dir)
+            assert result is not None
+            assert result.seller_count == 2
+            assert result.fba_seller_count == 1
+
 
 class TestGetKeepaDataOffline:
     """Test offline strategy — no API calls, purely DB + cache."""

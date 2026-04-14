@@ -1,6 +1,7 @@
 """Chainlit password auth callback with @gl-inet.com email whitelist."""
 
 import logging
+import secrets
 
 import chainlit as cl
 
@@ -15,10 +16,17 @@ def auth_callback(username: str, password: str) -> cl.User | None:
 
     Phase 1 MVP: all @gl-inet.com emails share a single APP_PASSWORD.
     Phase 6 will replace this with per-user bcrypt hashes.
+
+    Notes:
+        - ``ALLOWED_EMAIL_DOMAIN`` is normalized in ``webapp.config`` to always
+          start with "@" and to be lowercased, so a plain ``endswith`` here is
+          safe against the ``attacker@evilgl-inet.com`` lookalike attack.
+        - Password comparison goes through ``secrets.compare_digest`` to remove
+          the timing side channel that ``!=`` would expose.
     """
     email = username.strip().lower()
 
-    if not email.endswith(ALLOWED_EMAIL_DOMAIN.lower()):
+    if not email.endswith(ALLOWED_EMAIL_DOMAIN):
         logger.warning(
             "Auth rejected: email %r not in allowed domain %s",
             email,
@@ -30,7 +38,7 @@ def auth_callback(username: str, password: str) -> cl.User | None:
         logger.error("APP_PASSWORD is empty — all auth will fail")
         return None
 
-    if password != APP_PASSWORD:
+    if not secrets.compare_digest(password, APP_PASSWORD):
         logger.warning("Auth rejected: wrong password for %s", email)
         return None
 

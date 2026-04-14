@@ -1503,7 +1503,18 @@ def import_from_raw_json(
     fetched_at: str | None = None,
     fetch_mode: str = "basic",
 ) -> tuple[int, int]:
-    """Import Keepa data from raw JSON files. Returns (ok, failed) counts."""
+    """Import Keepa data from raw JSON files. Returns (ok, failed) counts.
+
+    Per-file ``fetch_mode`` upgrade: callers that pass the default
+    ``"basic"`` (e.g. ``admin migrate`` / ``admin reparse``, which import
+    historical raw JSONs of mixed origin) get an auto-upgrade to
+    ``"detailed"`` for any individual file whose raw JSON contains a
+    non-empty ``offers`` array. That array is only present when the
+    original Keepa request was a ``--detailed`` fetch (``offers=20``), so
+    it's a safe per-file signal and avoids permanently mis-tagging rows
+    that should be ``"detailed"``. Explicit ``fetch_mode="detailed"``
+    callers are honored as-is and never downgraded.
+    """
     from amz_scout.utils import today_iso
 
     fetched = fetched_at or today_iso()
@@ -1516,7 +1527,11 @@ def import_from_raw_json(
         try:
             with open(json_path) as f:
                 raw = json_mod.load(f)
-            store_keepa_product(conn, asin, site, raw, fetched, fetch_mode=fetch_mode)
+            # Auto-upgrade only when the caller did not explicitly say "detailed".
+            effective_mode = fetch_mode
+            if effective_mode != "detailed" and raw.get("offers"):
+                effective_mode = "detailed"
+            store_keepa_product(conn, asin, site, raw, fetched, fetch_mode=effective_mode)
             ok += 1
         except Exception:
             logger.exception("Import failed for %s/%s", site, asin)

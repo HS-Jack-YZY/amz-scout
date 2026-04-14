@@ -29,7 +29,13 @@ SYSTEM_PROMPT = (
 )
 
 # ─── Auth ────────────────────────────────────────────────────────
-ALLOWED_EMAIL_DOMAIN = os.environ.get("ALLOWED_EMAIL_DOMAIN", "@gl-inet.com")
+# Always anchor the domain with a leading "@" so endswith() can't be tricked
+# by a lookalike like "attacker@evilgl-inet.com" when the operator forgets the
+# "@" in their .env. We also lowercase here so callers don't have to.
+_raw_allowed_domain = os.environ.get("ALLOWED_EMAIL_DOMAIN", "@gl-inet.com").strip().lower()
+if not _raw_allowed_domain.startswith("@"):
+    _raw_allowed_domain = "@" + _raw_allowed_domain
+ALLOWED_EMAIL_DOMAIN = _raw_allowed_domain
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
 
 # ─── Database ────────────────────────────────────────────────────

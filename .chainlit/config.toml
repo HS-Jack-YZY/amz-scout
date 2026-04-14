@@ -19,8 +19,16 @@ persist_user_env = false
 # Set to true to show API keys as ***, false to show them as plain text
 mask_user_env = false
 
-# Authorized origins
-allow_origins = ["*"]
+# Authorized origins (CORS allow-list).
+#
+# Default ships with localhost variants only. Production deployments behind
+# Caddy must extend this list with the public origin (https://$DOMAIN).
+# `deploy/entrypoint.sh` rewrites this line from the container's $DOMAIN env
+# var on startup so the running container reflects the actual public origin —
+# see deploy/README.md for the runbook. Do NOT put "*" here: that allows any
+# site on the internet to issue cross-origin requests against authenticated
+# sessions, which is the CSRF/clickjacking surface this list exists to close.
+allow_origins = ["http://localhost", "http://localhost:8000", "http://127.0.0.1", "http://127.0.0.1:8000"]
 
 [features]
 # Process and display HTML in messages. This can be a security risk (see https://stackoverflow.com/questions/19603097/why-is-it-dangerous-to-render-user-generated-html-or-javascript)
@@ -54,21 +62,18 @@ favorites = false
 # Add emoji reaction when message is received (requires reactions:write OAuth scope)
 reaction_on_message_received = false
 
-# Authorize users to spontaneously upload files with messages
+# Authorize users to spontaneously upload files with messages.
+#
+# DISABLED for amz-scout: the chat flow has no `@cl.on_file_upload` handler,
+# so accepting uploads would only burn disk and widen the attack surface
+# (large unrestricted uploads, MIME confusion, etc.). If a future feature
+# needs uploads, flip `enabled = true` AND tighten `accept` to a real
+# allow-list — never ship with "*/*" + 500 MB + 20 files.
 [features.spontaneous_file_upload]
-    enabled = true
-    # Define accepted file types using MIME types
-    # Examples:
-    # 1. For specific file types:
-    #    accept = ["image/jpeg", "image/png", "application/pdf"]
-    # 2. For all files of certain type:
-    #    accept = ["image/*", "audio/*", "video/*"]
-    # 3. For specific file extensions:
-    #    accept = { "application/octet-stream" = [".xyz", ".pdb"] }
-    # Note: Using "*/*" is not recommended as it may cause browser warnings
-    accept = ["*/*"]
-    max_files = 20
-    max_size_mb = 500
+    enabled = false
+    accept = ["image/jpeg", "image/png", "application/pdf"]
+    max_files = 5
+    max_size_mb = 25
 
 [features.audio]
     # Enable audio features
