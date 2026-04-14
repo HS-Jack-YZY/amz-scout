@@ -24,6 +24,24 @@ SYSTEM_BLOCKS: list[dict[str, Any]] = [
 ]
 
 
+def _strip_cache_control_from_prior_tool_results(history: list[dict]) -> None:
+    """Remove ``cache_control`` from every ``tool_result`` block in history.
+
+    The moving cache_control breakpoint must actually MOVE: when we mark a
+    new turn's tool_result as ephemeral, the old marker has to come off, or
+    the total cache_control block count grows past Anthropic's hard limit
+    of 4 per request. Dropping the marker does not invalidate the already-
+    built cache — Anthropic's prefix match is over content tokens, not over
+    the ``cache_control`` metadata itself.
+    """
+    for msg in history:
+        if msg.get("role") != "user" or not isinstance(msg.get("content"), list):
+            continue
+        for block in msg["content"]:
+            if isinstance(block, dict) and block.get("type") == "tool_result":
+                block.pop("cache_control", None)
+
+
 async def run_chat_turn(history: list[dict]) -> tuple[str, list[dict]]:
     """Run one chat turn with tool use until the model is done.
 
@@ -43,6 +61,7 @@ async def run_chat_turn(history: list[dict]) -> tuple[str, list[dict]]:
             tools=TOOL_SCHEMAS,
             messages=history,
         )
+        logger.info("usage: %s", resp.usage.model_dump())
 
         # Append the assistant turn to history (preserve typed content blocks).
         # Convert the SDK's Pydantic objects to dicts for history consistency.
@@ -74,6 +93,12 @@ async def run_chat_turn(history: list[dict]) -> tuple[str, list[dict]]:
                 }
             )
 
+        # Moving cache_control breakpoint: retire any prior marker, then
+        # tag THIS iteration's last tool_result as ephemeral. One marker
+        # at a time keeps us under Anthropic's 4-block-per-request limit.
+        _strip_cache_control_from_prior_tool_results(history)
+        if tool_results:
+            tool_results[-1]["cache_control"] = {"type": "ephemeral"}
         # IMPORTANT: all tool results in ONE user message (for parallel tool safety)
         history.append({"role": "user", "content": tool_results})
 

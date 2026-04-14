@@ -938,3 +938,99 @@ class TestEnsureKeepaDataPostValidation:
         assert r["ok"] is True
         # Offline mode should not produce warnings (no fetches happen)
         assert "warnings" not in r["meta"] or r["meta"].get("warnings") == []
+
+
+# Wide-row marker fields from the competitive_snapshots schema. These live
+# OUTSIDE the LLM-safe allow-list in ``amz_scout._llm_trim`` and exist to
+# prove that ``amz_scout.api`` returns full DB rows. If any of them is missing
+# from a query result, somebody has wired trimming back into the api layer
+# and broken the CLI / admin contract.
+_API_WIDE_ROW_MARKERS = ("title", "url", "sold_by", "fulfillment")
+
+
+class TestApiEnvelopeCompleteness:
+    """Contract: ``amz_scout.api.query_*`` must return the full DB schema.
+
+    This is the regression guard that complements ``TestWebappTrimBoundary``
+    in ``test_webapp_smoke.py``. Trimming is a webapp-boundary concern only;
+    the api layer must keep CLI / admin / future scripts seeing the complete
+    row schema. If a future change moves trim back inside ``api.py``, every
+    test in this class fails loudly with the leaked field name.
+    """
+
+    def test_query_latest_returns_full_schema(self, seeded_config):
+        _, proj_path = seeded_config
+        r = query_latest(proj_path, marketplace="UK")
+
+        assert r["ok"] is True
+        assert len(r["data"]) >= 1
+        row = r["data"][0]
+        for marker in _API_WIDE_ROW_MARKERS:
+            assert marker in row, (
+                f"api.query_latest dropped {marker!r} — trim has leaked back "
+                f"into amz_scout.api. Trim must live at the webapp boundary only."
+            )
+
+    def test_query_compare_returns_full_schema(self, seeded_config):
+        _, proj_path = seeded_config
+        r = query_compare(proj_path, product="Slate 7")
+
+        assert r["ok"] is True
+        assert len(r["data"]) >= 1
+        row = r["data"][0]
+        for marker in _API_WIDE_ROW_MARKERS:
+            assert marker in row, (
+                f"api.query_compare dropped {marker!r} — trim leaked into api layer"
+            )
+
+    def test_query_ranking_returns_full_schema(self, seeded_config):
+        # seeded_config seeds rows with bare-digit BSR strings that don't
+        # match parse_bsr_routers' regex, so cs.bsr ends up NULL and
+        # query_bsr_ranking filters them out. Inject one extra row with a
+        # parseable "#N in Routers" string so this test has a row to inspect.
+        tmp_path, proj_path = seeded_config
+        db_path = tmp_path / "output" / "amz_scout.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        upsert_competitive(
+            conn,
+            [
+                CompetitiveData(
+                    date="2026-04-01",
+                    site="UK",
+                    category="Router",
+                    brand="ContractTest",
+                    model="BSR-Probe",
+                    asin="B0BSRPROBE",
+                    title="BSR Probe Router",
+                    price="£99.00",
+                    rating="4.0",
+                    review_count="10",
+                    bought_past_month="5+",
+                    bsr="#42 in Routers",
+                    available="Yes",
+                    url="https://example.test/dp/B0BSRPROBE",
+                ),
+            ],
+        )
+        conn.close()
+
+        r = query_ranking(proj_path, marketplace="UK")
+
+        assert r["ok"] is True
+        assert len(r["data"]) >= 1
+        row = r["data"][0]
+        for marker in _API_WIDE_ROW_MARKERS:
+            assert marker in row, (
+                f"api.query_ranking dropped {marker!r} — trim leaked into api layer"
+            )
+
+    # NOTE: ``query_availability`` is intentionally absent from this contract
+    # test. Its DB layer (``db.query_availability``) hand-projects only 7
+    # columns (brand/model/asin/site/available/price_cents/currency), all of
+    # which happen to be in ``LLM_SAFE_COMPETITIVE_FIELDS`` — so even if a
+    # future change re-introduced ``trim_competitive_rows`` inside
+    # ``api.query_availability``, the output rows would be identical and a
+    # marker-based regression test could not detect the leak. The webapp
+    # boundary test ``TestWebappTrimBoundary`` is sufficient guard for this
+    # tool's LLM-facing path.

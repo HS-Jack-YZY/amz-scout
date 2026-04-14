@@ -3,13 +3,28 @@
 Phase 2 exposes all 9 read-only query tools so the LLM can answer the full
 Scenario-1 research surface (latest snapshots, trends, compare, ranking,
 availability, sellers, deals, freshness, Keepa budget).
+
+Trimming policy (see ``amz_scout._llm_trim``): ``amz_scout.api`` deliberately
+returns full DB rows so that CLI/admin callers keep the complete schema. This
+module is the LLM boundary, so each ``_step_*`` wrapper that emits
+competitive-snapshot / time-series / seller / deal rows is decorated with
+``trim_for_llm(...)``, which projects the envelope's ``data`` list to the
+LLM-safe allow-list before the result reaches the model.
 """
 
+import functools
 import logging
+from collections.abc import Callable
 from typing import Any
 
 import chainlit as cl
 
+from amz_scout._llm_trim import (
+    trim_competitive_rows,
+    trim_deals_rows,
+    trim_seller_rows,
+    trim_timeseries_rows,
+)
 from amz_scout.api import check_freshness as _api_check_freshness
 from amz_scout.api import keepa_budget as _api_keepa_budget
 from amz_scout.api import query_availability as _api_query_availability
@@ -21,6 +36,31 @@ from amz_scout.api import query_sellers as _api_query_sellers
 from amz_scout.api import query_trends as _api_query_trends
 
 logger = logging.getLogger(__name__)
+
+
+def trim_for_llm(
+    trimmer: Callable[[list[dict]], list[dict]],
+) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """Project the ``data`` list of an api envelope through ``trimmer``.
+
+    Wrap an async ``_step_*`` wrapper so successful envelopes have their
+    ``data`` rows passed through the LLM-safe allow-list. Failed envelopes
+    (``ok=False``) and ``meta`` are passed through untouched. Returns a NEW
+    envelope dict so the api-layer return value is never mutated.
+    """
+
+    def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
+        @functools.wraps(fn)
+        async def wrapper(*args: Any, **kwargs: Any) -> dict:
+            result = await fn(*args, **kwargs)
+            if not isinstance(result, dict) or not result.get("ok"):
+                return result
+            rows = result.get("data") or []
+            return {**result, "data": trimmer(rows)}
+
+        return wrapper
+
+    return decorator
 
 
 def _missing_required(tool_name: str, field: str) -> dict[str, Any]:
@@ -279,6 +319,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
 
 # ─── Tool dispatcher ─────────────────────────────────────────────
 @cl.step(type="tool", name="query_latest")
+@trim_for_llm(trim_competitive_rows)
 async def _step_query_latest(marketplace: str, category: str | None = None) -> dict:
     """Chainlit step wrapper that shows tool inputs/outputs in the UI."""
     logger.info("query_latest called: marketplace=%s category=%s", marketplace, category)
@@ -298,36 +339,42 @@ async def _step_keepa_budget() -> dict:
 
 
 @cl.step(type="tool", name="query_availability")
+@trim_for_llm(trim_competitive_rows)
 async def _step_query_availability() -> dict:
     logger.info("query_availability called")
     return _api_query_availability()
 
 
 @cl.step(type="tool", name="query_compare")
+@trim_for_llm(trim_competitive_rows)
 async def _step_query_compare(product: str) -> dict:
     logger.info("query_compare called: product=%s", product)
     return _api_query_compare(product=product)
 
 
 @cl.step(type="tool", name="query_deals")
+@trim_for_llm(trim_deals_rows)
 async def _step_query_deals(marketplace: str | None = None) -> dict:
     logger.info("query_deals called: marketplace=%s", marketplace)
     return _api_query_deals(marketplace=marketplace)
 
 
 @cl.step(type="tool", name="query_ranking")
+@trim_for_llm(trim_competitive_rows)
 async def _step_query_ranking(marketplace: str, category: str | None = None) -> dict:
     logger.info("query_ranking called: marketplace=%s category=%s", marketplace, category)
     return _api_query_ranking(marketplace=marketplace, category=category)
 
 
 @cl.step(type="tool", name="query_sellers")
+@trim_for_llm(trim_seller_rows)
 async def _step_query_sellers(product: str, marketplace: str = "UK") -> dict:
     logger.info("query_sellers called: product=%s marketplace=%s", product, marketplace)
     return _api_query_sellers(product=product, marketplace=marketplace)
 
 
 @cl.step(type="tool", name="query_trends")
+@trim_for_llm(trim_timeseries_rows)
 async def _step_query_trends(
     product: str,
     marketplace: str = "UK",
@@ -347,8 +394,12 @@ async def _step_query_trends(
 async def dispatch_tool(name: str, args: dict) -> dict:
     """Route a tool call from the LLM to the right Python function.
 
-    Returns the raw amz_scout.api envelope dict unchanged — the LLM will
-    consume meta/error/hint fields directly.
+    Returns the amz_scout.api envelope dict. For tools that emit row data
+    (latest/availability/compare/deals/ranking/sellers/trends), the ``data``
+    list has been projected through ``trim_for_llm`` to the LLM-safe
+    allow-list defined in ``amz_scout._llm_trim``; ``meta`` and ``error``
+    are always passed through untouched. The LLM consumes meta/error/hint
+    fields directly.
     """
     if name == "query_latest":
         marketplace = args.get("marketplace")
