@@ -115,21 +115,65 @@ Results:
 
 ## End-to-end turn example
 
-> **Status**: the moving cache_control wiring is code-complete and verified
-> by the unit test in `tests/test_webapp_smoke.py::TestCacheControlWiring::
-> test_last_tool_result_block_gets_cache_control`. Live 3-turn webapp logs
-> with real `resp.usage.model_dump()` output are pending: they require a
-> Chainlit server session and at least three consecutive `query_latest`
-> calls. Once captured, paste them here under:
->
-> ```
-> Turn 1: usage={"input_tokens": X, "cache_creation_input_tokens": Y, "cache_read_input_tokens": 0, "output_tokens": Z}
-> Turn 2: usage={"input_tokens": X', "cache_creation_input_tokens": 0, "cache_read_input_tokens": Y, "output_tokens": Z'}
-> Turn 3: usage={"input_tokens": X'', "cache_creation_input_tokens": Δ, "cache_read_input_tokens": Y+..., "output_tokens": Z''}
-> ```
->
-> `logger.info("usage: %s", resp.usage.model_dump())` is already in place at
-> `webapp/llm.py:47`, so any real session emits the lines above to stdout.
+Captured locally on 2026-04-14 from `chainlit run webapp/app.py` against the
+live shared DB and the real Anthropic API. Three consecutive user messages
+in one session, each triggering `query_trends` on a different marketplace:
+
+1. "show me the price trend of GL.iNet Slate 7 on US"
+2. "what about on Germany?"
+3. "and Mexico?"
+
+`logger.info("usage: %s", resp.usage.model_dump())` at `webapp/llm.py:64`
+emits one line per `messages.create` call. Each user turn runs a short
+tool-use loop (2–3 iterations), so the log below shows the **first model
+call of each turn** — the call that observes whatever cache the previous
+turn left behind:
+
+```
+Turn 1 (iter 1/3): input_tokens=2362, cache_creation_input_tokens=0, cache_read_input_tokens=0,    output_tokens=134
+Turn 2 (iter 1/2): input_tokens=427,  cache_creation_input_tokens=0, cache_read_input_tokens=2968, output_tokens=131
+Turn 3 (iter 1/2): input_tokens=631,  cache_creation_input_tokens=0, cache_read_input_tokens=3863, output_tokens=109
+```
+
+The full per-iteration log (7 lines total across the 3 turns) also shows
+the within-turn cache growth as each tool_result gets marked ephemeral and
+immediately re-read on the next iteration:
+
+```
+Turn 1 iter 1: cc=0    cr=0      in=2362  out=134   (bare prompt; no cache yet)
+Turn 1 iter 2: cc=2588 cr=0      in=1     out=135   (marks first tool_result ephemeral)
+Turn 1 iter 3: cc=380  cr=2588   in=1     out=418   (reads turn-1 baseline + adds delta)
+Turn 2 iter 1: cc=0    cr=2968   in=427   out=131   (reads 2588+380 from turn 1)
+Turn 2 iter 2: cc=895  cr=2968   in=1     out=624
+Turn 3 iter 1: cc=0    cr=3863   in=631   out=109   (reads 2968+895 from turn 2)
+Turn 3 iter 2: cc=5700 cr=3863   in=1     out=820
+```
+
+**Interpretation**:
+
+- `cache_read_input_tokens` on the first iteration of each turn climbs
+  strictly monotonically: **0 → 2968 → 3863**. This is the direct
+  observable proof that the moving `cache_control` breakpoint (a) is being
+  attached to each turn's final `tool_result`, (b) is being stripped from
+  prior turns so the total stays ≤ 3 `cache_control` blocks, and (c) is
+  actually hitting the Anthropic cache across turns.
+- `cache_creation_input_tokens` on the first iteration of turns 2 and 3 is
+  **0** — the cache hit is pure read, nothing is re-cached. Fresh
+  `cache_creation` only appears later in each turn, when the new
+  `tool_result` for that turn gets tagged ephemeral for the next turn to
+  consume.
+- Total cross-turn cache-reads in this 3-turn session: **2968 + 3863 =
+  6,831 tokens read at ~$0.30/Mtok instead of $3/Mtok**, a ~90% discount
+  on that slice of the prompt. Trim savings (the 50–65% numbers above) are
+  strictly additive on top of this — the trimmed payload is what gets
+  cached in the first place, so every cache read is already on the smaller
+  envelope.
+- The "max 4 cache_control blocks" hard limit that caused the original
+  `BadRequestError` is respected: the unit test
+  `tests/test_webapp_smoke.py::TestCacheControlWiring::test_cache_control_does_not_accumulate_across_turns`
+  drives 5 sequential turns and asserts exactly 1 marked tool_result at
+  all times; this live run corroborates it — no 400s across 3 turns and
+  7 model calls.
 
 ## Estimated monthly savings
 
@@ -227,17 +271,14 @@ Real numbers will come from the 3-turn webapp log above once captured.
 - [x] `.claude/PRPs/reports/token-burn-reduction-report.md` contains real numbers
 - [x] `ruff check` + `ruff format --check` clean
 - [x] Full `pytest` suite green (5 token-audit tests skip as expected)
-- [ ] Manual 3-turn webapp run shows cache reads on turn 2+ — pending live session
+- [x] Manual 3-turn webapp run shows cache reads on turn 2+ (local chainlit session 2026-04-14; see "End-to-end turn example" above — `cache_read_input_tokens` climbs 0 → 2968 → 3863)
 
 ## Next Steps
 
-1. **Live webapp session**: run `chainlit run webapp/app.py -w`, issue three
-   consecutive `query_latest` calls on UK, paste the usage log lines under
-   the "End-to-end turn example" section above.
-2. **Backfill live measurements**: once `competitive_snapshots` has rows for
+1. **Backfill live measurements**: once `competitive_snapshots` has rows for
    UK, re-run `pytest tests/test_token_audit.py` to replace the synthetic
    `query_latest_synth20` measurement with real numbers for the 4 `SELECT
    cs.*` tools.
-3. **Phase 3 work** (next in the webapp PRD): live Keepa fetch confirmation
+2. **Phase 3 work** (next in the webapp PRD): live Keepa fetch confirmation
    UX. Both trim and cache savings apply there automatically; no changes
    to Phase 3 tools required.
