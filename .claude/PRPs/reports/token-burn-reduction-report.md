@@ -8,14 +8,29 @@
 
 Two independent token-saving levers landed in one plan:
 
-1. **Envelope trimming** — `webapp/tools.py` now routes every `query_*`
-   return through `amz_scout._llm_trim`, a new private module that produces
-   allow-listed copies of row dicts. The LLM sees only the fields an analyst
-   would cite; CLI callers keep seeing full rows.
+1. **Envelope trimming** — every `_step_*` wrapper in `webapp/tools.py` is
+   decorated with `@trim_for_llm(...)` from the new `amz_scout._llm_trim`
+   module, which produces allow-listed copies of row dicts before the
+   envelope reaches the LLM. The LLM sees only the fields an analyst would
+   cite; **`amz_scout.api` itself returns full DB rows**, so CLI / admin /
+   future scripts keep seeing the complete schema.
 2. **Moving cache_control breakpoint** — `webapp/llm.py` attaches
    `cache_control: {"type": "ephemeral"}` to the last `tool_result` block of
    every turn, so every subsequent turn's prompt prefix is cache-read at
    ~10% of normal input cost.
+
+> **Post-review correction (2026-04-14)** — the initial implementation wired
+> `_llm_trim` *inside* the seven `amz_scout.api.query_*` functions. Copilot's
+> PR review caught that this also trimmed CLI output (e.g. `amz-scout query
+> latest` rendered an empty `fulfillment` column) and contradicted the
+> module's own docstring ("CLI code must not import from it"). The fix moved
+> trimming to the webapp boundary via `@trim_for_llm` decorators on every
+> row-emitting `_step_*` wrapper, and added two regression suites:
+> `tests/test_api.py::TestApiEnvelopeCompleteness` (api layer must return
+> full rows) and `tests/test_webapp_smoke.py::TestWebappTrimBoundary`
+> (webapp dispatch must trim). Token savings are unchanged — the LLM still
+> sees identical bytes — only the ownership of the trim step moved one
+> layer outwards.
 
 Measurement is gated by a new pytest harness that calls Anthropic's
 `count_tokens` endpoint (free, non-billing) and writes
@@ -144,14 +159,17 @@ Real numbers will come from the 3-turn webapp log above once captured.
 | File | Action | Change |
 |---|---|---|
 | `src/amz_scout/_llm_trim.py` | CREATED | 4 frozen sets + `trim` helper + 4 partial aliases |
-| `src/amz_scout/api.py` | UPDATED | Import + 7 trim call-sites, no signature changes |
+| `src/amz_scout/api.py` | UPDATED | Initial PR added 7 trim call-sites here; the post-review correction REMOVED them — api now returns full DB rows. No signature changes. |
+| `webapp/tools.py` | UPDATED | Added `trim_for_llm(trimmer)` decorator + applied it to 7 row-emitting `_step_*` wrappers (latest/availability/compare/deals/ranking/sellers/trends). Trim now lives at the webapp boundary only. |
 | `webapp/llm.py` | UPDATED | `logger.info("usage: ...")` per turn + moving `cache_control` on `tool_results[-1]` |
-| `tests/test_llm_trim.py` | CREATED | 15 unit tests for allow-list/immutability/empty-input/unicode |
+| `tests/test_llm_trim.py` | CREATED | 15 unit tests for allow-list/immutability/empty-input/unicode (location-agnostic, unchanged by post-review correction) |
+| `tests/test_api.py` | UPDATED | +1 class `TestApiEnvelopeCompleteness` (4 tests) — contract test asserting api layer returns wide-row markers (`title`, `url`, `sold_by`, `fulfillment`). Guards against trim creeping back into api.py. |
 | `tests/test_token_audit.py` | CREATED | 8 network-gated tests + 1 synthetic fallback; writes `output/token_audit.json` |
-| `tests/test_webapp_smoke.py` | UPDATED | +2 tests in new `TestCacheControlWiring` class |
+| `tests/test_webapp_smoke.py` | UPDATED | +2 tests in `TestCacheControlWiring` class; +4 tests in new `TestWebappTrimBoundary` class (latest/trends/deals trim + failure-envelope passthrough) |
 | `pyproject.toml` | UPDATED | Register `network` marker |
-| `CLAUDE.md` | UPDATED | Add bullet #15 documenting the trimmed-envelope contract |
+| `CLAUDE.md` | UPDATED | Add bullet #15 documenting the trimmed-envelope contract (post-review revision: explicitly state trim lives at webapp boundary, link to both regression suites) |
 | `.claude/PRPs/reports/token-burn-reduction-report.md` | CREATED | This report |
+| `.claude/PRPs/reviews/local-reduce-api-token-burn-review.md` | CREATED | Local self-review artifact |
 
 ## Deviations from Plan
 
@@ -195,10 +213,13 @@ Real numbers will come from the 3-turn webapp log above once captured.
 ## Acceptance Criteria Status
 
 - [x] `src/amz_scout/_llm_trim.py` exists with 4 allow-lists + trim functions
-- [x] All 7 LLM-facing `query_*` functions route through the right trim helper
+- [x] All 7 LLM-facing `query_*` tools have their `_step_*` webapp wrapper decorated with `@trim_for_llm` (post-review correction — the initial PR wired this in `api.py`, which leaked into CLI; trim now lives at the webapp boundary only)
+- [x] `amz_scout.api.query_*` returns full DB rows for CLI / admin / future scripts (verified by `tests/test_api.py::TestApiEnvelopeCompleteness`)
 - [x] `webapp/llm.py` attaches `cache_control: ephemeral` to the last tool_result each turn
 - [x] `webapp/llm.py` logs `resp.usage` per turn at INFO
 - [x] `tests/test_llm_trim.py` passes (15 cases, 8+ required)
+- [x] `tests/test_api.py::TestApiEnvelopeCompleteness` passes (4 tests guarding the api-layer full-schema contract)
+- [x] `tests/test_webapp_smoke.py::TestWebappTrimBoundary` passes (4 tests guarding the webapp-boundary trim contract)
 - [x] `tests/test_webapp_smoke.py::TestCacheControlWiring` passes (2 new tests)
 - [x] `tests/test_token_audit.py` runs green with `ANTHROPIC_API_KEY` set and produces `output/token_audit.json`
 - [x] `output/token_audit.json` shows every *executed* tool with `pct_saved > 0` and `after <= before`

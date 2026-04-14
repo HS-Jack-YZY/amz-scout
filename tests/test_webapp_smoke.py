@@ -208,6 +208,196 @@ class TestToolDispatch:
 
 
 @pytest.mark.unit
+class TestWebappTrimBoundary:
+    """Webapp boundary contract: ``dispatch_tool`` must apply ``trim_for_llm``
+    to the envelope ``data`` for every row-emitting tool, while ``meta`` and
+    failure envelopes pass through untouched.
+
+    This is the regression guard for PR #7's correction: the trim helpers live
+    in ``amz_scout._llm_trim`` and used to be wired inside ``amz_scout.api``,
+    which silently bled into CLI output. Trimming must now happen at the
+    webapp boundary only — these tests fail loudly if anyone moves it back.
+    """
+
+    def _patch_chainlit_step(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import chainlit as cl
+
+        def _noop_step(**_kwargs):  # type: ignore[no-untyped-def]
+            def _decorator(fn):  # type: ignore[no-untyped-def]
+                return fn
+
+            return _decorator
+
+        monkeypatch.setattr(cl, "step", _noop_step)
+
+    def test_query_latest_envelope_is_trimmed_at_webapp_boundary(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _set_fake_env(monkeypatch)
+        self._patch_chainlit_step(monkeypatch)
+        _reset_webapp_modules()
+        from webapp import tools as webapp_tools
+        from webapp.tools import dispatch_tool
+
+        wide_row = {
+            "id": 7,
+            "site": "UK",
+            "brand": "ExampleBrand",
+            "model": "XR-100",
+            "asin": "B0TESTTEST",
+            "title": "Should not leak",
+            "url": "https://example.test",
+            "price_cents": 14999,
+            "currency": "GBP",
+            "rating": 4.5,
+            "review_count": 99,
+            "bsr": 1,
+            "available": 1,
+            "fulfillment": "Amazon",
+            "sold_by": "ExampleBrand",
+            "scraped_at": "2026-04-01T10:00:00Z",
+        }
+
+        def _fake(*_args, **_kwargs) -> dict:  # type: ignore[no-untyped-def]
+            return {
+                "ok": True,
+                "data": [wide_row],
+                "error": None,
+                "meta": {"count": 1, "auto_fetched": False},
+            }
+
+        monkeypatch.setattr(webapp_tools, "_api_query_latest", _fake)
+
+        result = asyncio.run(dispatch_tool("query_latest", {"marketplace": "UK"}))
+
+        assert result["ok"] is True
+        assert len(result["data"]) == 1
+        trimmed = result["data"][0]
+        assert trimmed["brand"] == "ExampleBrand"
+        assert trimmed["model"] == "XR-100"
+        assert trimmed["asin"] == "B0TESTTEST"
+        assert trimmed["price_cents"] == 14999
+        for leaked in ("id", "title", "url", "fulfillment", "sold_by"):
+            assert leaked not in trimmed, (
+                f"{leaked!r} leaked into LLM envelope — trim is no longer "
+                f"applied at the webapp boundary"
+            )
+        assert result["meta"] == {"count": 1, "auto_fetched": False}
+
+    def test_query_trends_timeseries_is_trimmed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _set_fake_env(monkeypatch)
+        self._patch_chainlit_step(monkeypatch)
+        _reset_webapp_modules()
+        from webapp import tools as webapp_tools
+        from webapp.tools import dispatch_tool
+
+        wide_rows = [
+            {
+                "keepa_ts": 7584000 + i,
+                "value": 14999 + i,
+                "fetched_at": "2026-04-01T10:00:00Z",
+                "date": f"2026-04-{i + 1:02d} 10:00",
+            }
+            for i in range(3)
+        ]
+
+        def _fake(*_args, **_kwargs) -> dict:  # type: ignore[no-untyped-def]
+            return {
+                "ok": True,
+                "data": wide_rows,
+                "error": None,
+                "meta": {"asin": "B0TEST", "series_name": "amazon_new"},
+            }
+
+        monkeypatch.setattr(webapp_tools, "_api_query_trends", _fake)
+
+        result = asyncio.run(
+            dispatch_tool(
+                "query_trends",
+                {"product": "Slate 7", "marketplace": "UK"},
+            )
+        )
+
+        assert result["ok"] is True
+        assert len(result["data"]) == 3
+        for row in result["data"]:
+            assert set(row.keys()) == {"date", "value"}, (
+                f"timeseries row must be trimmed to date+value, got {row.keys()}"
+            )
+        assert result["meta"]["asin"] == "B0TEST"
+
+    def test_query_deals_envelope_is_trimmed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _set_fake_env(monkeypatch)
+        self._patch_chainlit_step(monkeypatch)
+        _reset_webapp_modules()
+        from webapp import tools as webapp_tools
+        from webapp.tools import dispatch_tool
+
+        wide_deal = {
+            "asin": "B0TEST",
+            "site": "UK",
+            "deal_type": "LIGHTNING",
+            "badge": "Deal of the Day",
+            "percent_claimed": 60,
+            "deal_status": "ACTIVE",
+            "start_time": 7584000,
+            "end_time": 7590000,
+            "access_type": "ALL",
+            "fetched_at": "2026-04-01T10:00:00Z",
+        }
+
+        def _fake(*_args, **_kwargs) -> dict:  # type: ignore[no-untyped-def]
+            return {
+                "ok": True,
+                "data": [wide_deal],
+                "error": None,
+                "meta": {},
+            }
+
+        monkeypatch.setattr(webapp_tools, "_api_query_deals", _fake)
+
+        result = asyncio.run(dispatch_tool("query_deals", {"marketplace": "UK"}))
+
+        assert result["ok"] is True
+        trimmed = result["data"][0]
+        assert "access_type" not in trimmed
+        assert "fetched_at" not in trimmed
+        assert trimmed["deal_type"] == "LIGHTNING"
+        assert trimmed["percent_claimed"] == 60
+
+    def test_failure_envelope_passes_through_without_trim(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A failed envelope (ok=False) must skip trimming entirely so the
+        diagnostic ``error`` and any debug ``data`` reach the model intact."""
+        _set_fake_env(monkeypatch)
+        self._patch_chainlit_step(monkeypatch)
+        _reset_webapp_modules()
+        from webapp import tools as webapp_tools
+        from webapp.tools import dispatch_tool
+
+        failure = {
+            "ok": False,
+            "data": [],
+            "error": "synthetic failure for test",
+            "meta": {},
+        }
+
+        def _fake(*_args, **_kwargs) -> dict:  # type: ignore[no-untyped-def]
+            return failure
+
+        monkeypatch.setattr(webapp_tools, "_api_query_latest", _fake)
+
+        result = asyncio.run(dispatch_tool("query_latest", {"marketplace": "UK"}))
+
+        assert result is failure
+
+
+@pytest.mark.unit
 class TestCacheControlWiring:
     """Verify run_chat_turn attaches cache_control to the last tool_result.
 

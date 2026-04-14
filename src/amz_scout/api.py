@@ -15,12 +15,6 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, NamedTuple, TypedDict
 
-from amz_scout._llm_trim import (
-    trim_competitive_rows,
-    trim_deals_rows,
-    trim_seller_rows,
-    trim_timeseries_rows,
-)
 from amz_scout.config import (
     MarketplaceConfig,
     ProjectConfig,
@@ -462,7 +456,6 @@ def query_latest(
         logger.exception("query_latest failed")
         return _envelope(False, error=str(e))
 
-    rows = trim_competitive_rows(rows)
     return _envelope(True, data=rows, hint_if_empty=BROWSER_QUERY_HINT, count=len(rows))
 
 
@@ -552,7 +545,6 @@ def query_trends(
                     ]
 
         rows = _add_dates(rows)
-        rows = trim_timeseries_rows(rows)
     except Exception as e:
         logger.exception("query_trends failed")
         return _envelope(False, error=str(e))
@@ -586,7 +578,6 @@ def query_compare(project: str | None = None, product: str = "") -> dict:
         logger.exception("query_compare failed")
         return _envelope(False, error=str(e))
 
-    rows = trim_competitive_rows(rows)
     return _envelope(True, data=rows, hint_if_empty=BROWSER_QUERY_HINT, count=len(rows))
 
 
@@ -605,7 +596,6 @@ def query_ranking(
         logger.exception("query_ranking failed")
         return _envelope(False, error=str(e))
 
-    rows = trim_competitive_rows(rows)
     return _envelope(True, data=rows, hint_if_empty=BROWSER_QUERY_HINT, count=len(rows))
 
 
@@ -619,7 +609,6 @@ def query_availability(project: str | None = None) -> dict:
         logger.exception("query_availability failed")
         return _envelope(False, error=str(e))
 
-    rows = trim_competitive_rows(rows)
     return _envelope(True, data=rows, hint_if_empty=BROWSER_QUERY_HINT, count=len(rows))
 
 
@@ -661,7 +650,6 @@ def query_sellers(
             rows = query_seller_history(conn, asin, site)
 
         rows = _add_dates(rows)
-        rows = trim_seller_rows(rows)
     except Exception as e:
         logger.exception("query_sellers failed")
         return _envelope(False, error=str(e))
@@ -713,7 +701,6 @@ def query_deals(
         logger.exception("query_deals failed")
         return _envelope(False, error=str(e))
 
-    rows = trim_deals_rows(rows)
     return _envelope(True, data=rows, count=len(rows), **fetch_meta)
 
 

@@ -225,12 +225,12 @@ r = batch_discover(candidates=r["meta"]["discover_pending"], headed=True)
 
 14. **product_tags 表暂不使用**: 表已建好但不作为功能依赖。过滤统一用 `category` / `brand` / `marketplace`。
 
-15. **Webapp 信封已精简（trimmed envelopes）**: `webapp/tools.py` 路由的所有查询都经过 `amz_scout._llm_trim` 过滤字段，LLM 只看到分析师会引用的字段：核心产品身份（brand/model/asin）、价格/评分/BSR、可用性、时间戳。CLI 调用方（`amz-scout query`、`amz-scout scrape`）仍看到完整信封。具体白名单：
+15. **Webapp 信封已精简（trimmed envelopes，仅 webapp 边界）**: trim 只发生在 `webapp/tools.py` 的 `_step_*` 包装器上，通过 `@trim_for_llm(...)` 装饰器把 `amz_scout._llm_trim` 的白名单套到 envelope 的 `data` 字段。`amz_scout.api` 本身**永远返回完整 DB 行**，因此 CLI（`amz-scout query`、`amz-scout scrape`）、admin 工具、未来的脚本看到的都是全量字段（包括 `fulfillment`、`url`、`sold_by`、`title` 等）。这条契约由两组测试守门：`tests/test_api.py::TestApiEnvelopeCompleteness`（断言 api 层不掉字段）+ `tests/test_webapp_smoke.py::TestWebappTrimBoundary`（断言 webapp dispatch 后字段已收窄）。具体白名单：
     - `trim_competitive_rows`: 13 个字段（site/category/brand/model/asin/price_cents/currency/rating/review_count/bought_past_month/bsr/available/scraped_at）。丢弃 `*_raw`、`title`、`url`、`stock_*`、`sold_by`、`other_offers`、`coupon`、`is_prime`、`star_distribution`、`image_count`、`qa_count`、`fulfillment`、`id`、`project`、`created_at`。
     - `trim_timeseries_rows`: 仅保留 `date` + `value`（query_trends）。
     - `trim_seller_rows`: 仅保留 `date` + `seller_id`（query_sellers）。
     - `trim_deals_rows`: 8 字段（asin/site/deal_type/badge/percent_claimed/deal_status/start_time/end_time）。
-    - 若 LLM 需要一个当前被过滤掉的字段，在 `src/amz_scout/_llm_trim.py` 中对应 frozenset 添加，然后跑 `pytest tests/test_token_audit.py` 确认 cost delta 可接受。**meta 从不过滤** —— `auto_fetched`/`tokens_used`/`warnings` 等保持原样。
+    - 若 LLM 需要一个当前被过滤掉的字段，在 `src/amz_scout/_llm_trim.py` 中对应 frozenset 添加，然后跑 `pytest tests/test_token_audit.py` 确认 cost delta 可接受。**绝不**把 trim 调用搬回 `amz_scout/api.py` —— 这会让 CLI 静默丢字段。**meta 从不过滤** —— `auto_fetched`/`tokens_used`/`warnings` 等保持原样。
 
 ### Available Projects
 
