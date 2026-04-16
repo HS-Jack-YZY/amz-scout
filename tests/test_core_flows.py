@@ -41,9 +41,11 @@ def _make_keepa_raw(
     model: str = "GL-BE3600",
     asin: str = "B0TEST12345",
     product_group: str = "Router",
+    ean_list: list[str] | None = None,
+    upc_list: list[str] | None = None,
 ) -> dict:
     """Create minimal Keepa raw product JSON for testing."""
-    return {
+    d = {
         "asin": asin,
         "brand": brand,
         "title": title,
@@ -56,6 +58,11 @@ def _make_keepa_raw(
         "buyBoxSellerIdHistory": [],
         "couponHistory": [],
     }
+    if ean_list is not None:
+        d["eanList"] = ean_list
+    if upc_list is not None:
+        d["upcList"] = upc_list
+    return d
 
 
 # ─── I6: _auto_register_from_keepa ───────────────────────────────────
@@ -128,6 +135,89 @@ class TestAutoRegisterFromKeepa:
         ).fetchall()
         markets = {r["marketplace"] for r in rows}
         assert markets == {"UK", "DE"}
+
+    def test_ean_binds_cross_market(self, conn):
+        """Product with matching EAN should bind to existing product, not create new."""
+        raw_uk = _make_keepa_raw(
+            brand="GL.iNet",
+            title="Slate 7 Router",
+            model="GL-BE3600",
+            asin="B0UK_EAN_01",
+            ean_list=["0850018166010"],
+        )
+        r1 = store_keepa_product(conn, "B0UK_EAN_01", "UK", raw_uk, "2026-04-10T00:00:00Z")
+        assert r1 is not None
+        assert r1["new_product"] is True
+
+        raw_de = _make_keepa_raw(
+            brand="GL.iNet",
+            title="GL-BE3600 WiFi 7 Reiserouter",
+            model="GL-BE3600",
+            asin="B0DE_EAN_01",
+            ean_list=["0850018166010"],
+        )
+        r2 = store_keepa_product(conn, "B0DE_EAN_01", "DE", raw_de, "2026-04-10T01:00:00Z")
+        assert r2 is not None
+        assert r2["new_product"] is False
+        assert r2["product_id"] == r1["product_id"]
+        assert r2["match_type"] == "ean"
+
+    def test_upc_binds_cross_market(self, conn):
+        """UPC match should also bind to existing product."""
+        raw_us = _make_keepa_raw(
+            brand="TP-Link",
+            title="AX1500 Router",
+            model="AX1500",
+            asin="B0US_UPC_01",
+            upc_list=["885913123456"],
+        )
+        r1 = store_keepa_product(conn, "B0US_UPC_01", "US", raw_us, "2026-04-10T00:00:00Z")
+        assert r1 is not None
+        assert r1["match_type"] == "brand_title"
+
+        raw_ca = _make_keepa_raw(
+            brand="TP-Link",
+            title="AX1500 Wi-Fi Router",
+            model="AX1500",
+            asin="B0CA_UPC_01",
+            upc_list=["885913123456"],
+        )
+        r2 = store_keepa_product(conn, "B0CA_UPC_01", "CA", raw_ca, "2026-04-10T01:00:00Z")
+        assert r2 is not None
+        assert r2["product_id"] == r1["product_id"]
+        assert r2["match_type"] == "ean"
+
+    def test_no_ean_falls_back_to_brand_title(self, conn):
+        """Product without EAN/UPC should use brand+title fallback."""
+        raw = _make_keepa_raw(brand="TestBrand", title="TestProduct", model="TP-100")
+        result = store_keepa_product(conn, "B0NO_EAN_01", "UK", raw, "2026-04-10T00:00:00Z")
+        assert result is not None
+        assert result["new_product"] is True
+        assert result.get("match_type") == "brand_title"
+
+    def test_ean_no_cross_brand_match(self, conn):
+        """EAN match should NOT bind across different brands."""
+        raw_a = _make_keepa_raw(
+            brand="BrandA",
+            title="ProductX",
+            model="X-100",
+            asin="B0BRAND_A01",
+            ean_list=["SHARED_EAN_999"],
+        )
+        store_keepa_product(conn, "B0BRAND_A01", "UK", raw_a, "2026-04-10T00:00:00Z")
+
+        raw_b = _make_keepa_raw(
+            brand="BrandB",
+            title="ProductY",
+            model="Y-200",
+            asin="B0BRAND_B01",
+            ean_list=["SHARED_EAN_999"],
+        )
+        r2 = store_keepa_product(conn, "B0BRAND_B01", "US", raw_b, "2026-04-10T01:00:00Z")
+        assert r2 is not None
+        assert r2["new_product"] is True
+        assert r2["brand"] == "BrandB"
+        assert r2["match_type"] == "brand_title"
 
 
 # ─── I5: ensure_keepa_data confirmation flow ──────────────────────────

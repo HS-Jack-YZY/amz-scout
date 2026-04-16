@@ -529,6 +529,104 @@ def _try_register_product(
     }
 
 
+def _safe_json_list(s: str | None) -> list:
+    """Parse a JSON string as a list, returning [] on None or malformed input."""
+    if not s:
+        return []
+    try:
+        return json_mod.loads(s)
+    except (json_mod.JSONDecodeError, TypeError):
+        logger.warning("Malformed JSON list in DB: %r", s)
+        return []
+
+
+def _find_product_by_ean(
+    conn: sqlite3.Connection,
+    asin: str,
+    raw: dict,
+) -> int | None:
+    """Find an existing product_id by matching EAN/UPC codes.
+
+    Extracts EAN and UPC lists from Keepa raw data, then searches
+    keepa_products for other ASINs that share the same codes AND are
+    already registered in product_asins. Returns the first matching
+    product_id, or None if no match.
+    """
+    ean_list = raw.get("eanList") or []
+    upc_list = raw.get("upcList") or []
+    codes = set(ean_list + upc_list)
+    if not codes:
+        return None
+
+    brand = (raw.get("brand") or "").strip()
+
+    placeholders = ",".join(["?"] * len(codes))
+    sql = f"""
+        SELECT DISTINCT pa.product_id
+        FROM keepa_products kp
+        JOIN product_asins pa ON pa.asin = kp.asin AND pa.marketplace = kp.site
+        WHERE kp.asin != ?
+        AND (
+            EXISTS (SELECT 1 FROM json_each(kp.ean_list) WHERE value IN ({placeholders}))
+            OR EXISTS (SELECT 1 FROM json_each(kp.upc_list) WHERE value IN ({placeholders}))
+        )
+    """
+    params: list = [asin] + list(codes) + list(codes)
+
+    # No brand available — EAN alone is sufficient evidence; skip brand guard
+    if brand:
+        sql += "    AND kp.brand = ?\n"
+        params.append(brand)
+
+    rows = conn.execute(sql, params).fetchall()
+    if len(rows) > 1:
+        ids = [r["product_id"] for r in rows]
+        logger.warning(
+            "EAN ambiguity for %s: codes match %d products %s, skipping auto-bind",
+            asin,
+            len(ids),
+            ids,
+        )
+        return None
+    return rows[0]["product_id"] if rows else None
+
+
+def _bind_asin_to_product(
+    conn: sqlite3.Connection,
+    product_id: int,
+    site: str,
+    asin: str,
+) -> dict:
+    """Bind an ASIN to an existing product via EAN/UPC match.
+
+    Registers the ASIN, looks up product metadata, logs the binding,
+    and returns a result dict with ``match_type='ean'``.
+    """
+    register_asin(conn, product_id, site, asin, status="unverified")
+    prod = conn.execute(
+        "SELECT brand, model, category FROM products WHERE id = ?",
+        (product_id,),
+    ).fetchone()
+    logger.info(
+        "EAN-bound %s/%s → product %d (%s %s)",
+        site,
+        asin,
+        product_id,
+        prod["brand"],
+        prod["model"],
+    )
+    return {
+        "product_id": product_id,
+        "brand": prod["brand"],
+        "model": prod["model"],
+        "category": prod["category"],
+        "asin": asin,
+        "marketplace": site,
+        "new_product": False,
+        "match_type": "ean",
+    }
+
+
 def _auto_register_from_keepa(
     conn: sqlite3.Connection,
     asin: str,
@@ -537,8 +635,10 @@ def _auto_register_from_keepa(
 ) -> dict | None:
     """Auto-register a product from Keepa metadata if not already registered.
 
-    Skips silently when the ASIN is already in ``product_asins`` for this
-    marketplace, or when the Keepa data lacks *brand* or *title*.
+    Registration priority:
+    1. Skip if ASIN already in product_asins for this marketplace
+    2. EAN/UPC match: bind to existing product if codes match
+    3. Brand+title fallback: create new product entry
 
     Returns a dict with registration details, or *None* if skipped.
     """
@@ -549,6 +649,12 @@ def _auto_register_from_keepa(
     if existing:
         return None
 
+    # Priority 1: EAN/UPC match — zero-cost cross-market binding
+    ean_product_id = _find_product_by_ean(conn, asin, raw)
+    if ean_product_id is not None:
+        return _bind_asin_to_product(conn, ean_product_id, site, asin)
+
+    # Priority 2: brand+title fallback
     result = _try_register_product(
         conn,
         asin,
@@ -564,6 +670,8 @@ def _auto_register_from_keepa(
             site,
             asin,
         )
+    else:
+        result["match_type"] = "brand_title"
     return result
 
 
@@ -1234,12 +1342,13 @@ def tag_product(
 def sync_registry_from_keepa(conn: sqlite3.Connection) -> list[dict]:
     """Register orphan ASINs from keepa_products that are missing from product_asins.
 
-    Only registers products with non-empty brand and title.
+    Matching priority: (1) EAN/UPC → (2) brand+title.
+    Only registers products with non-empty brand and title (for brand+title path).
     Returns a list of dicts describing each registration.
     """
     orphans = conn.execute(
         """SELECT kp.asin, kp.site, kp.brand, kp.model, kp.title,
-                  kp.product_group
+                  kp.product_group, kp.ean_list, kp.upc_list
            FROM keepa_products kp
            WHERE NOT EXISTS (
                SELECT 1 FROM product_asins pa
@@ -1249,6 +1358,21 @@ def sync_registry_from_keepa(conn: sqlite3.Connection) -> list[dict]:
 
     results: list[dict] = []
     for row in orphans:
+        # Build a raw-like dict for _find_product_by_ean compatibility
+        raw_compat = {
+            "eanList": _safe_json_list(row["ean_list"]),
+            "upcList": _safe_json_list(row["upc_list"]),
+            "brand": row["brand"],
+        }
+        ean_product_id = _find_product_by_ean(conn, row["asin"], raw_compat)
+
+        if ean_product_id is not None:
+            bound = _bind_asin_to_product(
+                conn, ean_product_id, row["site"], row["asin"],
+            )
+            results.append({"registered": True, **bound})
+            continue
+
         reg = _try_register_product(
             conn,
             asin=row["asin"],
@@ -1259,6 +1383,7 @@ def sync_registry_from_keepa(conn: sqlite3.Connection) -> list[dict]:
             category=row["product_group"] or "",
         )
         if reg:
+            reg["match_type"] = "brand_title"
             results.append({"registered": True, **reg})
         else:
             results.append(

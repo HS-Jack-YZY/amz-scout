@@ -187,7 +187,7 @@ Keepa 数据写入 DB
 | # | Phase | Description | Status | Parallel | Depends | PRP Plan |
 |---|---|---|---|---|---|---|
 | 1 | **CLAUDE.md 瘦身** | 压缩至 ≤2,500 tokens，移除重复指令、强制 ASIN 补全、冗余示例；Developer Reference 外迁 | in-progress | with 2 | - | [plan](.claude/PRPs/plans/claude-md-slim-phase1.plan.md) |
-| 2 | **EAN/UPC 自动绑定** | 修改 `_auto_register_from_keepa()` 添加 EAN 匹配逻辑；验证覆盖率；添加测试 | pending | with 1 | - | - |
+| 2 | **EAN/UPC 自动绑定** | 修改 `_auto_register_from_keepa()` 添加 EAN 匹配逻辑；验证覆盖率；添加测试 | in-progress | with 1 | - | [plan](.claude/PRPs/plans/ean-upc-auto-binding.plan.md) |
 | 3 | **查询直通模式** | 修改 webapp tool wrappers 返回摘要 + cl.File；添加 session 查询记录；压缩 tool docstrings | pending | - | 1 | - |
 | 4 | **验证 + 回归测试** | 对比瘦身前后 token 消耗；全量测试套件；手动验证关键查询场景 | pending | - | 1, 2, 3 | - |
 
