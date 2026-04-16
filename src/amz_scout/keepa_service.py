@@ -222,15 +222,15 @@ def _raw_dir(output_base: Path, mp: MarketplaceConfig) -> Path:
 def _detailed_from_raw(raw: dict) -> bool:
     """Auto-detect whether a cached Keepa raw JSON came from a detailed fetch.
 
-    A ``--detailed`` Keepa request adds ``offers=20`` to the query, so the
-    response contains a non-empty ``offers`` array. Basic-mode responses do
-    not. Reading this signal off the cached JSON is more reliable than
-    threading a per-record fetch_mode flag through every caller, and it
-    keeps the cache round-trip lossless for ``seller_count`` /
-    ``fba_seller_count`` plus the pre-computed ``stats`` price block.
+    A ``--detailed`` Keepa request adds detailed-only fields such as
+    ``offers`` and the pre-computed ``stats`` block. Those keys may be
+    present even when ``offers`` is an empty list, so detection must use
+    key presence rather than offer-list truthiness. Reading this signal off
+    the cached JSON is more reliable than threading a per-record fetch_mode
+    flag through every caller, and it keeps the cache round-trip lossless
+    for ``seller_count`` / ``fba_seller_count`` plus ``stats``.
     """
-    offers = raw.get("offers")
-    return bool(offers)
+    return "stats" in raw or "offers" in raw
 
 
 def _read_from_cache(

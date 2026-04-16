@@ -1529,7 +1529,7 @@ def import_from_raw_json(
                 raw = json_mod.load(f)
             # Auto-upgrade only when the caller did not explicitly say "detailed".
             effective_mode = fetch_mode
-            if effective_mode != "detailed" and raw.get("offers"):
+            if effective_mode != "detailed" and ("stats" in raw or "offers" in raw):
                 effective_mode = "detailed"
             store_keepa_product(conn, asin, site, raw, fetched, fetch_mode=effective_mode)
             ok += 1

@@ -10,7 +10,7 @@ import pytest
 from amz_scout.config import MarketplaceConfig
 from amz_scout.db import init_schema, store_keepa_product
 from amz_scout.freshness import FreshnessStrategy
-from amz_scout.keepa_service import _read_from_cache, get_keepa_data
+from amz_scout.keepa_service import _detailed_from_raw, _read_from_cache, get_keepa_data
 from amz_scout.models import PriceHistory, Product
 
 # raw_data fixture is provided by conftest.py (synthetic + real fallback)
@@ -100,6 +100,38 @@ class TestReadFromCache:
             assert result is not None
             assert result.seller_count == 2
             assert result.fba_seller_count == 1
+
+
+    def test_detects_detailed_mode_from_empty_offers(self, raw_data):
+        """A cached raw JSON with ``offers: []`` must still be detected as
+        detailed mode. Regression: ``bool([])`` is False, so the old
+        truthiness check mis-classified detailed caches with zero offers.
+        """
+        import copy
+
+        raw = copy.deepcopy(raw_data)
+        raw["offers"] = []
+        raw["stats"] = {"min": [0], "max": [100]}
+
+        assert _detailed_from_raw(raw) is True
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            raw_dir = Path(tmpdir)
+            with open(raw_dir / "uk_B0F2MR53D6.json", "w") as f:
+                json.dump(raw, f)
+
+            result = _read_from_cache(_product(), "UK", raw_dir)
+            assert result is not None
+
+    def test_basic_mode_when_no_detailed_keys(self, raw_data):
+        """A raw JSON without ``offers`` or ``stats`` keys is basic mode."""
+        import copy
+
+        raw = copy.deepcopy(raw_data)
+        raw.pop("offers", None)
+        raw.pop("stats", None)
+
+        assert _detailed_from_raw(raw) is False
 
 
 class TestGetKeepaDataOffline:

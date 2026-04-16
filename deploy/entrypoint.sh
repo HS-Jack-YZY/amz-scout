@@ -35,7 +35,7 @@ case "$DOMAIN" in
         ;;
     *)
         # Build the JSON-ish array literal that TOML accepts.
-        ALLOW_LIST="[\"https://${DOMAIN}\", \"http://localhost\", \"http://127.0.0.1\"]"
+        ALLOW_LIST="[\"https://${DOMAIN}\", \"http://localhost\", \"http://localhost:8000\", \"http://127.0.0.1\", \"http://127.0.0.1:8000\"]"
         # The sed pattern matches the exact line we shipped in .chainlit/config.toml.
         # We pin to `^allow_origins = ` so the comments above the line are untouched.
         sed -i "s|^allow_origins = .*|allow_origins = ${ALLOW_LIST}|" "$CONFIG_TOML"
