@@ -1508,12 +1508,14 @@ def import_from_raw_json(
     Per-file ``fetch_mode`` upgrade: callers that pass the default
     ``"basic"`` (e.g. ``admin migrate`` / ``admin reparse``, which import
     historical raw JSONs of mixed origin) get an auto-upgrade to
-    ``"detailed"`` for any individual file whose raw JSON contains a
-    non-empty ``offers`` array. That array is only present when the
-    original Keepa request was a ``--detailed`` fetch (``offers=20``), so
-    it's a safe per-file signal and avoids permanently mis-tagging rows
-    that should be ``"detailed"``. Explicit ``fetch_mode="detailed"``
-    callers are honored as-is and never downgraded.
+    ``"detailed"`` for any individual file whose raw JSON contains either
+    the ``stats`` key or the ``offers`` key. This check is based on key
+    presence, so ``offers: []`` still triggers the upgrade, and files with
+    ``stats`` but no offers do as well. These fields are treated as
+    per-file signals that the original Keepa request included detailed
+    data, avoiding permanently mis-tagging rows that should be
+    ``"detailed"``. Explicit ``fetch_mode="detailed"`` callers are honored
+    as-is and never downgraded.
     """
     from amz_scout.utils import today_iso
 

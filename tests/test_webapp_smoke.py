@@ -101,6 +101,25 @@ class TestEmailDomainNormalization:
         assert not "attacker@evilgl-inet.com".endswith(normalized)
         assert "alice@gl-inet.com".endswith(normalized)
 
+    def test_empty_domain_falls_back_to_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An empty ALLOWED_EMAIL_DOMAIN must fall back to the default
+        rather than silently producing '@' which locks out all users.
+        """
+        _set_fake_env(monkeypatch)
+        monkeypatch.setenv("ALLOWED_EMAIL_DOMAIN", "")
+        _reset_webapp_modules()
+        from webapp import config
+
+        assert config.ALLOWED_EMAIL_DOMAIN == "@gl-inet.com"
+
+    def test_whitespace_only_domain_falls_back(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _set_fake_env(monkeypatch)
+        monkeypatch.setenv("ALLOWED_EMAIL_DOMAIN", "   ")
+        _reset_webapp_modules()
+        from webapp import config
+
+        assert config.ALLOWED_EMAIL_DOMAIN == "@gl-inet.com"
+
 
 @pytest.mark.unit
 class TestToolDispatch:

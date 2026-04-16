@@ -33,7 +33,11 @@ SYSTEM_PROMPT = (
 # by a lookalike like "attacker@evilgl-inet.com" when the operator forgets the
 # "@" in their .env. We also lowercase here so callers don't have to.
 _raw_allowed_domain = os.environ.get("ALLOWED_EMAIL_DOMAIN", "@gl-inet.com").strip().lower()
-if not _raw_allowed_domain.startswith("@"):
+if not _raw_allowed_domain or _raw_allowed_domain == "@":
+    # Empty / whitespace-only env var → fall back to default instead of
+    # silently producing "@" which would lock out all users.
+    _raw_allowed_domain = "@gl-inet.com"
+elif not _raw_allowed_domain.startswith("@"):
     _raw_allowed_domain = "@" + _raw_allowed_domain
 ALLOWED_EMAIL_DOMAIN = _raw_allowed_domain
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
