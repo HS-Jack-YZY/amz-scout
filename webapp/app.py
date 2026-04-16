@@ -46,9 +46,18 @@ async def on_message(msg: cl.Message) -> None:
 
     try:
         final_text, updated_history = await run_chat_turn(history)
-    except Exception as e:
+    except Exception:
+        # Keep stack + exception detail in server logs only — never echo the
+        # raw exception to authenticated users since it can leak file paths,
+        # configuration values, or internal error strings. Operators read the
+        # actual cause from `logger.exception` server-side.
         logger.exception("run_chat_turn failed")
-        await cl.Message(content=f"⚠️ Sorry, something went wrong: {e}").send()
+        await cl.Message(
+            content=(
+                "⚠️ Sorry, something went wrong on the server. "
+                "Please try again — if it keeps happening, ping the operator."
+            )
+        ).send()
         return
 
     cl.user_session.set("history", updated_history)

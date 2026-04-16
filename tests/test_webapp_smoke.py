@@ -51,6 +51,77 @@ class TestWebappImports:
 
 
 @pytest.mark.unit
+class TestEmailDomainNormalization:
+    """Regression guard for the auth domain anchor.
+
+    ``webapp.config.ALLOWED_EMAIL_DOMAIN`` MUST always start with "@" and be
+    lowercased, regardless of how the operator wrote the env var. Without
+    this normalization, an env value of "gl-inet.com" (no leading "@") would
+    let "attacker@evilgl-inet.com" satisfy ``email.endswith(domain)`` and
+    bypass the email whitelist entirely.
+    """
+
+    def test_default_value_already_anchored(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _set_fake_env(monkeypatch)
+        monkeypatch.delenv("ALLOWED_EMAIL_DOMAIN", raising=False)
+        _reset_webapp_modules()
+        from webapp import config
+
+        assert config.ALLOWED_EMAIL_DOMAIN == "@gl-inet.com"
+
+    def test_missing_at_prefix_is_added(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _set_fake_env(monkeypatch)
+        monkeypatch.setenv("ALLOWED_EMAIL_DOMAIN", "gl-inet.com")
+        _reset_webapp_modules()
+        from webapp import config
+
+        assert config.ALLOWED_EMAIL_DOMAIN == "@gl-inet.com"
+
+    def test_uppercase_input_is_lowercased(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _set_fake_env(monkeypatch)
+        monkeypatch.setenv("ALLOWED_EMAIL_DOMAIN", "GL-INET.COM")
+        _reset_webapp_modules()
+        from webapp import config
+
+        assert config.ALLOWED_EMAIL_DOMAIN == "@gl-inet.com"
+
+    def test_lookalike_domain_does_not_satisfy_endswith(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The whole point of the anchor: a normalized domain must reject
+        ``attacker@evilgl-inet.com``. We verify by hand-rolling the same
+        ``endswith`` check ``webapp.auth`` uses, against the normalized value.
+        """
+        _set_fake_env(monkeypatch)
+        monkeypatch.setenv("ALLOWED_EMAIL_DOMAIN", "gl-inet.com")  # no "@"
+        _reset_webapp_modules()
+        from webapp import config
+
+        normalized = config.ALLOWED_EMAIL_DOMAIN
+        assert not "attacker@evilgl-inet.com".endswith(normalized)
+        assert "alice@gl-inet.com".endswith(normalized)
+
+    def test_empty_domain_falls_back_to_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An empty ALLOWED_EMAIL_DOMAIN must fall back to the default
+        rather than silently producing '@' which locks out all users.
+        """
+        _set_fake_env(monkeypatch)
+        monkeypatch.setenv("ALLOWED_EMAIL_DOMAIN", "")
+        _reset_webapp_modules()
+        from webapp import config
+
+        assert config.ALLOWED_EMAIL_DOMAIN == "@gl-inet.com"
+
+    def test_whitespace_only_domain_falls_back(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _set_fake_env(monkeypatch)
+        monkeypatch.setenv("ALLOWED_EMAIL_DOMAIN", "   ")
+        _reset_webapp_modules()
+        from webapp import config
+
+        assert config.ALLOWED_EMAIL_DOMAIN == "@gl-inet.com"
+
+
+@pytest.mark.unit
 class TestToolDispatch:
     """Verify tool dispatch returns the amz_scout.api envelope shape."""
 
@@ -284,9 +355,7 @@ class TestWebappTrimBoundary:
             )
         assert result["meta"] == {"count": 1, "auto_fetched": False}
 
-    def test_query_trends_timeseries_is_trimmed(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_query_trends_timeseries_is_trimmed(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _set_fake_env(monkeypatch)
         self._patch_chainlit_step(monkeypatch)
         _reset_webapp_modules()
@@ -328,9 +397,7 @@ class TestWebappTrimBoundary:
             )
         assert result["meta"]["asin"] == "B0TEST"
 
-    def test_query_deals_envelope_is_trimmed(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_query_deals_envelope_is_trimmed(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _set_fake_env(monkeypatch)
         self._patch_chainlit_step(monkeypatch)
         _reset_webapp_modules()

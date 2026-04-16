@@ -219,6 +219,20 @@ def _raw_dir(output_base: Path, mp: MarketplaceConfig) -> Path:
     return output_base / "data" / mp.region / "raw"
 
 
+def _detailed_from_raw(raw: dict) -> bool:
+    """Auto-detect whether a cached Keepa raw JSON came from a detailed fetch.
+
+    A ``--detailed`` Keepa request adds detailed-only fields such as
+    ``offers`` and the pre-computed ``stats`` block. Those keys may be
+    present even when ``offers`` is an empty list, so detection must use
+    key presence rather than offer-list truthiness. Reading this signal off
+    the cached JSON is more reliable than threading a per-record fetch_mode
+    flag through every caller, and it keeps the cache round-trip lossless
+    for ``seller_count`` / ``fba_seller_count`` plus ``stats``.
+    """
+    return "stats" in raw or "offers" in raw
+
+
 def _read_from_cache(
     product: Product,
     site: str,
@@ -227,7 +241,10 @@ def _read_from_cache(
     """Read cached PriceHistory from raw JSON file.
 
     Uses the same _parse_product() as the API path, ensuring
-    identical output regardless of source.
+    identical output regardless of source. Detailed-mode caches are detected
+    automatically from the raw JSON content (see ``_detailed_from_raw``) so
+    detailed-only fields survive the round-trip without the caller having to
+    remember which mode the original fetch used.
     """
     if not raw_dir:
         return None
@@ -238,7 +255,7 @@ def _read_from_cache(
     try:
         with open(json_path) as f:
             raw = json_mod.load(f)
-        return _parse_product(product, site, raw, detailed=False)
+        return _parse_product(product, site, raw, detailed=_detailed_from_raw(raw))
     except Exception:
         logger.exception("Failed to read cache for %s/%s", site, asin)
         return None

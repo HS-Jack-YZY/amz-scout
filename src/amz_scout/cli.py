@@ -66,16 +66,18 @@ def _setup_logging(verbose: bool = False) -> None:
 
 
 def _resolve_target_sites(info, products: list[Product], marketplace: str | None) -> list[str]:
-    """Compute target marketplaces from CLI flag, YAML config, or DB product overrides."""
-    return (
-        [marketplace]
-        if marketplace
-        else (
-            info.config.target_marketplaces
-            if info.config
-            else list({s for p in products for s in p.marketplace_overrides})
-        )
-    )
+    """Compute target marketplaces from CLI flag, YAML config, or DB product overrides.
+
+    The DB-derived branch goes through ``set`` to dedupe across products and
+    then ``sorted`` so the iteration order is stable across runs. Without the
+    sort, set hashing made the CLI output, CSV write order, and DB upsert
+    order non-deterministic, which is a pain for diffs and reproducibility.
+    """
+    if marketplace:
+        return [marketplace]
+    if info.config:
+        return info.config.target_marketplaces
+    return sorted({s for p in products for s in p.marketplace_overrides})
 
 
 @app.command()
@@ -91,7 +93,7 @@ def scrape(
     category: str | None = typer.Option(None, "-c", "--category", help="Filter by category"),
     data_only: bool = typer.Option(False, help="Skip Keepa price history"),
     history_only: bool = typer.Option(False, help="Only fetch Keepa price history"),
-    detailed: bool = typer.Option(False, help="Keepa detailed mode (~5 tokens/product vs 1)"),
+    detailed: bool = typer.Option(False, help="Keepa detailed mode (~6 tokens/product vs 1)"),
     headed: bool = typer.Option(False, help="Show browser window"),
     retry: int = typer.Option(3, "--retry", help="Retry count per product"),
     delay: int = typer.Option(2, "--delay", help="Delay between products (seconds)"),
@@ -173,7 +175,7 @@ def _scrape_price_history(
     db_conn=None,
 ) -> None:
     """Fetch Keepa price history."""
-    mode_label = "detailed ~5 tok/product" if detailed else "basic 1 tok/product"
+    mode_label = "detailed ~6 tok/product" if detailed else "basic 1 tok/product"
     console.print(f"\n[bold]── Price History ({mode_label}) ──[/]")
 
     # Try Keepa first
@@ -216,14 +218,17 @@ def _scrape_price_history(
             csv_path = data_dir / f"{site.lower()}_price_history.csv"
             merged = merge_price_history(read_price_history(csv_path), histories)
             write_price_history(merged, csv_path)
-            # DB write (fire-and-forget)
+            # DB write (fire-and-forget). Thread `detailed` through so the
+            # `fetch_mode` column on `keepa_products` reflects how this batch
+            # was fetched — otherwise it stays "basic" forever and freshness
+            # mode-upgrade logic can't tell whether a re-fetch is needed.
             if db_conn:
-                _store_raw_to_db(db_conn, raw_dir, products, site)
+                _store_raw_to_db(db_conn, raw_dir, products, site, detailed=detailed)
 
     if keepa:
         remaining = keepa.tokens_left
         total_products = len(products) * len(target_sites)
-        tok_per = 5 if detailed else 1
+        tok_per = 6 if detailed else 1
         tokens_used = total_products * tok_per
         console.print(f"  Keepa: ~{tokens_used} tokens used, {remaining} remaining")
         if remaining < total_products * tok_per:
@@ -699,9 +704,24 @@ def _validate_results(results: list[CompetitiveData], site: str) -> None:
             console.print(f"    [yellow]! {w}[/]")
 
 
-def _store_raw_to_db(db_conn, raw_dir: Path, products: list[Product], site: str) -> None:
-    """Import Keepa raw JSON into DB. Failures are logged, not raised."""
-    ok, fail = import_from_raw_json(db_conn, raw_dir, products, site)
+def _store_raw_to_db(
+    db_conn,
+    raw_dir: Path,
+    products: list[Product],
+    site: str,
+    detailed: bool = False,
+) -> None:
+    """Import Keepa raw JSON into DB. Failures are logged, not raised.
+
+    The ``detailed`` flag flows into the ``fetch_mode`` column on
+    ``keepa_products`` so the freshness layer can later decide whether a
+    cached row covers a basic vs detailed query. Without this the column
+    was permanently stuck at ``"basic"`` and any subsequent ``--detailed``
+    request would refuse to use the cache (or worse, silently drop the
+    detailed-only seller fields on read-back).
+    """
+    fetch_mode = "detailed" if detailed else "basic"
+    ok, fail = import_from_raw_json(db_conn, raw_dir, products, site, fetch_mode=fetch_mode)
     if fail:
         console.print(f"  [yellow]DB: {ok} stored, {fail} failed[/]")
 
