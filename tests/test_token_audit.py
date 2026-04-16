@@ -47,9 +47,13 @@ def audit_path() -> Path:
     return out
 
 
-def _envelope_untrimmed(data: list[dict]) -> dict:
-    """Wrap raw DB rows in an envelope matching the public shape but with no trim."""
-    return {"ok": True, "data": data, "error": None, "meta": {}}
+def _envelope_untrimmed(data: list[dict], meta: dict | None = None) -> dict:
+    """Wrap raw DB rows in an envelope matching the public shape but with no trim.
+
+    When *meta* is provided the before-envelope carries the same metadata as the
+    after-envelope so the token delta isolates the ``data`` field difference only.
+    """
+    return {"ok": True, "data": data, "error": None, "meta": meta if meta is not None else {}}
 
 
 def _count_tokens_for_tool_result(client: Any, payload: dict) -> int:
@@ -136,7 +140,7 @@ def test_query_latest_token_delta(
     if not raw:
         pytest.skip("competitive_snapshots has no UK rows — trim measurement is meaningless")
     after_env = amz_api.query_latest(marketplace="UK")
-    before_env = _envelope_untrimmed(raw)
+    before_env = _envelope_untrimmed(raw, meta=after_env.get("meta", {}))
 
     before = _count_tokens_for_tool_result(anthropic_client, before_env)
     after = _count_tokens_for_tool_result(anthropic_client, after_env)
@@ -156,7 +160,7 @@ def test_query_ranking_token_delta(
     if not raw:
         pytest.skip("no BSR ranking rows for UK — trim measurement is meaningless")
     after_env = amz_api.query_ranking(marketplace="UK")
-    before_env = _envelope_untrimmed(raw)
+    before_env = _envelope_untrimmed(raw, meta=after_env.get("meta", {}))
 
     before = _count_tokens_for_tool_result(anthropic_client, before_env)
     after = _count_tokens_for_tool_result(anthropic_client, after_env)
@@ -177,7 +181,7 @@ def test_query_availability_token_delta(
     if not raw:
         pytest.skip("no availability rows — trim measurement is meaningless")
     after_env = amz_api.query_availability()
-    before_env = _envelope_untrimmed(raw)
+    before_env = _envelope_untrimmed(raw, meta=after_env.get("meta", {}))
 
     before = _count_tokens_for_tool_result(anthropic_client, before_env)
     after = _count_tokens_for_tool_result(anthropic_client, after_env)
@@ -202,7 +206,7 @@ def test_query_compare_token_delta(
     after_env = amz_api.query_compare(product=model)
     with open_db(real_db) as conn:
         raw = query_cross_market(conn, model)
-    before_env = _envelope_untrimmed(raw)
+    before_env = _envelope_untrimmed(raw, meta=after_env.get("meta", {}))
 
     before = _count_tokens_for_tool_result(anthropic_client, before_env)
     after = _count_tokens_for_tool_result(anthropic_client, after_env)
@@ -246,7 +250,7 @@ def test_query_trends_token_delta(
         }
         for r in raw
     ]
-    before_env = _envelope_untrimmed(dated)
+    before_env = _envelope_untrimmed(dated, meta=after_env.get("meta", {}))
 
     before = _count_tokens_for_tool_result(anthropic_client, before_env)
     after = _count_tokens_for_tool_result(anthropic_client, after_env)
@@ -281,7 +285,7 @@ def test_query_sellers_token_delta(
         }
         for r in raw
     ]
-    before_env = _envelope_untrimmed(dated)
+    before_env = _envelope_untrimmed(dated, meta=after_env.get("meta", {}))
 
     before = _count_tokens_for_tool_result(anthropic_client, before_env)
     after = _count_tokens_for_tool_result(anthropic_client, after_env)
@@ -301,7 +305,7 @@ def test_query_deals_token_delta(
     if not raw:
         pytest.skip("no deals rows for UK — trim measurement is meaningless")
     after_env = amz_api.query_deals(marketplace="UK", auto_fetch=False)
-    before_env = _envelope_untrimmed(raw)
+    before_env = _envelope_untrimmed(raw, meta=after_env.get("meta", {}))
 
     before = _count_tokens_for_tool_result(anthropic_client, before_env)
     after = _count_tokens_for_tool_result(anthropic_client, after_env)
