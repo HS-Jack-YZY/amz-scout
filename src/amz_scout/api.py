@@ -228,12 +228,29 @@ def _resolve_asin(
     4. Failure: raises ValueError
     """
     # Level 1: SQLite registry (most authoritative)
+    db_warnings: list[str] = []
     if conn is not None:
         from amz_scout.db import find_product
 
         row = find_product(conn, query_str, marketplace)
         if row and row.get("asin"):
             return row["asin"], row["model"], row.get("brand", ""), "db", []
+        # Product exists but no ASIN for this marketplace — check other markets
+        if row and row.get("id") and marketplace:
+            others = conn.execute(
+                "SELECT asin, marketplace FROM product_asins "
+                "WHERE product_id = ? LIMIT 5",
+                (row["id"],),
+            ).fetchall()
+            if others:
+                known = ", ".join(
+                    f"{r['asin']} ({r['marketplace']})" for r in others
+                )
+                db_warnings.append(
+                    f"Product '{row['model']}' found in registry but has no "
+                    f"ASIN for {marketplace}. Known: {known}. "
+                    "Use discover_asin() to find the correct ASIN."
+                )
 
     # Level 2: config product list (substring match)
     query_lower = query_str.lower()
@@ -280,6 +297,8 @@ def _resolve_asin(
 
         return candidate, candidate, "", "asin", warnings
 
+    if db_warnings:
+        raise ValueError(f"Product not found: {query_str}. {db_warnings[0]}")
     raise ValueError(f"Product not found: {query_str}")
 
 

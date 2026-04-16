@@ -1594,10 +1594,16 @@ def find_product(
 
     # Model, search_keywords, or Keepa title substring match
     like = f"%{query_str}%"
-    sql = """
+    if marketplace:
+        join_on = "p.id = pa.product_id AND pa.marketplace = ?"
+        params: list = [marketplace, like, like, like]
+    else:
+        join_on = "p.id = pa.product_id"
+        params: list = [like, like, like]
+    sql = f"""
         SELECT p.id, p.category, p.brand, p.model, pa.asin, pa.marketplace
         FROM products p
-        LEFT JOIN product_asins pa ON p.id = pa.product_id
+        LEFT JOIN product_asins pa ON {join_on}
         WHERE (
             p.model LIKE ?
             OR p.search_keywords LIKE ?
@@ -1607,12 +1613,8 @@ def find_product(
                 WHERE pa2.product_id = p.id AND kp.title LIKE ?
             )
         )
+        LIMIT 1
     """
-    params: list = [like, like, like]
-    if marketplace:
-        sql += " AND pa.marketplace = ?"
-        params.append(marketplace)
-    sql += " LIMIT 1"
     row = conn.execute(sql, params).fetchone()
     return dict(row) if row else None
 

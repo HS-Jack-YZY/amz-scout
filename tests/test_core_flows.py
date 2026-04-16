@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from amz_scout.db import (
+    find_product,
     init_schema,
     register_asin,
     register_product,
@@ -566,3 +567,48 @@ class TestRegisterMarketAsins:
         assert row["asin"] == "B0UK000001"  # unchanged
         assert row["status"] == "verified"  # unchanged
         c.close()
+
+
+# ─── P0: find_product cross-market resolution ───────────────────────
+
+
+class TestFindProductCrossMarket:
+    """Test that find_product returns product even when target marketplace has no ASIN."""
+
+    def test_finds_product_when_marketplace_has_asin(self, conn):
+        """Standard case: product has ASIN for requested marketplace."""
+        pid, _ = register_product(conn, "Router", "GL.iNet", "Slate 7")
+        register_asin(conn, pid, "UK", "B0UK_FIND01")
+
+        row = find_product(conn, "Slate 7", marketplace="UK")
+        assert row is not None
+        assert row["asin"] == "B0UK_FIND01"
+        assert row["marketplace"] == "UK"
+
+    def test_finds_product_when_marketplace_has_no_asin(self, conn):
+        """Product registered for UK, queried for DE — should still return the product."""
+        pid, _ = register_product(conn, "Router", "GL.iNet", "Slate 7")
+        register_asin(conn, pid, "UK", "B0UK_FIND02")
+
+        row = find_product(conn, "Slate 7", marketplace="DE")
+        assert row is not None
+        assert row["model"] == "Slate 7"
+        assert row["brand"] == "GL.iNet"
+        assert row["id"] == pid
+        # ASIN should be NULL since DE has no registration
+        assert row["asin"] is None
+        assert row["marketplace"] is None
+
+    def test_returns_none_when_product_not_exists(self, conn):
+        """Completely unknown product should return None."""
+        row = find_product(conn, "NonExistentProduct", marketplace="UK")
+        assert row is None
+
+    def test_no_marketplace_returns_any_asin(self, conn):
+        """Without marketplace filter, should return any available ASIN."""
+        pid, _ = register_product(conn, "Router", "GL.iNet", "Slate 7")
+        register_asin(conn, pid, "UK", "B0UK_FIND03")
+
+        row = find_product(conn, "Slate 7")
+        assert row is not None
+        assert row["asin"] == "B0UK_FIND03"
