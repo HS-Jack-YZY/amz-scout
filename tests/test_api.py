@@ -1034,3 +1034,87 @@ class TestApiEnvelopeCompleteness:
     # marker-based regression test could not detect the leak. The webapp
     # boundary test ``TestWebappTrimBoundary`` is sufficient guard for this
     # tool's LLM-facing path.
+
+
+# ─── Resolve ASIN status gate (plan: product_asins.status cleanup) ──
+
+
+class TestResolveAsinStatusGate:
+    """Cover query lifecycle matrix #10 (not_listed silent failure) and
+    #12 (wrong_product unchecked on ASIN pass-through)."""
+
+    def _setup_db(self, tmp_path):
+        db_path = tmp_path / "status_gate.db"
+        c = sqlite3.connect(str(db_path))
+        c.row_factory = sqlite3.Row
+        init_schema(c)
+        pid, _ = register_product(c, "Router", "TestBrand", "TestModel")
+        register_asin(c, pid, "UK", "B0DEADXXX1", status="not_listed", notes="")
+        register_asin(c, pid, "DE", "B0WRONG001", status="wrong_product", notes="")
+        register_asin(c, pid, "FR", "B0GOOD0001", status="verified", notes="")
+        c.close()
+        return db_path
+
+    def test_raises_on_not_listed_asin_pass_through(self, tmp_path):
+        db_path = self._setup_db(tmp_path)
+        c = sqlite3.connect(str(db_path))
+        c.row_factory = sqlite3.Row
+        with pytest.raises(ValueError, match="not_listed"):
+            _resolve_asin([], "B0DEADXXX1", marketplace="UK", conn=c)
+        c.close()
+
+    def test_raises_on_wrong_product_asin_pass_through(self, tmp_path):
+        db_path = self._setup_db(tmp_path)
+        c = sqlite3.connect(str(db_path))
+        c.row_factory = sqlite3.Row
+        with pytest.raises(ValueError, match="wrong_product"):
+            _resolve_asin([], "B0WRONG001", marketplace="DE", conn=c)
+        c.close()
+
+    def test_passes_for_verified_asin(self, tmp_path):
+        db_path = self._setup_db(tmp_path)
+        c = sqlite3.connect(str(db_path))
+        c.row_factory = sqlite3.Row
+        asin, _model, _brand, _source, _warnings = _resolve_asin(
+            [], "B0GOOD0001", marketplace="FR", conn=c
+        )
+        assert asin == "B0GOOD0001"
+        c.close()
+
+    def test_query_filter_excludes_not_listed_in_load_products(self, tmp_path):
+        from amz_scout.db import load_products_from_db
+
+        db_path = self._setup_db(tmp_path)
+        c = sqlite3.connect(str(db_path))
+        c.row_factory = sqlite3.Row
+        products_uk = load_products_from_db(c, marketplace="UK")
+        assert products_uk == []
+        products_fr = load_products_from_db(c, marketplace="FR")
+        assert len(products_fr) == 1
+        assert products_fr[0].marketplace_overrides["FR"]["asin"] == "B0GOOD0001"
+        c.close()
+
+    def test_query_envelope_failure_for_not_listed(self, tmp_path, monkeypatch):
+        """End-to-end: query_trends on a not_listed ASIN returns ok=False."""
+        from pathlib import Path as _Path
+
+        import amz_scout.api as api_mod
+        from amz_scout.api import _ProjectInfo
+
+        db_path = self._setup_db(tmp_path)
+
+        def fake_ctx(project=None, **_kw):
+            return _ProjectInfo(
+                config=None,
+                marketplaces={},
+                products=[],
+                db_path=db_path,
+                output_base=_Path("output"),
+                marketplace_aliases={"uk": "UK"},
+            )
+
+        monkeypatch.setattr(api_mod, "_resolve_context", fake_ctx)
+        r = query_trends(product="B0DEADXXX1", marketplace="UK", auto_fetch=False)
+        assert r["ok"] is False
+        assert "not_listed" in r["error"]
+        assert r["data"] == []

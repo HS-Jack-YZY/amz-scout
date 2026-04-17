@@ -99,6 +99,53 @@ cli.py  ────────────────────────
 
 9 tables: **Data**: `competitive_snapshots` (browser), `keepa_time_series` (price arrays), `keepa_buybox_history`, `keepa_coupon_history`, `keepa_deals`, `keepa_products` (metadata + fetch_mode). **Product registry**: `products`, `product_asins` (per-marketplace ASIN + status), `product_tags`. Series types 0-35 follow Keepa's csv[] indices; 100 = monthly_sold, 200+ = category rankings.
 
+## ASIN Status Semantics
+
+`product_asins.status` (since schema v5) is a 4-value enum, not a state machine.
+Transitions are largely free; the column records the **last validation conclusion**.
+
+### Values
+
+| Value | Meaning | Typical Trigger |
+|-------|---------|-----------------|
+| `unverified` | Registered but not yet validated against Keepa title | Default on insert; `add_product`, `discover_asin`, `_auto_register_from_keepa` |
+| `verified` | Keepa title matches expected brand+model | `validate_asins()` match |
+| `wrong_product` | Keepa title disagrees with brand+model (mis-mapped ASIN) | `validate_asins()` mismatch |
+| `not_listed` | Keepa returned empty title (ASIN dead/removed) | `_try_mark_not_listed()`, `validate_asins()` empty title path |
+
+### Query Gate
+
+`_resolve_asin` and `load_products_from_db` reject `wrong_product` and `not_listed`,
+raising structured errors instead of returning empty data. This prevents the
+silent-failure bug where users would see "no data for marketplace" when the
+real cause was a dead ASIN.
+
+### State Diagram
+
+```mermaid
+stateDiagram-v2
+    [*] --> unverified: register / discover / auto-register
+    unverified --> verified: validate_asins title match
+    unverified --> wrong_product: validate_asins title mismatch
+    unverified --> not_listed: validate / fetch returns empty title
+    verified --> wrong_product: re-validate after Amazon swap
+    verified --> not_listed: product delisted
+    wrong_product --> verified: corrected + re-validate
+    not_listed --> verified: product re-listed + re-validate
+    not_listed --> unverified: manual retry via discover
+```
+
+### Single Write Entry Point
+
+All status mutations should go through `update_asin_status()` (db.py).
+Direct SQL updates bypass `last_checked` / `updated_at` bookkeeping.
+
+### What's NOT in this column
+
+- **Monitoring on/off per user** — will live in a future `user_product_subscriptions` table (Phase 3)
+- **Validation freshness (stale)** — derive from `last_checked` timestamp at query time
+- **Transition guards** — none enforced in code; relying on `update_asin_status` discipline
+
 ## Config Structure
 
 - `config/marketplaces.yaml` — 13 marketplace definitions (domain, Keepa codes, currency, region, postcode). **Only required YAML file.**

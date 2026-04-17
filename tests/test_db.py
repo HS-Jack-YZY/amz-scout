@@ -62,11 +62,11 @@ class TestSchema:
     def test_init_schema_idempotent(self, conn):
         init_schema(conn)  # Second call should not raise
         row = conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()
-        assert row[0] == 4  # v1 + v2 + v3 + v4
+        assert row[0] == 5  # v1 + v2 + v3 + v4 + v5
 
     def test_schema_version(self, conn):
         row = conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()
-        assert row[0] == 4
+        assert row[0] == 5
 
 
 # ─── Keepa write tests ──────────────────────────────────────────────
@@ -358,3 +358,133 @@ class TestDataIntegrity:
 
         actual = conn.execute("SELECT COUNT(*) FROM keepa_coupon_history").fetchone()[0]
         assert actual == expected
+
+
+# ─── Schema v5 migration tests ───────────────────────────────────────
+
+
+class TestStatusMigrationV5:
+    """Verify schema v5 migration: drop zombie 'unavailable' status."""
+
+    def test_v5_check_constraint_rejects_unavailable(self, conn):
+        from amz_scout.db import register_product
+
+        pid, _ = register_product(conn, "Router", "Test", "M1")
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO product_asins (product_id, marketplace, asin, status) "
+                "VALUES (?, 'UK', 'B0AAAAAAAA', 'unavailable')",
+                (pid,),
+            )
+
+    def test_v5_check_constraint_accepts_four_values(self, conn):
+        from amz_scout.db import register_product
+
+        pid, _ = register_product(conn, "Router", "Test", "M2")
+        statuses = ["unverified", "verified", "wrong_product", "not_listed"]
+        for i, status in enumerate(statuses):
+            conn.execute(
+                "INSERT INTO product_asins (product_id, marketplace, asin, status) "
+                "VALUES (?, ?, ?, ?)",
+                (pid, f"MK{i}", f"B0BBBB{i:04d}", status),
+            )
+
+    def test_v5_idempotent(self, conn):
+        init_schema(conn)  # second call
+        row = conn.execute(
+            "SELECT COUNT(*) AS c FROM schema_migrations WHERE version = 5"
+        ).fetchone()
+        assert row["c"] == 1
+
+    def test_v5_preserves_existing_rows(self, tmp_path):
+        """Exercise the v4 → v5 migration: existing rows and the asin index
+        must survive the rename → create → insert-select → drop → index rebuild.
+
+        Setup forcibly downgrades a fresh DB to v4 shape (old 5-value CHECK
+        including 'unavailable', no v5 migration record) so that the second
+        ``init_schema`` call triggers the real v5 migration code path.
+        Monkey-patching ``SCHEMA_VERSION`` alone is insufficient because
+        ``_SCHEMA_SQL`` unconditionally seeds the v5 migration record.
+        """
+        import amz_scout.db as db_mod
+        from amz_scout.db import register_asin, register_product
+
+        db_path = tmp_path / "v4tov5.db"
+
+        # Step 1: fresh init, then forcibly downgrade to v4 shape.
+        c0 = sqlite3.connect(str(db_path))
+        c0.row_factory = sqlite3.Row
+        init_schema(c0)
+        c0.execute("DELETE FROM schema_migrations WHERE version = 5")
+        c0.execute("ALTER TABLE product_asins RENAME TO _pa_tmp")
+        c0.execute("""
+            CREATE TABLE product_asins (
+                product_id  INTEGER NOT NULL
+                    REFERENCES products(id) ON DELETE CASCADE,
+                marketplace TEXT NOT NULL,
+                asin        TEXT NOT NULL,
+                status      TEXT NOT NULL DEFAULT 'unverified'
+                    CHECK(status IN (
+                        'unverified','verified','wrong_product',
+                        'not_listed','unavailable'
+                    )),
+                notes       TEXT NOT NULL DEFAULT '',
+                last_checked TEXT,
+                created_at  TEXT NOT NULL
+                    DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                updated_at  TEXT NOT NULL
+                    DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                PRIMARY KEY (product_id, marketplace)
+            )
+        """)
+        c0.execute("INSERT INTO product_asins SELECT * FROM _pa_tmp")
+        c0.execute("DROP TABLE _pa_tmp")
+        # Drop the index too so we can assert v5 recreates it.
+        c0.execute("DROP INDEX IF EXISTS idx_pa_asin")
+        c0.commit()
+
+        # Step 2: write test data under the v4-shape table.
+        pid, _ = register_product(c0, "R", "B", "M")
+        register_asin(
+            c0, pid, "UK", "B0SURVIVE1", status="verified", notes="kept"
+        )
+        c0.close()
+
+        # Clear the schema-init cache so init_schema re-runs _migrate.
+        db_mod._schema_initialized.discard(str(db_path))
+
+        # Step 3: reopen — v5 migration should now run for real.
+        c2 = sqlite3.connect(str(db_path))
+        c2.row_factory = sqlite3.Row
+        init_schema(c2)
+
+        # Data survived the table rebuild.
+        row = c2.execute(
+            "SELECT asin, status, notes FROM product_asins WHERE marketplace = 'UK'"
+        ).fetchone()
+        assert row["asin"] == "B0SURVIVE1"
+        assert row["status"] == "verified"
+        assert row["notes"] == "kept"
+
+        # Index recreated by the migration.
+        idx = c2.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='index' AND name='idx_pa_asin'"
+        ).fetchone()
+        assert idx is not None, "v5 migration must recreate idx_pa_asin"
+
+        # Migration record inserted.
+        version = c2.execute(
+            "SELECT MAX(version) AS v FROM schema_migrations"
+        ).fetchone()
+        assert version["v"] == 5
+
+        # Tightened CHECK is in force: 'unavailable' now rejected.
+        with pytest.raises(sqlite3.IntegrityError):
+            c2.execute(
+                "INSERT INTO product_asins "
+                "(product_id, marketplace, asin, status) "
+                "VALUES (?, 'XX', 'B0ZZZZZZZZ', 'unavailable')",
+                (pid,),
+            )
+        c2.close()

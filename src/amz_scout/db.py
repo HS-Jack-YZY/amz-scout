@@ -102,7 +102,7 @@ SERIES_NAMES = {
     100: "MONTHLY_SOLD",
 }
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 # ─── Connection management ────────────────────────────────────────────
 
@@ -264,6 +264,82 @@ def _migrate(conn: sqlite3.Connection) -> None:
                     "VALUES (4, 'add fetch_mode to keepa_products')"
                 )
                 logger.info("Migrated schema to version 4")
+
+            if current < 5:
+                # v5: drop zombie 'unavailable' status; tighten CHECK to 4 values.
+                # SQLite cannot ALTER CHECK constraints — rebuild the table.
+
+                # Sanity check: defensive against undocumented writes.
+                bad = conn.execute(
+                    "SELECT COUNT(*) AS c FROM product_asins "
+                    "WHERE status = 'unavailable'"
+                ).fetchone()
+                if bad and bad["c"] > 0:
+                    raise RuntimeError(
+                        f"Migration v5: found {bad['c']} rows with "
+                        "status='unavailable'. These rows were never written "
+                        "by current code (zombie status). To proceed:\n"
+                        "  UPDATE product_asins SET status='not_listed' "
+                        "WHERE status='unavailable';\n"
+                        "Then re-run init_schema() to complete v5."
+                    )
+
+                # Rebuild table with tightened CHECK.
+                conn.execute(
+                    "ALTER TABLE product_asins RENAME TO product_asins_v4_old"
+                )
+                conn.execute("""
+                    CREATE TABLE product_asins (
+                        product_id      INTEGER NOT NULL
+                            REFERENCES products(id) ON DELETE CASCADE,
+                        marketplace     TEXT NOT NULL,
+                        asin            TEXT NOT NULL,
+                        -- Status semantics (see docs/DEVELOPER.md
+                        -- "ASIN Status Semantics"):
+                        --   unverified    : registered but not yet
+                        --                   validated against Keepa title
+                        --   verified      : Keepa title matches expected
+                        --                   brand+model
+                        --   wrong_product : Keepa title disagrees with
+                        --                   brand+model (mis-mapped ASIN)
+                        --   not_listed    : Keepa returned empty title
+                        --                   (ASIN dead/removed on Amazon)
+                        -- Phase A queries reject 'wrong_product' and
+                        -- 'not_listed' to prevent silent empty results.
+                        status          TEXT NOT NULL DEFAULT 'unverified'
+                            CHECK(status IN (
+                                'unverified','verified',
+                                'wrong_product','not_listed'
+                            )),
+                        notes           TEXT NOT NULL DEFAULT '',
+                        last_checked    TEXT,
+                        created_at      TEXT NOT NULL
+                            DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                        updated_at      TEXT NOT NULL
+                            DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                        PRIMARY KEY (product_id, marketplace)
+                    )
+                """)
+                conn.execute(
+                    "INSERT INTO product_asins "
+                    "(product_id, marketplace, asin, status, notes, "
+                    "last_checked, created_at, updated_at) "
+                    "SELECT product_id, marketplace, asin, status, notes, "
+                    "last_checked, created_at, updated_at "
+                    "FROM product_asins_v4_old"
+                )
+                conn.execute("DROP TABLE product_asins_v4_old")
+                conn.execute(
+                    "CREATE INDEX idx_pa_asin ON product_asins(asin)"
+                )
+
+                conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations "
+                    "(version, description) VALUES "
+                    "(5, 'drop zombie unavailable status from "
+                    "product_asins.CHECK')"
+                )
+                logger.info("Migrated schema to version 5")
     except Exception:
         logger.exception(
             "Schema migration failed at version %d. Database may need manual repair.",
@@ -283,6 +359,8 @@ INSERT INTO schema_migrations (version, description)
     VALUES (2, 'add project column to competitive_snapshots');
 INSERT INTO schema_migrations (version, description) VALUES (3, 'add product registry tables');
 INSERT INTO schema_migrations (version, description) VALUES (4, 'add fetch_mode to keepa_products');
+INSERT INTO schema_migrations (version, description)
+    VALUES (5, 'drop zombie unavailable status from product_asins.CHECK');
 
 CREATE TABLE competitive_snapshots (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -437,9 +515,15 @@ CREATE TABLE product_asins (
     product_id      INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
     marketplace     TEXT NOT NULL,
     asin            TEXT NOT NULL,
+    -- Status semantics (see docs/DEVELOPER.md "ASIN Status Semantics"):
+    --   unverified    : registered but not yet validated against Keepa title
+    --   verified      : Keepa title matches expected brand+model
+    --   wrong_product : Keepa title disagrees with brand+model (mis-mapped ASIN)
+    --   not_listed    : Keepa returned empty title (ASIN dead/removed on Amazon)
+    -- Phase A queries reject 'wrong_product' and 'not_listed' to prevent silent empty results.
     status          TEXT NOT NULL DEFAULT 'unverified'
                     CHECK(status IN (
-                        'unverified','verified','wrong_product','not_listed','unavailable'
+                        'unverified','verified','wrong_product','not_listed'
                     )),
     notes           TEXT NOT NULL DEFAULT '',
     last_checked    TEXT,
@@ -1459,7 +1543,9 @@ def load_products_from_db(
 
     if marketplace:
         joins.append("JOIN product_asins pa ON p.id = pa.product_id")
-        wheres.append("pa.marketplace = ? AND pa.status != 'wrong_product'")
+        wheres.append(
+            "pa.marketplace = ? AND pa.status NOT IN ('wrong_product', 'not_listed')"
+        )
         params.append(marketplace)
 
     if category:
@@ -1485,7 +1571,7 @@ def load_products_from_db(
     asin_rows = conn.execute(
         f"SELECT product_id, marketplace, asin, status "
         f"FROM product_asins WHERE product_id IN ({placeholders}) "
-        f"AND status != 'wrong_product'",
+        f"AND status NOT IN ('wrong_product', 'not_listed')",
         product_ids,
     ).fetchall()
 

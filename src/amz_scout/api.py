@@ -213,6 +213,28 @@ def _resolve_context(
     )
 
 
+def _check_asin_status_gate(
+    conn: sqlite3.Connection, asin: str, marketplace: str
+) -> None:
+    """Raise ValueError if (asin, marketplace) is registered with a blocking status.
+
+    Blocks 'wrong_product' and 'not_listed' to prevent silent-empty-data
+    queries (query-lifecycle-matrix #10 / #12). Called from both
+    find_product and raw-ASIN branches of _resolve_asin as
+    defense-in-depth over load_products_from_db's WHERE filter.
+    """
+    row = conn.execute(
+        "SELECT status FROM product_asins WHERE asin = ? AND marketplace = ?",
+        (asin, marketplace),
+    ).fetchone()
+    if row and row["status"] in ("wrong_product", "not_listed"):
+        raise ValueError(
+            f"ASIN {asin} for {marketplace} is marked '{row['status']}'. "
+            "Run discover_asin() for a valid ASIN, or update_asin_status() "
+            "if this was misclassified."
+        )
+
+
 def _resolve_asin(
     products: list[Product],
     query_str: str,
@@ -234,6 +256,8 @@ def _resolve_asin(
 
         row = find_product(conn, query_str, marketplace)
         if row and row.get("asin"):
+            if row.get("marketplace"):
+                _check_asin_status_gate(conn, row["asin"], row["marketplace"])
             return row["asin"], row["model"], row.get("brand", ""), "db", []
         # Product exists but no ASIN for this marketplace — check other markets
         if row and row.get("id") and marketplace:
@@ -263,6 +287,9 @@ def _resolve_asin(
     candidate = query_str.upper().strip()
     if _ASIN_RE.match(candidate):
         warnings: list[str] = []
+
+        if conn is not None and marketplace:
+            _check_asin_status_gate(conn, candidate, marketplace)
 
         # Soft warning for non-B-prefix ASINs (likely books/media ISBN)
         if not candidate.startswith("B"):
@@ -325,7 +352,7 @@ def _auto_fetch(
     info: _ProjectInfo,
     products: list[Product],
     sites: list[str],
-) -> dict:
+) -> dict[str, Any]:
     """Opportunistic LAZY fetch; failures are logged but never block the query."""
     try:
         from amz_scout.freshness import FreshnessStrategy
@@ -389,7 +416,7 @@ def _add_dates(rows: list[dict]) -> list[dict]:
 # ─── Public: project discovery ───────────────────────────────────────
 
 
-def resolve_project(project: str) -> dict:
+def resolve_project(project: str) -> ApiResponse:
     """Discover project configuration: products, marketplaces, settings.
 
     Returns envelope with data containing project name, product list,
@@ -431,7 +458,7 @@ def resolve_product(
     project: str | None = None,
     query_str: str = "",
     marketplace: str | None = None,
-) -> dict:
+) -> ApiResponse:
     """Resolve a product query string to ASIN and model info.
 
     Accepts model names (substring match), ASIN strings, or brand+model
@@ -464,7 +491,7 @@ def query_latest(
     project: str | None = None,
     marketplace: str | None = None,
     category: str | None = None,
-) -> dict:
+) -> ApiResponse:
     """Latest competitive snapshot per product/site."""
     try:
         info = _resolve_context(project, marketplace=marketplace, category=category)
@@ -485,7 +512,7 @@ def query_trends(
     series: str = "new",
     days: int = 90,
     auto_fetch: bool = True,
-) -> dict:
+) -> ApiResponse:
     """Price/data time series for one product on one marketplace.
 
     When *auto_fetch* is True (default), missing Keepa data is fetched
@@ -587,7 +614,7 @@ def query_trends(
     )
 
 
-def query_compare(project: str | None = None, product: str = "") -> dict:
+def query_compare(project: str | None = None, product: str = "") -> ApiResponse:
     """Compare one product across all marketplaces (latest snapshot)."""
     try:
         info = _resolve_context(project)
@@ -604,7 +631,7 @@ def query_ranking(
     project: str | None = None,
     marketplace: str = "UK",
     category: str | None = None,
-) -> dict:
+) -> ApiResponse:
     """Products ranked by BSR for a marketplace."""
     try:
         info = _resolve_context(project, marketplace=marketplace, category=category)
@@ -618,7 +645,7 @@ def query_ranking(
     return _envelope(True, data=rows, hint_if_empty=BROWSER_QUERY_HINT, count=len(rows))
 
 
-def query_availability(project: str | None = None) -> dict:
+def query_availability(project: str | None = None) -> ApiResponse:
     """Availability matrix: all products across all sites."""
     try:
         info = _resolve_context(project)
@@ -636,7 +663,7 @@ def query_sellers(
     product: str = "",
     marketplace: str = "UK",
     auto_fetch: bool = True,
-) -> dict:
+) -> ApiResponse:
     """Buy Box seller history for one product.
 
     When *auto_fetch* is True (default), missing Keepa data is fetched
@@ -692,7 +719,7 @@ def query_deals(
     project: str | None = None,
     marketplace: str | None = None,
     auto_fetch: bool = True,
-) -> dict:
+) -> ApiResponse:
     """Deal/promotion history.
 
     When *auto_fetch* is True (default), missing Keepa data is fetched
@@ -737,7 +764,7 @@ def ensure_keepa_data(
     max_age_days: int = 7,
     detailed: bool = False,
     confirm: bool = False,
-) -> dict:
+) -> ApiResponse:
     """Ensure Keepa data exists in the database, fetching if needed.
 
     Default strategy is ``"lazy"``: use cached data no matter how old,
@@ -889,7 +916,7 @@ def check_freshness(
     project: str | None = None,
     marketplace: str | None = None,
     product: str | None = None,
-) -> dict:
+) -> ApiResponse:
     """Check Keepa data freshness without fetching anything."""
     try:
         from amz_scout.freshness import (
@@ -928,7 +955,7 @@ def check_freshness(
     return _envelope(True, data=matrix, sites=sites, count=len(matrix))
 
 
-def keepa_budget() -> dict:
+def keepa_budget() -> ApiResponse:
     """Check Keepa API token balance."""
     try:
         from amz_scout.scraper.keepa import KeepaClient
@@ -967,7 +994,7 @@ def list_products(
     marketplace: str | None = None,
     tag: str | None = None,
     db_path: Path | str | None = None,
-) -> dict:
+) -> ApiResponse:
     """List all registered products with optional filters."""
     try:
         from amz_scout.db import list_registered_products
@@ -996,7 +1023,7 @@ def add_product(
     search_keywords: str = "",
     tag: str | None = None,
     db_path: Path | str | None = None,
-) -> dict:
+) -> ApiResponse:
     """Register a new product and optionally set ASIN mappings.
 
     *asins* is a dict mapping marketplace codes to ASINs,
@@ -1044,7 +1071,7 @@ def remove_product_by_model(
     brand: str,
     model: str,
     db_path: Path | str | None = None,
-) -> dict:
+) -> ApiResponse:
     """Remove a product by exact brand + model match."""
     try:
         from amz_scout.db import find_product_exact
@@ -1071,7 +1098,7 @@ def update_product_asin(
     status: str = "unverified",
     notes: str = "",
     db_path: Path | str | None = None,
-) -> dict:
+) -> ApiResponse:
     """Set or update the ASIN for a product on a specific marketplace."""
     try:
         from amz_scout.db import find_product_exact, register_asin
@@ -1101,7 +1128,7 @@ def update_product_asin(
 def get_pending_markets(
     product_id: int,
     db_path: Path | str | None = None,
-) -> dict:
+) -> ApiResponse:
     """Return Keepa-supported markets where this product has no ASIN registered yet.
 
     Returns a dict with ``pending`` (list of market codes to search) and
@@ -1141,7 +1168,7 @@ def register_market_asins(
     product_id: int,
     asins: dict[str, str],
     db_path: Path | str | None = None,
-) -> dict:
+) -> ApiResponse:
     """Batch-register ASINs for multiple marketplaces under an existing product.
 
     *asins* maps marketplace codes to ASINs,
@@ -1190,7 +1217,7 @@ def import_yaml(
     project_config: str,
     tag: str | None = None,
     db_path: Path | str | None = None,
-) -> dict:
+) -> ApiResponse:
     """Import products from a YAML config file into the product registry.
 
     Each product is registered with ASINs for all target marketplaces.
@@ -1240,7 +1267,7 @@ def import_yaml(
     )
 
 
-def sync_registry(db_path: Path | str | None = None) -> dict:
+def sync_registry(db_path: Path | str | None = None) -> ApiResponse:
     """Register orphan ASINs from keepa_products into the product registry.
 
     Scans ``keepa_products`` for entries not yet in ``product_asins`` and
@@ -1271,7 +1298,7 @@ def sync_registry(db_path: Path | str | None = None) -> dict:
 def validate_asins(
     marketplace: str | None = None,
     db_path: Path | str | None = None,
-) -> dict:
+) -> ApiResponse:
     """Validate unverified ASINs by checking Keepa product title against brand+model.
 
     For each unverified ASIN, checks if ``keepa_products.title`` exists and
@@ -1434,6 +1461,12 @@ def _run_discover_batch(
             headed=headed,
             db_path=db_path,
         )
+        dr_data = dr["data"]
+        new_asin = (
+            dr_data.get("asin")
+            if dr["ok"] and isinstance(dr_data, dict)
+            else None
+        )
         results.append(
             {
                 "brand": brand,
@@ -1441,7 +1474,7 @@ def _run_discover_batch(
                 "marketplace": mp,
                 "old_asin": c.get("old_asin", ""),
                 "ok": dr["ok"],
-                "new_asin": dr["data"].get("asin") if dr["ok"] else None,
+                "new_asin": new_asin,
                 "error": dr.get("error"),
             }
         )
@@ -1455,7 +1488,7 @@ def validate_and_discover(
     auto_discover: bool = False,
     headed: bool = False,
     db_path: Path | str | None = None,
-) -> dict:
+) -> ApiResponse:
     """Validate ASINs and optionally discover replacements for bad ones.
 
     1. Runs ``validate_asins()`` to check all unverified ASINs.
@@ -1522,7 +1555,7 @@ def batch_discover(
     candidates: list[dict],
     headed: bool = False,
     db_path: Path | str | None = None,
-) -> dict:
+) -> ApiResponse:
     """Execute ASIN discovery for a list of candidates.
 
     Each candidate dict must have: ``brand``, ``model``, ``marketplace``.
@@ -1547,7 +1580,7 @@ def discover_asin(
     search_keywords: str = "",
     headed: bool = False,
     db_path: Path | str | None = None,
-) -> dict:
+) -> ApiResponse:
     """Search Amazon to find the correct ASIN for a product on a marketplace.
 
     This is a **slow** operation (10-30 seconds) that launches a browser.

@@ -299,5 +299,16 @@ Keepa 数据写入 DB
 
 ---
 
+## Phase 3 Open Questions (from product_asins.status cleanup, 2026-04-17)
+
+- **Monitoring toggle column placement**: per-user "paused monitoring" — extend `product_asins.status` vs new `user_product_subscriptions` table?
+- **Validation freshness state**: independent `stale` status vs derived from `last_checked` timestamp at query time?
+- **State transition enforcement**: keep `update_asin_status()` single-entry discipline, vs Python Enum + transition table?
+
+> Source: `.claude/PRPs/reports/query-lifecycle-matrix.md` + council verdict.
+> Decision deferred until Phase 3 multi-user schema is concrete.
+
+---
+
 *Generated: 2026-04-16*
 *Status: DRAFT — awaiting Q1/Q2 验证（EAN 覆盖率 + 跨品牌冲突检查）*
