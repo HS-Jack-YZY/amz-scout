@@ -310,5 +310,62 @@ Keepa 数据写入 DB
 
 ---
 
+## Decision: Remove Intent Validation from `product_asins.status` (2026-04-17)
+
+### 背景
+
+v5 migration 刚把 status 从 5 值收紧到 4 值（`unverified` / `verified` / `wrong_product` / `not_listed`）。进一步讨论后发现：在当前 **单用户 (Jack) + 交互式查询 + MVP 阶段** 的前提下，`verified` 和 `wrong_product` 两个状态是 over-engineering。
+
+### 论点
+
+**错误源头分类**：
+- **Intent error**（用户输入歧义 ASIN/model，拿到"错"产品）→ 用户自己是源头；交互式场景下用户**能从 Keepa title 实时发现并修正查询**，系统做预防性拦截价值低、成本高（需要跑 `validate_asins()`）
+- **Availability error**（Amazon 下架 ASIN，返回空数据）→ 用户是受害者；错误源头在外部系统，用户**无法从交互自己察觉**（空 data 是多义的：下架 vs 市场不卖 vs 未抓取）。这类错误需要系统显式标记
+
+**设计原则**：每次新增 status 值或 validate 步骤前先问"错误源头是谁？交互式用户能自查吗？"— 只对用户无法自查或非交互场景投资自动化拦截机制。
+
+### 决策
+
+**砍掉意图验证，保留可用性验证**。将 `product_asins.status` 简化为 **2 值 enum** 或改为 **布尔字段 `is_listed`**（方案选择留到 plan 阶段）：
+
+| 值 | 含义 | 写入触发 |
+|---|---|---|
+| `active` (default) | 可正常查询；未被观察到下架 | 默认插入值 |
+| `not_listed` | 观察到 Keepa 返回空 title + 无 csv | `_try_mark_not_listed()` 自动 |
+
+**删除的行为**：
+- `validate_asins()` 函数（~100 行）
+- `verified` / `wrong_product` / `unverified` 三个状态值
+- CLI `amz-scout validate` 子命令
+- API `validate_asins` / `validate_and_discover` 端点（保留 discover）
+
+**保留的行为**：
+- `_try_mark_not_listed` 自动标记
+- Query gate 逻辑（只拒绝 `not_listed`）
+- `discover_asin()` 浏览器找 ASIN 功能
+- `update_asin_status()` 作为 status 单入口写入
+
+### 对 Phase 3 的影响
+
+多用户场景下"信任边界"应该下放到 `user_product_subscriptions`（每用户 opt-in），而不是回到 registry 层做 intent 验证。即未来多用户也**不会**复活 verified/wrong_product — 这个决策与 Phase 3 方向是正交的。
+
+### 实战验证计划
+
+删除后用一段时间（1-2 周）观察：
+1. 交互式查询中 intent error 是否能靠 title 快速自修正
+2. 批量 YAML 导入是否需要一次性 sanity check（可另做 `import_yaml(validate_only=True)`）
+3. Not-listed 覆盖率是否够用
+
+如果需要恢复 intent 验证，改回方向应是 **EAN/UPC 匹配** 而非 title 启发式（参考 `_find_product_by_ean` 已有的跨市场绑定逻辑）。
+
+### 本次 v5 migration 的兼容性
+
+v5 迁移的代码改动（query gate 扩展 + `_resolve_asin` status gate）绝大部分可复用 — 只需把条件从 `status IN ('wrong_product', 'not_listed')` 收紧为 `status = 'not_listed'`，其他无需改动。
+
+> Source: 2026-04-17 对话追溯。
+> Next step: `/everything-claude-code:prp-plan` 生成 v6 migration + validate 代码路径删除的具体实施计划。
+
+---
+
 *Generated: 2026-04-16*
-*Status: DRAFT — Q1/Q2 verified 2026-04-17. Phases 1 & 2 complete; Phase 3 unblocked.*
+*Status: DRAFT — Q1/Q2 verified 2026-04-17. Phases 1 & 2 complete; Phase 3 unblocked. Intent-validation removal decision 2026-04-17.*

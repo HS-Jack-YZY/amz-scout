@@ -415,7 +415,6 @@ def _save_discovered_asin(db_conn, product: Product, site: str, asin: str) -> bo
                 row["id"],
                 site,
                 asin,
-                status="unverified",
                 notes="discovered via browser search",
             )
             return True

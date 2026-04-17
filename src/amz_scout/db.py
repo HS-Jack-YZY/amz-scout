@@ -102,7 +102,7 @@ SERIES_NAMES = {
     100: "MONTHLY_SOLD",
 }
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 # ─── Connection management ────────────────────────────────────────────
 
@@ -340,6 +340,70 @@ def _migrate(conn: sqlite3.Connection) -> None:
                     "product_asins.CHECK')"
                 )
                 logger.info("Migrated schema to version 5")
+
+            if current < 6:
+                # v6: remove intent validation — collapse status to 2 values.
+                # Map legacy statuses:
+                #   'unverified', 'verified', 'wrong_product' -> 'active'
+                #   'not_listed'                              -> 'not_listed'
+                # SQLite cannot ALTER CHECK — rebuild the table and map
+                # statuses in a single INSERT ... SELECT CASE so the new
+                # CHECK never sees a disallowed legacy value.
+
+                conn.execute(
+                    "ALTER TABLE product_asins RENAME TO product_asins_v5_old"
+                )
+                conn.execute("""
+                    CREATE TABLE product_asins (
+                        product_id      INTEGER NOT NULL
+                            REFERENCES products(id) ON DELETE CASCADE,
+                        marketplace     TEXT NOT NULL,
+                        asin            TEXT NOT NULL,
+                        -- Status semantics (since v6):
+                        --   active      : default; queryable; not observed
+                        --                 as delisted
+                        --   not_listed  : Keepa returned empty title +
+                        --                 no csv data (ASIN dead/removed
+                        --                 on Amazon)
+                        -- No intent validation — trust user input + Keepa
+                        -- identity.  See docs/DEVELOPER.md
+                        -- "ASIN Status Semantics".
+                        status          TEXT NOT NULL DEFAULT 'active'
+                            CHECK(status IN ('active', 'not_listed')),
+                        notes           TEXT NOT NULL DEFAULT '',
+                        last_checked    TEXT,
+                        created_at      TEXT NOT NULL
+                            DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                        updated_at      TEXT NOT NULL
+                            DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                        PRIMARY KEY (product_id, marketplace)
+                    )
+                """)
+                conn.execute("""
+                    INSERT INTO product_asins
+                        (product_id, marketplace, asin, status, notes,
+                         last_checked, created_at, updated_at)
+                    SELECT
+                        product_id, marketplace, asin,
+                        CASE
+                            WHEN status = 'not_listed' THEN 'not_listed'
+                            ELSE 'active'
+                        END AS status,
+                        notes, last_checked, created_at, updated_at
+                    FROM product_asins_v5_old
+                """)
+                conn.execute("DROP TABLE product_asins_v5_old")
+                conn.execute(
+                    "CREATE INDEX idx_pa_asin ON product_asins(asin)"
+                )
+
+                conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations "
+                    "(version, description) VALUES "
+                    "(6, 'remove intent validation: "
+                    "status -> active/not_listed')"
+                )
+                logger.info("Migrated schema to version 6")
     except Exception:
         logger.exception(
             "Schema migration failed at version %d. Database may need manual repair.",
@@ -361,6 +425,8 @@ INSERT INTO schema_migrations (version, description) VALUES (3, 'add product reg
 INSERT INTO schema_migrations (version, description) VALUES (4, 'add fetch_mode to keepa_products');
 INSERT INTO schema_migrations (version, description)
     VALUES (5, 'drop zombie unavailable status from product_asins.CHECK');
+INSERT INTO schema_migrations (version, description)
+    VALUES (6, 'remove intent validation: status -> active/not_listed');
 
 CREATE TABLE competitive_snapshots (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -515,16 +581,12 @@ CREATE TABLE product_asins (
     product_id      INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
     marketplace     TEXT NOT NULL,
     asin            TEXT NOT NULL,
-    -- Status semantics (see docs/DEVELOPER.md "ASIN Status Semantics"):
-    --   unverified    : registered but not yet validated against Keepa title
-    --   verified      : Keepa title matches expected brand+model
-    --   wrong_product : Keepa title disagrees with brand+model (mis-mapped ASIN)
-    --   not_listed    : Keepa returned empty title (ASIN dead/removed on Amazon)
-    -- Phase A queries reject 'wrong_product' and 'not_listed' to prevent silent empty results.
-    status          TEXT NOT NULL DEFAULT 'unverified'
-                    CHECK(status IN (
-                        'unverified','verified','wrong_product','not_listed'
-                    )),
+    -- Status semantics (since v6; see docs/DEVELOPER.md "ASIN Status Semantics"):
+    --   active      : default; queryable; not observed as delisted
+    --   not_listed  : Keepa returned empty title + no csv (ASIN dead/removed)
+    -- No intent validation — trust user input + Keepa identity.
+    status          TEXT NOT NULL DEFAULT 'active'
+                    CHECK(status IN ('active', 'not_listed')),
     notes           TEXT NOT NULL DEFAULT '',
     last_checked    TEXT,
     created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
@@ -591,7 +653,7 @@ def _try_register_product(
         return None
 
     product_id, is_new = register_product(conn, category, brand, model)
-    register_asin(conn, product_id, site, asin, status="unverified")
+    register_asin(conn, product_id, site, asin)
 
     logger.info(
         "%s %s/%s → product %d (%s %s)",
@@ -686,7 +748,7 @@ def _bind_asin_to_product(
     Registers the ASIN, looks up product metadata, logs the binding,
     and returns a result dict with ``match_type='ean'``.
     """
-    register_asin(conn, product_id, site, asin, status="unverified")
+    register_asin(conn, product_id, site, asin)
     prod = conn.execute(
         "SELECT brand, model, category FROM products WHERE id = ?",
         (product_id,),
@@ -1395,7 +1457,7 @@ def register_asin(
     product_id: int,
     marketplace: str,
     asin: str,
-    status: str = "unverified",
+    status: str = "active",
     notes: str = "",
 ) -> None:
     """Set or update the ASIN for a product on a marketplace."""
@@ -1544,7 +1606,7 @@ def load_products_from_db(
     if marketplace:
         joins.append("JOIN product_asins pa ON p.id = pa.product_id")
         wheres.append(
-            "pa.marketplace = ? AND pa.status NOT IN ('wrong_product', 'not_listed')"
+            "pa.marketplace = ? AND pa.status != 'not_listed'"
         )
         params.append(marketplace)
 
@@ -1571,7 +1633,7 @@ def load_products_from_db(
     asin_rows = conn.execute(
         f"SELECT product_id, marketplace, asin, status "
         f"FROM product_asins WHERE product_id IN ({placeholders}) "
-        f"AND status NOT IN ('wrong_product', 'not_listed')",
+        f"AND status != 'not_listed'",
         product_ids,
     ).fetchall()
 
@@ -1621,25 +1683,6 @@ def update_asin_status(
             "WHERE product_id = ? AND marketplace = ?",
             (status, notes, product_id, marketplace),
         )
-
-
-def get_unverified_asins(
-    conn: sqlite3.Connection,
-    marketplace: str | None = None,
-) -> list[dict]:
-    """Return product/ASIN pairs with status 'unverified'."""
-    sql = """
-        SELECT p.id AS product_id, p.brand, p.model, pa.marketplace, pa.asin
-        FROM products p
-        JOIN product_asins pa ON p.id = pa.product_id
-        WHERE pa.status = 'unverified'
-    """
-    params: list = []
-    if marketplace:
-        sql += " AND pa.marketplace = ?"
-        params.append(marketplace)
-    sql += " ORDER BY p.brand, p.model, pa.marketplace"
-    return [dict(r) for r in conn.execute(sql, params)]
 
 
 def find_product_exact(

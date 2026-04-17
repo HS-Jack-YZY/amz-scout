@@ -24,8 +24,6 @@ User asks about product data
   │   ├─ "刷新数据" / "更新"        → ensure_keepa_data(marketplace=, strategy="fresh")
   │   ├─ "数据新鲜度"              → check_freshness()
   │   ├─ "Keepa token 余额"       → keepa_budget()
-  │   ├─ "验证 ASIN"              → validate_asins(marketplace=)
-  │   ├─ "验证并发现"              → validate_and_discover(marketplace=)
   │   └─ "同步注册表"              → sync_registry()
   │
   ├─ 产品注册表管理
@@ -40,16 +38,18 @@ User asks about product data
       └─ "批量搜索 ASIN"           → batch_discover(candidates=[...])
 ```
 
+> Intent 验证（判断 ASIN 是否对应用户想要的产品）自 v6 起不再由系统预校验。用户从查询返回的 Keepa `title` 自查；误配时改用 `discover_asin()` 或补全更精确的 brand/model。
+
 ### Calling the API
 
 ```python
 from amz_scout.api import (
     query_latest, query_trends, query_compare, query_ranking,
     query_availability, query_sellers, query_deals,
-    ensure_keepa_data, check_freshness, keepa_budget, validate_asins, sync_registry,
+    ensure_keepa_data, check_freshness, keepa_budget, sync_registry,
     list_products, add_product, remove_product_by_model, update_product_asin,
     register_market_asins, get_pending_markets, import_yaml, discover_asin,
-    validate_and_discover, batch_discover, resolve_product,
+    batch_discover, resolve_product,
 )
 ```
 
@@ -87,7 +87,7 @@ r = check_freshness()
 7. **Price encoding**: value÷100=价格（分→元）。Rating×10（45=4.5★）。rank 原始整数。-1=不可用。
 8. **Product registry**: 身份管理系统（跨市场 ASIN 关联），注册≠监控。三种注册：`add_product()` / `import_yaml()` / Keepa 写入自动注册。
 9. **project 参数**: `str | None = None`。None→SQLite，字符串→旧 YAML 路径。
-10. **ASIN 验证**: `validate_and_discover(marketplace=)` 一站式。确认后 `batch_discover()`。
+10. **ASIN 下架检测**: `ensure_keepa_data()` post-fetch 自动把空 title + 无 csv 的 ASIN 标记为 `not_listed`；查询门会拒绝。无需显式 validate。**Intent 错配**（拿到的产品不是用户想要的）由用户看返回 Keepa title 自查自修，不在系统侧预校验。
 11. **绝不猜测 ASIN**: 不在注册表→问用户或用 `discover_asin()`。直接给 ASIN 查询会自动 fetch+注册。
 12. **禁止直接调用 Keepa API**: 所有 Keepa 操作必须通过 `amz_scout.api`。找 ASIN 优先级：(1) 问用户 → (2) WebSearch 搜 Amazon URL → (3) `discover_asin()`。违规导致 60 token 耗尽，阻塞 1 小时。
 13. **product_tags 暂不使用**: 过滤用 `category` / `brand` / `marketplace`。

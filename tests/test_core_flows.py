@@ -4,7 +4,6 @@ Covers:
 - I5: ensure_keepa_data confirmation flow (phase="needs_confirmation")
 - I6: _auto_register_from_keepa (register when brand+title present, skip when empty)
 - I7: query_trends new_product flag logic
-- I8: validate_and_discover phase transitions
 """
 
 import sqlite3
@@ -88,7 +87,7 @@ class TestAutoRegisterFromKeepa:
             ("B0TEST12345", "UK"),
         ).fetchone()
         assert row is not None
-        assert row["status"] == "unverified"
+        assert row["status"] == "active"
 
     def test_skips_when_brand_empty(self, conn):
         """Product with empty brand should NOT be auto-registered."""
@@ -369,134 +368,6 @@ class TestQueryTrendsNewProduct:
         # The product was already registered above, so resolution should find it
 
 
-# ─── I8: validate_and_discover phase transitions ──────────────────────
-
-
-class TestValidateAndDiscoverPhases:
-    """Test the three-phase flow of validate_and_discover."""
-
-    @patch("amz_scout.api.validate_asins")
-    def test_all_verified_no_suggestions(self, mock_validate):
-        from amz_scout.api import validate_and_discover
-
-        mock_validate.return_value = {
-            "ok": True,
-            "data": [
-                {
-                    "brand": "GL.iNet",
-                    "model": "Slate 7",
-                    "marketplace": "UK",
-                    "asin": "B0F2MR53D6",
-                    "status": "verified",
-                    "reason": "title matches",
-                },
-            ],
-            "error": None,
-            "meta": {"verified": 1, "not_listed": 0, "wrong_product": 0},
-        }
-
-        r = validate_and_discover(marketplace="UK")
-
-        assert r["ok"] is True
-        assert r["meta"]["phase"] == "validate"
-        assert "nothing to discover" in r["meta"]["message"].lower()
-
-    @patch("amz_scout.api.validate_asins")
-    def test_suggestions_return_pending_confirmation(self, mock_validate):
-        from amz_scout.api import validate_and_discover
-
-        mock_validate.return_value = {
-            "ok": True,
-            "data": [
-                {
-                    "brand": "GL.iNet",
-                    "model": "Slate 7",
-                    "marketplace": "UK",
-                    "asin": "B0WRONG001",
-                    "status": "not_listed",
-                    "reason": "no title in Keepa",
-                },
-                {
-                    "brand": "ASUS",
-                    "model": "RT-BE58",
-                    "marketplace": "UK",
-                    "asin": "B0FGDRP3VZ",
-                    "status": "verified",
-                    "reason": "title matches",
-                },
-            ],
-            "error": None,
-            "meta": {"verified": 1, "not_listed": 1, "wrong_product": 0},
-        }
-
-        r = validate_and_discover(marketplace="UK", auto_discover=False)
-
-        assert r["ok"] is True
-        assert r["meta"]["phase"] == "pending_confirmation"
-        assert len(r["meta"]["discover_pending"]) == 1
-        assert r["meta"]["discover_pending"][0]["old_asin"] == "B0WRONG001"
-
-    @patch("amz_scout.api.validate_asins")
-    def test_propagates_validation_error(self, mock_validate):
-        from amz_scout.api import validate_and_discover
-
-        mock_validate.return_value = {
-            "ok": False,
-            "data": [],
-            "error": "DB connection failed",
-            "meta": {},
-        }
-
-        r = validate_and_discover(marketplace="UK")
-
-        assert r["ok"] is False
-        assert "DB connection failed" in r["error"]
-
-    @patch("amz_scout.api._run_discover_batch")
-    @patch("amz_scout.api.validate_asins")
-    def test_auto_discover_runs_batch(self, mock_validate, mock_batch):
-        from amz_scout.api import validate_and_discover
-
-        mock_validate.return_value = {
-            "ok": True,
-            "data": [
-                {
-                    "brand": "GL.iNet",
-                    "model": "Slate 7",
-                    "marketplace": "UK",
-                    "asin": "B0WRONG001",
-                    "status": "wrong_product",
-                    "reason": "title mismatch",
-                },
-            ],
-            "error": None,
-            "meta": {"verified": 0, "not_listed": 0, "wrong_product": 1},
-        }
-
-        mock_batch.return_value = (
-            [
-                {
-                    "brand": "GL.iNet",
-                    "model": "Slate 7",
-                    "marketplace": "UK",
-                    "old_asin": "B0WRONG001",
-                    "new_asin": "B0CORRECT1",
-                    "ok": True,
-                }
-            ],
-            1,
-            0,
-        )
-
-        r = validate_and_discover(marketplace="UK", auto_discover=True)
-
-        assert r["ok"] is True
-        assert r["meta"]["phase"] == "discovered"
-        assert r["meta"]["discovered"] == 1
-        assert r["meta"]["failed"] == 0
-        mock_batch.assert_called_once()
-
-
 # ─── Additional: get_pending_markets and register_market_asins ────────
 
 
@@ -543,7 +414,7 @@ class TestRegisterMarketAsins:
         init_schema(c)
 
         pid, _ = register_product(c, "Router", "TestBrand", "TestModel")
-        register_asin(c, pid, "UK", "B0UK000001", status="verified")
+        register_asin(c, pid, "UK", "B0UK000001", status="active")
         c.close()
 
         r = register_market_asins(
@@ -565,7 +436,7 @@ class TestRegisterMarketAsins:
             (pid,),
         ).fetchone()
         assert row["asin"] == "B0UK000001"  # unchanged
-        assert row["status"] == "verified"  # unchanged
+        assert row["status"] == "active"  # unchanged
         c.close()
 
 

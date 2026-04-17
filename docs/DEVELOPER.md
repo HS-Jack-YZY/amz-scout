@@ -101,38 +101,39 @@ cli.py  ────────────────────────
 
 ## ASIN Status Semantics
 
-`product_asins.status` (since schema v5) is a 4-value enum, not a state machine.
-Transitions are largely free; the column records the **last validation conclusion**.
+`product_asins.status` (since schema v6) is a 2-value enum. It tracks
+**Amazon availability**, not user intent validation.
 
 ### Values
 
 | Value | Meaning | Typical Trigger |
 |-------|---------|-----------------|
-| `unverified` | Registered but not yet validated against Keepa title | Default on insert; `add_product`, `discover_asin`, `_auto_register_from_keepa` |
-| `verified` | Keepa title matches expected brand+model | `validate_asins()` match |
-| `wrong_product` | Keepa title disagrees with brand+model (mis-mapped ASIN) | `validate_asins()` mismatch |
-| `not_listed` | Keepa returned empty title (ASIN dead/removed) | `_try_mark_not_listed()`, `validate_asins()` empty title path |
+| `active` | Default; queryable. Registered and not observed as delisted. | Default on insert; `add_product`, `discover_asin`, `_auto_register_from_keepa`, `register_asin` |
+| `not_listed` | Observed empty-title response from Keepa (ASIN dead/removed on Amazon) | `_try_mark_not_listed()` during `ensure_keepa_data` post-fetch validation |
+
+### Design Principle — Intent vs Availability
+
+- **Intent errors** (user supplies ambiguous / wrong ASIN / model) → user's
+  own input is the source; interactive users can spot the mismatch from the
+  returned Keepa title and correct their query. No automated pre-validation
+  needed.
+- **Availability errors** (Amazon delisted the product) → external system is
+  the source; user cannot tell "empty data" from "market-unavailable data"
+  without a system signal. `not_listed` serves this purpose.
 
 ### Query Gate
 
-`_resolve_asin` and `load_products_from_db` reject `wrong_product` and `not_listed`,
-raising structured errors instead of returning empty data. This prevents the
-silent-failure bug where users would see "no data for marketplace" when the
-real cause was a dead ASIN.
+`_resolve_asin` and `load_products_from_db` reject only `not_listed` —
+`active` rows pass through. This prevents the silent-failure bug where
+users would see "no data" when the real cause was a dead ASIN.
 
 ### State Diagram
 
 ```mermaid
 stateDiagram-v2
-    [*] --> unverified: register / discover / auto-register
-    unverified --> verified: validate_asins title match
-    unverified --> wrong_product: validate_asins title mismatch
-    unverified --> not_listed: validate / fetch returns empty title
-    verified --> wrong_product: re-validate after Amazon swap
-    verified --> not_listed: product delisted
-    wrong_product --> verified: corrected + re-validate
-    not_listed --> verified: product re-listed + re-validate
-    not_listed --> unverified: manual retry via discover
+    [*] --> active: register / discover / auto-register
+    active --> not_listed: ensure_keepa_data post-fetch observes empty title + no csv
+    not_listed --> active: manual recovery via update_asin_status after re-listing
 ```
 
 ### Single Write Entry Point
@@ -140,11 +141,15 @@ stateDiagram-v2
 All status mutations should go through `update_asin_status()` (db.py).
 Direct SQL updates bypass `last_checked` / `updated_at` bookkeeping.
 
-### What's NOT in this column
+### What's NOT in this column (deferred to Phase 3)
 
-- **Monitoring on/off per user** — will live in a future `user_product_subscriptions` table (Phase 3)
-- **Validation freshness (stale)** — derive from `last_checked` timestamp at query time
-- **Transition guards** — none enforced in code; relying on `update_asin_status` discipline
+- **Monitoring on/off per user** — will live in a future
+  `user_product_subscriptions` table
+- **Validation freshness (stale)** — derive from `last_checked` timestamp at
+  query time
+- **Intent validation** — removed in v6; rely on interactive user review of
+  Keepa titles. If future scale requires automation, use EAN/UPC matching
+  (see `_find_product_by_ean`) rather than title fuzzy matching
 
 ## Config Structure
 

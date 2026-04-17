@@ -30,13 +30,11 @@ from amz_scout.api import (
     resolve_product,
     resolve_project,
     update_product_asin,
-    validate_asins,
 )
 from amz_scout.db import (
     init_schema,
     register_asin,
     register_product,
-    store_keepa_product,
     upsert_competitive,
 )
 from amz_scout.models import CompetitiveData, Product
@@ -681,12 +679,12 @@ class TestUpdateProductAsin:
             "Model3",
             "UK",
             "B0STATUS01",
-            status="verified",
-            notes="confirmed on amazon.co.uk",
+            status="not_listed",
+            notes="observed delisted on amazon.co.uk",
             db_path=test_db,
         )
         assert r["ok"] is True
-        assert r["data"]["status"] == "verified"
+        assert r["data"]["status"] == "not_listed"
 
 
 class TestImportYaml:
@@ -837,75 +835,6 @@ class TestQueryWithoutProject:
         assert r["ok"] is True
 
 
-# ─── ASIN validation tests ──────────────────────────────────────────
-
-
-class TestValidateAsins:
-    def test_no_keepa_data_stays_unverified(self, test_db):
-        """Products without Keepa data should remain unverified."""
-        add_product("Router", "NoBrand", "NoData", asins={"UK": "B0NODATA01"}, db_path=test_db)
-        r = validate_asins(marketplace="UK", db_path=test_db)
-        assert r["ok"] is True
-        skipped = [x for x in r["data"] if x["status"] == "unverified"]
-        assert len(skipped) >= 1
-
-    def test_matching_title_verifies(self, test_db):
-        """Product with matching Keepa title should be verified."""
-        with sqlite3.connect(str(test_db)) as conn:
-            conn.row_factory = sqlite3.Row
-            init_schema(conn)
-            pid, _ = register_product(conn, "Router", "GL.iNet", "Slate 7 Test")
-            register_asin(conn, pid, "UK", "B0VERIFYME")
-            # Simulate Keepa data with matching title
-            store_keepa_product(
-                conn,
-                "B0VERIFYME",
-                "UK",
-                {"title": "GL.iNet Slate 7 WiFi Travel Router"},
-                "2026-04-01",
-            )
-
-        r = validate_asins(marketplace="UK", db_path=test_db)
-        verified = [x for x in r["data"] if x["asin"] == "B0VERIFYME"]
-        assert len(verified) == 1
-        assert verified[0]["status"] == "verified"
-
-    def test_mismatched_title_marks_wrong_product(self, test_db):
-        """Product with non-matching title should be marked wrong_product."""
-        with sqlite3.connect(str(test_db)) as conn:
-            conn.row_factory = sqlite3.Row
-            init_schema(conn)
-            pid, _ = register_product(conn, "Router", "GL.iNet", "Slate 7 Mismatch")
-            register_asin(conn, pid, "UK", "B0WRONGPRD")
-            store_keepa_product(
-                conn, "B0WRONGPRD", "UK", {"title": "USB-C Hub Adapter Multiport"}, "2026-04-01"
-            )
-
-        r = validate_asins(marketplace="UK", db_path=test_db)
-        wrong = [x for x in r["data"] if x["asin"] == "B0WRONGPRD"]
-        assert len(wrong) == 1
-        assert wrong[0]["status"] == "wrong_product"
-
-    def test_empty_title_marks_not_listed(self, test_db):
-        """Product with empty Keepa title should be marked not_listed."""
-        with sqlite3.connect(str(test_db)) as conn:
-            conn.row_factory = sqlite3.Row
-            init_schema(conn)
-            pid, _ = register_product(conn, "Router", "GL.iNet", "NotListed Test")
-            register_asin(conn, pid, "UK", "B0NOTLISTD")
-            store_keepa_product(conn, "B0NOTLISTD", "UK", {"title": None}, "2026-04-01")
-
-        r = validate_asins(marketplace="UK", db_path=test_db)
-        not_listed = [x for x in r["data"] if x["asin"] == "B0NOTLISTD"]
-        assert len(not_listed) == 1
-        assert not_listed[0]["status"] == "not_listed"
-
-    def test_empty_db_returns_empty(self, test_db):
-        r = validate_asins(db_path=test_db)
-        assert r["ok"] is True
-        assert r["data"] == []
-
-
 class TestDiscoverAsin:
     def test_unknown_marketplace_returns_error(self):
         from amz_scout.api import discover_asin
@@ -1040,8 +969,11 @@ class TestApiEnvelopeCompleteness:
 
 
 class TestResolveAsinStatusGate:
-    """Cover query lifecycle matrix #10 (not_listed silent failure) and
-    #12 (wrong_product unchecked on ASIN pass-through)."""
+    """Cover query lifecycle matrix #10 (not_listed silent failure).
+
+    v6 removed intent validation — the wrong_product gate no longer
+    exists; only the not_listed availability gate remains.
+    """
 
     def _setup_db(self, tmp_path):
         db_path = tmp_path / "status_gate.db"
@@ -1050,8 +982,7 @@ class TestResolveAsinStatusGate:
         init_schema(c)
         pid, _ = register_product(c, "Router", "TestBrand", "TestModel")
         register_asin(c, pid, "UK", "B0DEADXXX1", status="not_listed", notes="")
-        register_asin(c, pid, "DE", "B0WRONG001", status="wrong_product", notes="")
-        register_asin(c, pid, "FR", "B0GOOD0001", status="verified", notes="")
+        register_asin(c, pid, "FR", "B0GOOD0001", status="active", notes="")
         c.close()
         return db_path
 
@@ -1063,15 +994,7 @@ class TestResolveAsinStatusGate:
             _resolve_asin([], "B0DEADXXX1", marketplace="UK", conn=c)
         c.close()
 
-    def test_raises_on_wrong_product_asin_pass_through(self, tmp_path):
-        db_path = self._setup_db(tmp_path)
-        c = sqlite3.connect(str(db_path))
-        c.row_factory = sqlite3.Row
-        with pytest.raises(ValueError, match="wrong_product"):
-            _resolve_asin([], "B0WRONG001", marketplace="DE", conn=c)
-        c.close()
-
-    def test_passes_for_verified_asin(self, tmp_path):
+    def test_passes_for_active_asin(self, tmp_path):
         db_path = self._setup_db(tmp_path)
         c = sqlite3.connect(str(db_path))
         c.row_factory = sqlite3.Row
