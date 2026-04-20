@@ -381,6 +381,19 @@ def _auto_fetch(
         return {"auto_fetched": False, "auto_fetch_error": True, "auto_fetch_detail": str(e)}
 
 
+def _auto_fetch_stale_warning(fetch_meta: dict[str, Any]) -> str | None:
+    """Return a user-facing warning when ``_auto_fetch`` swallowed a failure.
+
+    ``summarize_for_llm`` only forwards ``meta['warnings']`` to the LLM, so the
+    ``auto_fetch_error`` flag alone is invisible downstream. Callers append the
+    returned string to their warnings list to surface the freshness caveat.
+    """
+    if not fetch_meta.get("auto_fetch_error"):
+        return None
+    detail = fetch_meta.get("auto_fetch_detail") or "unknown error"
+    return f"Keepa auto-fetch failed ({detail}); results may be stale."
+
+
 def _try_mark_not_listed(
     conn: sqlite3.Connection,
     asin: str,
@@ -598,6 +611,10 @@ def query_trends(
         logger.exception("query_trends failed")
         return _envelope(False, error=str(e))
 
+    stale_warning = _auto_fetch_stale_warning(fetch_meta)
+    if stale_warning:
+        resolve_warnings.append(stale_warning)
+
     meta_extra: dict = {}
     if resolve_warnings:
         meta_extra["warnings"] = resolve_warnings
@@ -703,6 +720,10 @@ def query_sellers(
         logger.exception("query_sellers failed")
         return _envelope(False, error=str(e))
 
+    stale_warning = _auto_fetch_stale_warning(fetch_meta)
+    if stale_warning:
+        resolve_warnings.append(stale_warning)
+
     meta_extra: dict = {}
     if resolve_warnings:
         meta_extra["warnings"] = resolve_warnings
@@ -750,7 +771,14 @@ def query_deals(
         logger.exception("query_deals failed")
         return _envelope(False, error=str(e))
 
-    return _envelope(True, data=rows, count=len(rows), **fetch_meta)
+    resolve_warnings: list[str] = []
+    stale_warning = _auto_fetch_stale_warning(fetch_meta)
+    if stale_warning:
+        resolve_warnings.append(stale_warning)
+    meta_extra: dict = {}
+    if resolve_warnings:
+        meta_extra["warnings"] = resolve_warnings
+    return _envelope(True, data=rows, count=len(rows), **fetch_meta, **meta_extra)
 
 
 # ─── Public: Keepa data management ──────────────────────────────────

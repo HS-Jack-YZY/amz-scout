@@ -510,6 +510,65 @@ class TestAutoFetch:
         assert "auto_fetched" not in r["meta"]
 
 
+class TestAutoFetchErrorWarnings:
+    """Bug B (issue #13): when `_auto_fetch` catches a Keepa failure and sets
+    ``auto_fetch_error`` in meta, the calling query must surface that signal
+    into ``meta["warnings"]`` so the LLM-facing summary (which allowlists
+    ``warnings`` but drops unknown meta keys) sees the freshness caveat.
+
+    These tests patch ``amz_scout.keepa_service.get_keepa_data`` — the
+    function is imported inside ``_auto_fetch``'s try block every call, so
+    the patch must target the source module.
+    """
+
+    def _boom(self, *_a, **_kw):
+        raise RuntimeError("HTTP 429 rate limited")
+
+    def test_query_trends_auto_fetch_error_surfaces_as_warning(
+        self, config_dir, monkeypatch
+    ):
+        _, proj_path = config_dir
+        monkeypatch.setattr("amz_scout.keepa_service.get_keepa_data", self._boom)
+
+        r = query_trends(proj_path, product="Slate 7", marketplace="UK")
+        warnings = r["meta"].get("warnings") or []
+        assert any("auto-fetch failed" in w.lower() for w in warnings), (
+            f"Bug B regression: auto_fetch_error did not reach envelope warnings. "
+            f"meta={r['meta']!r}"
+        )
+        assert r["meta"].get("auto_fetch_error") is True, (
+            "Backward-compat: legacy meta flag must still be present"
+        )
+
+    def test_query_sellers_auto_fetch_error_surfaces_as_warning(
+        self, config_dir, monkeypatch
+    ):
+        _, proj_path = config_dir
+        monkeypatch.setattr("amz_scout.keepa_service.get_keepa_data", self._boom)
+
+        r = query_sellers(proj_path, product="Slate 7", marketplace="UK")
+        warnings = r["meta"].get("warnings") or []
+        assert any("auto-fetch failed" in w.lower() for w in warnings), (
+            f"Bug B regression: auto_fetch_error did not reach envelope warnings. "
+            f"meta={r['meta']!r}"
+        )
+        assert r["meta"].get("auto_fetch_error") is True
+
+    def test_query_deals_auto_fetch_error_surfaces_as_warning(
+        self, config_dir, monkeypatch
+    ):
+        _, proj_path = config_dir
+        monkeypatch.setattr("amz_scout.keepa_service.get_keepa_data", self._boom)
+
+        r = query_deals(proj_path, marketplace="UK")
+        warnings = r["meta"].get("warnings") or []
+        assert any("auto-fetch failed" in w.lower() for w in warnings), (
+            f"Bug B regression: auto_fetch_error did not reach envelope warnings. "
+            f"meta={r['meta']!r}"
+        )
+        assert r["meta"].get("auto_fetch_error") is True
+
+
 class TestMarketplaceAliasInQueries:
     def test_trends_with_alias(self, config_dir):
         _, proj_path = config_dir

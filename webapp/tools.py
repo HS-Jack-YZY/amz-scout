@@ -20,6 +20,7 @@ inside the summary) and as a regression safety valve; ``check_freshness`` /
 decorator.
 """
 
+import asyncio
 import functools
 import logging
 from collections.abc import Callable
@@ -294,7 +295,9 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
 async def _step_query_latest(marketplace: str, category: str | None = None) -> ApiResponse:
     """Chainlit step wrapper that shows tool inputs/outputs in the UI."""
     logger.info("query_latest called: marketplace=%s category=%s", marketplace, category)
-    return _api_query_latest(marketplace=marketplace, category=category)
+    return await asyncio.to_thread(
+        _api_query_latest, marketplace=marketplace, category=category
+    )
 
 
 @cl.step(type="tool", name="check_freshness")
@@ -302,13 +305,15 @@ async def _step_check_freshness(
     marketplace: str | None = None, product: str | None = None
 ) -> ApiResponse:
     logger.info("check_freshness called: marketplace=%s product=%s", marketplace, product)
-    return _api_check_freshness(marketplace=marketplace, product=product)
+    return await asyncio.to_thread(
+        _api_check_freshness, marketplace=marketplace, product=product
+    )
 
 
 @cl.step(type="tool", name="keepa_budget")
 async def _step_keepa_budget() -> ApiResponse:
     logger.info("keepa_budget called")
-    return _api_keepa_budget()
+    return await asyncio.to_thread(_api_keepa_budget)
 
 
 @cl.step(type="tool", name="query_availability")
@@ -321,7 +326,7 @@ async def _step_keepa_budget() -> ApiResponse:
 )
 async def _step_query_availability() -> ApiResponse:
     logger.info("query_availability called")
-    return _api_query_availability()
+    return await asyncio.to_thread(_api_query_availability)
 
 
 @cl.step(type="tool", name="query_compare")
@@ -334,7 +339,7 @@ async def _step_query_availability() -> ApiResponse:
 )
 async def _step_query_compare(product: str) -> ApiResponse:
     logger.info("query_compare called: product=%s", product)
-    return _api_query_compare(product=product)
+    return await asyncio.to_thread(_api_query_compare, product=product)
 
 
 @cl.step(type="tool", name="query_deals")
@@ -349,7 +354,7 @@ async def _step_query_compare(product: str) -> ApiResponse:
 )
 async def _step_query_deals(marketplace: str | None = None) -> ApiResponse:
     logger.info("query_deals called: marketplace=%s", marketplace)
-    return _api_query_deals(marketplace=marketplace)
+    return await asyncio.to_thread(_api_query_deals, marketplace=marketplace)
 
 
 @cl.step(type="tool", name="query_ranking")
@@ -362,7 +367,9 @@ async def _step_query_deals(marketplace: str | None = None) -> ApiResponse:
 )
 async def _step_query_ranking(marketplace: str, category: str | None = None) -> ApiResponse:
     logger.info("query_ranking called: marketplace=%s category=%s", marketplace, category)
-    return _api_query_ranking(marketplace=marketplace, category=category)
+    return await asyncio.to_thread(
+        _api_query_ranking, marketplace=marketplace, category=category
+    )
 
 
 @cl.step(type="tool", name="query_sellers")
@@ -375,7 +382,9 @@ async def _step_query_ranking(marketplace: str, category: str | None = None) -> 
 )
 async def _step_query_sellers(product: str, marketplace: str = "UK") -> ApiResponse:
     logger.info("query_sellers called: product=%s marketplace=%s", product, marketplace)
-    return _api_query_sellers(product=product, marketplace=marketplace)
+    return await asyncio.to_thread(
+        _api_query_sellers, product=product, marketplace=marketplace
+    )
 
 
 @cl.step(type="tool", name="query_trends")
@@ -404,7 +413,13 @@ async def _step_query_trends(
         series,
         days,
     )
-    return _api_query_trends(product=product, marketplace=marketplace, series=series, days=days)
+    return await asyncio.to_thread(
+        _api_query_trends,
+        product=product,
+        marketplace=marketplace,
+        series=series,
+        days=days,
+    )
 
 
 async def dispatch_tool(name: str, args: dict) -> ApiResponse:
