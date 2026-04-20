@@ -961,7 +961,7 @@ class TestRegisterProductConcurrency:
     def _run_workers(self, db_path, variants):
         import threading
 
-        results: list[tuple[int, bool] | BaseException | None] = [None] * len(variants)
+        results: list[tuple[int, bool] | Exception | None] = [None] * len(variants)
 
         def worker(i, brand, model):
             c = sqlite3.connect(str(db_path), timeout=5.0)
@@ -970,7 +970,7 @@ class TestRegisterProductConcurrency:
             try:
                 from amz_scout.db import register_product
                 results[i] = register_product(c, "Router", brand, model)
-            except BaseException as exc:
+            except Exception as exc:
                 results[i] = exc
             finally:
                 c.close()
@@ -994,6 +994,7 @@ class TestRegisterProductConcurrency:
 
         db_path = tmp_path / "concurrency.db"
         c0 = sqlite3.connect(str(db_path))
+        c0.execute("PRAGMA journal_mode = WAL")
         c0.execute("PRAGMA foreign_keys = ON")
         init_schema(c0)
         c0.close()
@@ -1023,6 +1024,7 @@ class TestRegisterProductConcurrency:
 
         db_path = tmp_path / "concurrency_variants.db"
         c0 = sqlite3.connect(str(db_path))
+        c0.execute("PRAGMA journal_mode = WAL")
         c0.execute("PRAGMA foreign_keys = ON")
         init_schema(c0)
         c0.close()
