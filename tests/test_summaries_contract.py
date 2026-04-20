@@ -12,6 +12,9 @@ design — that is the intended guarantee. What this test *does* flip red on:
   ``preview_trimmer``, passing a different ``meta`` shape).
 - Someone changes the envelope shell (``ok`` / ``error`` / ``meta``) so
   that the audit no longer mirrors the production envelope wrapper.
+- Someone introduces caller-``meta`` mutation in either ``_envelope_summary``
+  or ``_build_summary`` (the canonical test deep-copies meta before the
+  call and compares afterward).
 
 Kept separate from ``tests/test_token_audit.py`` because that module is
 ``pytestmark = pytest.mark.network`` (skips without ANTHROPIC_API_KEY). This
@@ -20,6 +23,8 @@ behind its own ``pytest.mark.unit`` marker.
 """
 
 from __future__ import annotations
+
+import copy
 
 import pytest
 
@@ -61,6 +66,12 @@ def test_envelope_summary_matches_production_build_summary() -> None:
     def _preview(xs: list[dict]) -> list[dict]:
         return [{"date": r["date"], "value": r["value"]} for r in xs]
 
+    # Deep-copy the caller-visible meta *before* invoking either side, so we
+    # can later detect in-place mutation. Comparing `harness_envelope["meta"]`
+    # to `meta` alone would be a tautology (same object), and would silently
+    # pass even if a future edit to `_build_summary` mutated its input.
+    original_meta = copy.deepcopy(meta)
+
     harness_envelope = _envelope_summary(
         rows,
         preview_trimmer=_preview,
@@ -81,9 +92,17 @@ def test_envelope_summary_matches_production_build_summary() -> None:
         "Harness diverged from _build_summary — issue #14 regression. "
         f"harness={harness_envelope['data']!r} prod={prod_summary!r}"
     )
-    # Meta carries unchanged — the envelope must not accidentally pipe
-    # meta through _truncate_warnings; only summary.warnings is capped.
-    assert harness_envelope["meta"] == meta
+    # Envelope passes meta through by reference — it must be the *same*
+    # object the caller handed in, not a copy (the wrapper's documented
+    # behavior; copies would silently double memory on large meta).
+    assert harness_envelope["meta"] is meta
+    # Neither _envelope_summary nor _build_summary may mutate the caller's
+    # meta. `warnings` is the field most at risk because _truncate_warnings
+    # would be tempting to apply in-place; this assertion locks that it is
+    # NOT mutated on the input dict (only reflected in summary.warnings).
+    assert meta == original_meta, (
+        f"meta was mutated in-place. original={original_meta!r} after={meta!r}"
+    )
     assert harness_envelope["ok"] is True
     assert harness_envelope["error"] is None
 
