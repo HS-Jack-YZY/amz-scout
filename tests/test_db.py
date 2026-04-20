@@ -724,9 +724,12 @@ class TestBrandModelKeyMigrationV7:
             )
         c2.close()
 
-    def test_v7_fk_integrity_after_merge(self, tmp_path):
-        """After v7 merge, product_asins FK enforcement is back on and
-        every product_id resolves to a valid row in the new products.
+    def test_v7_fk_integrity_after_migration(self, tmp_path):
+        """After the v7 migration, product_asins FK enforcement is back
+        on and every product_id resolves to a valid row in the new
+        ``products``. This test seeds a single product (no merge path)
+        and focuses on FK restoration; the merge path is covered by
+        ``test_v7_migrates_v6_db_and_merges_duplicates``.
         """
         import amz_scout.db as db_mod
 
@@ -797,7 +800,7 @@ class TestQuerySideNormalizationV7:
 
     These cover the follow-up to schema v7 where ``register_product``
     was the only path normalized. Literal ``brand = ?`` comparisons in
-    ``find_product_exact`` / ``list_products_with_asins`` /
+    ``find_product_exact`` / ``list_registered_products`` /
     ``load_products_from_db`` produced silent "registered but not
     findable" failures.
     """

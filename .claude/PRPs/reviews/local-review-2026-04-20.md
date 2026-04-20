@@ -1,8 +1,17 @@
 # Local Code Review — 2026-04-20
 
+> **STATUS (post-review)**: H1 + H2 + L1 were addressed in commit
+> `f6cfec0` before PR #15 was opened. This file is kept for historical
+> context only. M1 (`_find_product_by_ean` normalization drift), L2
+> (`db.py` size), and L3 (test naming) are tracked as follow-ups; L3
+> is addressed by a rename in this PR's post-review Copilot pass.
+> Helper names referenced below may reflect an intermediate draft
+> (e.g. `list_products_with_asins`); the actual helper is
+> `list_registered_products`.
+
 **Branch**: `feat/brand-model-normalization`
 **Scope**: uncommitted changes (5 tracked + 2 untracked) — schema v7 brand/model normalization
-**Decision**: **REQUEST CHANGES** (1 HIGH blocker: v7 contract only half-implemented)
+**Decision**: **REQUEST CHANGES** (1 HIGH blocker: v7 contract only half-implemented) — *resolved, see STATUS above*
 
 ## Summary
 
