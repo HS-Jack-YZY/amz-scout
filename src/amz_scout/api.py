@@ -384,9 +384,10 @@ def _auto_fetch(
 def _auto_fetch_stale_warning(fetch_meta: dict[str, Any]) -> str | None:
     """Return a user-facing warning when ``_auto_fetch`` swallowed a failure.
 
-    ``summarize_for_llm`` only forwards ``meta['warnings']`` to the LLM, so the
-    ``auto_fetch_error`` flag alone is invisible downstream. Callers append the
-    returned string to their warnings list to surface the freshness caveat.
+    ``summarize_for_llm`` forwards only a small allowlist of ``meta`` keys to
+    the LLM. ``warnings`` is in that allowlist, but ``auto_fetch_error`` is
+    not, so callers append the returned string to their warnings list to
+    surface the freshness caveat.
     """
     if not fetch_meta.get("auto_fetch_error"):
         return None
@@ -771,13 +772,13 @@ def query_deals(
         logger.exception("query_deals failed")
         return _envelope(False, error=str(e))
 
-    resolve_warnings: list[str] = []
+    warnings_list: list[str] = []
     stale_warning = _auto_fetch_stale_warning(fetch_meta)
     if stale_warning:
-        resolve_warnings.append(stale_warning)
+        warnings_list.append(stale_warning)
     meta_extra: dict = {}
-    if resolve_warnings:
-        meta_extra["warnings"] = resolve_warnings
+    if warnings_list:
+        meta_extra["warnings"] = warnings_list
     return _envelope(True, data=rows, count=len(rows), **fetch_meta, **meta_extra)
 
 
