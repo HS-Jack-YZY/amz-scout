@@ -913,3 +913,70 @@ class TestCacheControlWiring:
             and any(b.get("type") == "tool_result" for b in m["content"])
             for m in updated
         )
+
+
+@pytest.mark.unit
+class TestAsyncThreadOffload:
+    """Bug A (issue #13): async wrappers must offload blocking sync I/O
+    so one user's slow Keepa fetch does not freeze the Chainlit event loop
+    for every other concurrent session.
+    """
+
+    def test_every_step_wrapper_uses_asyncio_to_thread(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import threading
+
+        _set_fake_env(monkeypatch)
+
+        import chainlit as cl
+
+        def _noop_step(**_kwargs):  # type: ignore[no-untyped-def]
+            def _decorator(fn):  # type: ignore[no-untyped-def]
+                return fn
+
+            return _decorator
+
+        monkeypatch.setattr(cl, "step", _noop_step)
+
+        _reset_webapp_modules()
+        from webapp import tools as webapp_tools
+        from webapp.tools import TOOL_SCHEMAS, dispatch_tool
+
+        def _record_thread(**_kw) -> dict:  # type: ignore[no-untyped-def]
+            return {
+                "ok": True,
+                "data": [],
+                "error": None,
+                "meta": {"_thread": threading.current_thread().name},
+            }
+
+        for attr in (
+            "_api_check_freshness",
+            "_api_keepa_budget",
+            "_api_query_availability",
+            "_api_query_compare",
+            "_api_query_deals",
+            "_api_query_latest",
+            "_api_query_ranking",
+            "_api_query_sellers",
+            "_api_query_trends",
+        ):
+            monkeypatch.setattr(webapp_tools, attr, _record_thread)
+
+        async def _run_all() -> list[tuple[str, dict]]:
+            out: list[tuple[str, dict]] = []
+            for tool in TOOL_SCHEMAS:
+                name = tool["name"]
+                args: dict = {}
+                for prop in tool["input_schema"].get("required", []):
+                    args[prop] = "UK" if prop == "marketplace" else "Slate 7"
+                out.append((name, await dispatch_tool(name, args)))
+            return out
+
+        for name, result in asyncio.run(_run_all()):
+            thread_name = result["meta"]["_thread"]
+            assert not thread_name.startswith("MainThread"), (
+                f"{name}: sync _api_* ran on {thread_name!r} — Bug A regression. "
+                f"Wrapper must await asyncio.to_thread(_api_*, ...)."
+            )
