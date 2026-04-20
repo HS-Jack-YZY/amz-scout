@@ -614,7 +614,9 @@ def query_trends(
 
     stale_warning = _auto_fetch_stale_warning(fetch_meta)
     if stale_warning:
-        resolve_warnings.append(stale_warning)
+        # Insert at the front so it survives `_truncate_warnings` (MAX_WARNINGS=3);
+        # freshness caveat is more actionable than any of the resolve warnings.
+        resolve_warnings.insert(0, stale_warning)
 
     meta_extra: dict = {}
     if resolve_warnings:
@@ -723,7 +725,9 @@ def query_sellers(
 
     stale_warning = _auto_fetch_stale_warning(fetch_meta)
     if stale_warning:
-        resolve_warnings.append(stale_warning)
+        # Insert at the front so it survives `_truncate_warnings` (MAX_WARNINGS=3);
+        # freshness caveat is more actionable than any of the resolve warnings.
+        resolve_warnings.insert(0, stale_warning)
 
     meta_extra: dict = {}
     if resolve_warnings:
