@@ -186,10 +186,10 @@ Keepa 数据写入 DB
 
 | # | Phase | Description | Status | Parallel | Depends | PRP Plan |
 |---|---|---|---|---|---|---|
-| 1 | **CLAUDE.md 瘦身** | 压缩至 ≤2,500 tokens，移除重复指令、强制 ASIN 补全、冗余示例；Developer Reference 外迁 | in-progress | with 2 | - | [plan](.claude/PRPs/plans/claude-md-slim-phase1.plan.md) |
-| 2 | **EAN/UPC 自动绑定** | 修改 `_auto_register_from_keepa()` 添加 EAN 匹配逻辑；验证覆盖率；添加测试 | in-progress | with 1 | - | [plan](.claude/PRPs/plans/ean-upc-auto-binding.plan.md) |
-| 3 | **查询直通模式** | 修改 webapp tool wrappers 返回摘要 + cl.File；添加 session 查询记录；压缩 tool docstrings | in-progress | - | 1 | [plan](.claude/PRPs/plans/query-passthrough-mode.plan.md) |
-| 4 | **验证 + 回归测试** | 对比瘦身前后 token 消耗；全量测试套件；手动验证关键查询场景 | pending | - | 1, 2, 3 | - |
+| 1 | **CLAUDE.md 瘦身** | 压缩至 ≤2,500 tokens，移除重复指令、强制 ASIN 补全、冗余示例；Developer Reference 外迁 | complete | with 2 | - | [plan](.claude/PRPs/plans/completed/claude-md-slim-phase1.plan.md) · [report](.claude/PRPs/reports/claude-md-slim-phase1-report.md) |
+| 2 | **EAN/UPC 自动绑定** | 修改 `_auto_register_from_keepa()` 添加 EAN 匹配逻辑；验证覆盖率；添加测试 | complete | with 1 | - | [plan](.claude/PRPs/plans/completed/ean-upc-auto-binding.plan.md) · [report](.claude/PRPs/reports/ean-upc-auto-binding-report.md) |
+| 3 | **查询直通模式** | 修改 webapp tool wrappers 返回摘要 + cl.File；添加 session 查询记录；压缩 tool docstrings | complete | - | 1 | [plan](.claude/PRPs/plans/completed/query-passthrough-mode.plan.md) · [report](.claude/PRPs/reports/query-passthrough-mode-report.md) |
+| 4 | **验证 + 回归测试** | 对比瘦身前后 token 消耗；全量测试套件；手动验证关键查询场景 | complete | - | 1, 2, 3 | [plan](.claude/PRPs/plans/completed/amz-scout-slim-refactor-phase4-validation.plan.md) · [report](.claude/PRPs/reports/amz-scout-slim-refactor-phase4-validation.md) |
 
 ### Phase Details
 
@@ -369,4 +369,4 @@ v5 迁移的代码改动（query gate 扩展 + `_resolve_asin` status gate）绝
 ---
 
 *Generated: 2026-04-16*
-*Status: DRAFT — Q1/Q2 verified 2026-04-17. Phases 1 & 2 complete; Phase 3 unblocked. Intent-validation removal decision 2026-04-17.*
+*Status: CLOSED — All 4 phases complete as of 2026-04-20. Phase 4 validation: query_trends 83.6% saved, aggregate 66.57% saved, 0 brand drift. See [phase4 report](.claude/PRPs/reports/amz-scout-slim-refactor-phase4-validation.md). Intent-validation removal decision recorded 2026-04-17 (Q1/Q2 coverage audit same day).*

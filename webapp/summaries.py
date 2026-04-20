@@ -178,7 +178,11 @@ def _attach_file_to_session(name: str, content: bytes) -> bool:
         logger.debug("No chainlit session; skipping pending_files attach")
         return False
     except Exception:
-        logger.warning("pending_files session update failed; user will not receive %s", name, exc_info=True)
+        logger.warning(
+            "pending_files session update failed; user will not receive %s",
+            name,
+            exc_info=True,
+        )
         return False
     return True
 
