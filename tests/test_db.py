@@ -589,7 +589,7 @@ class TestBrandModelKeyMigrationV7:
         ).fetchone()
         assert row["c"] == 1
 
-    def test_v7_migrates_v6_db_and_merges_duplicates(self, tmp_path):
+    def test_v7_migrates_v6_db_and_merges_duplicates(self, tmp_path, caplog):
         """v6 → v7 upgrade: rebuild products with brand_key/model_key,
         merge rows whose normalized (brand, model) collide, and re-point
         product_asins / product_tags at the surviving canonical id.
@@ -675,7 +675,19 @@ class TestBrandModelKeyMigrationV7:
         c2 = sqlite3.connect(str(db_path))
         c2.row_factory = sqlite3.Row
         c2.execute("PRAGMA foreign_keys = ON")
-        init_schema(c2)
+        import logging as _logging
+
+        with caplog.at_level(_logging.WARNING, logger="amz_scout.db"):
+            init_schema(c2)
+
+        # The v7 merge drops B0UK000099 (product 11 UK) because its
+        # (product_id, marketplace) conflicts with (10, UK) after the
+        # merge. The migrator must log which ASIN was dropped so an
+        # operator can reconcile the loser manually.
+        assert "B0UK000099" in caplog.text, (
+            "expected dropped-ASIN warning; got:\n" + caplog.text
+        )
+        assert "UK" in caplog.text
 
         rows = c2.execute(
             "SELECT id, brand, model, brand_key, model_key "
@@ -852,3 +864,85 @@ class TestQuerySideNormalizationV7:
         assert len(load_products_from_db(conn, brand="tp-link")) == 1
         assert len(load_products_from_db(conn, brand="\tTP-Link\n")) == 1
         assert load_products_from_db(conn, brand="wrong") == []
+
+
+# ─── _find_product_by_ean brand-guard normalization ──────────────────
+
+
+class TestFindProductByEanBrandGuardV7:
+    """The v7 refactor relaxed the ``_find_product_by_ean`` brand guard
+    from literal ``brand = ?`` to ``LOWER(TRIM(kp.brand)) = LOWER(TRIM(?))``.
+    This lets Keepa's casing/spacing variance (the raw source of the
+    registry identity drift that v7 exists to fix) still hit the
+    matching EAN/UPC row instead of silently returning None and
+    producing a duplicate product_id on cross-market bind.
+
+    These tests pin the new behavior directly; prior to this PR the
+    helper had no test coverage at all for the brand-guard branch.
+    """
+
+    def _seed_keepa_row(
+        self,
+        conn: sqlite3.Connection,
+        asin: str,
+        site: str,
+        brand: str,
+        ean: str,
+    ) -> None:
+        conn.execute(
+            "INSERT INTO keepa_products "
+            "(asin, site, brand, ean_list, upc_list, fetch_mode, fetched_at) "
+            "VALUES (?, ?, ?, ?, '[]', 'full', '2026-04-20T00:00:00Z')",
+            (asin, site, brand, f'["{ean}"]'),
+        )
+
+    def test_brand_guard_hits_on_case_and_whitespace_variants(self, conn):
+        from amz_scout.db import _find_product_by_ean, register_asin, register_product
+
+        pid, _ = register_product(conn, "Router", "GL.iNet", "Slate 7")
+        # Seed an existing Keepa row whose brand has Keepa-typical
+        # surrounding whitespace that the old literal `brand = ?`
+        # guard would have missed.
+        self._seed_keepa_row(
+            conn, "B0REF000001", "UK", "  GL.iNet  ", "1234567890123"
+        )
+        register_asin(conn, pid, "UK", "B0REF000001")
+
+        # A new ASIN shares the EAN and names the same brand with
+        # different casing. The guard must still accept this as a hit.
+        raw = {"eanList": ["1234567890123"], "brand": "gl.inet"}
+        assert _find_product_by_ean(conn, "B0NEW000001", raw) == pid
+
+        raw = {"eanList": ["1234567890123"], "brand": " GL.INET "}
+        assert _find_product_by_ean(conn, "B0NEW000001", raw) == pid
+
+    def test_brand_guard_rejects_true_mismatch(self, conn):
+        from amz_scout.db import _find_product_by_ean, register_asin, register_product
+
+        pid, _ = register_product(conn, "Router", "GL.iNet", "Slate 7")
+        self._seed_keepa_row(
+            conn, "B0REF000001", "UK", "GL.iNet", "1234567890123"
+        )
+        register_asin(conn, pid, "UK", "B0REF000001")
+
+        # Same EAN, genuinely different brand — guard must still reject.
+        raw = {"eanList": ["1234567890123"], "brand": "TP-Link"}
+        assert _find_product_by_ean(conn, "B0NEW000001", raw) is None
+
+    def test_brand_guard_skipped_when_brand_absent(self, conn):
+        """Comment in production code promises: 'No brand available —
+        EAN alone is sufficient evidence; skip brand guard'. Pin it."""
+        from amz_scout.db import _find_product_by_ean, register_asin, register_product
+
+        pid, _ = register_product(conn, "Router", "GL.iNet", "Slate 7")
+        self._seed_keepa_row(
+            conn, "B0REF000001", "UK", "GL.iNet", "1234567890123"
+        )
+        register_asin(conn, pid, "UK", "B0REF000001")
+
+        # No brand in raw => guard skipped, EAN alone binds.
+        raw = {"eanList": ["1234567890123"]}
+        assert _find_product_by_ean(conn, "B0NEW000001", raw) == pid
+
+        raw = {"eanList": ["1234567890123"], "brand": ""}
+        assert _find_product_by_ean(conn, "B0NEW000001", raw) == pid
