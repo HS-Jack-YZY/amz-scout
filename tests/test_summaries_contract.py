@@ -108,26 +108,40 @@ def test_envelope_summary_matches_production_build_summary() -> None:
 
 
 def test_envelope_summary_empty_rows_matches_production() -> None:
-    """Edge case: no rows → no preview / no date_range, count==0."""
+    """Edge case: no rows → no preview / no date_range, count==0.
+
+    Also locks the meta-by-reference contract for the empty-dict case —
+    historically the wrapper used ``meta or {}`` which silently replaced an
+    empty caller dict with a new object, breaking the reference passthrough
+    the canonical test asserts on truthy meta. Using a single shared
+    ``meta_empty`` object across both calls lets us assert the same
+    invariants uniformly.
+    """
     from tests.test_token_audit import _envelope_summary
     from webapp.summaries import _build_summary
 
     def _no_preview(_: list[dict]) -> list[dict]:
         return []
 
+    meta_empty: dict = {}
+    original_meta = copy.deepcopy(meta_empty)
+
     harness = _envelope_summary(
         [],
         preview_trimmer=_no_preview,
         date_field="date",
         file_name="empty.xlsx",
-        meta={},
+        meta=meta_empty,
     )
     prod = _build_summary(
         [],
         file_name="empty.xlsx",
-        meta={},
+        meta=meta_empty,
         preview_trimmer=_no_preview,
         date_field="date",
         truncated=False,
     )
     assert harness["data"] == prod
+    # Reference passthrough must hold for empty meta as well.
+    assert harness["meta"] is meta_empty
+    assert meta_empty == original_meta

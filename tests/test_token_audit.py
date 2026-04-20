@@ -88,7 +88,11 @@ def _envelope_summary(
     """
     from webapp.summaries import _build_summary
 
-    meta = meta or {}
+    # Use `is None` rather than `or {}`: the latter replaces a caller-provided
+    # empty dict with a new object, silently breaking the documented
+    # meta-by-reference contract (caught by the canonical contract test).
+    if meta is None:
+        meta = {}
     summary = _build_summary(
         rows,
         file_name=file_name,
