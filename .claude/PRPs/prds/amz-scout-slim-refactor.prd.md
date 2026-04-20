@@ -188,7 +188,7 @@ Keepa 数据写入 DB
 |---|---|---|---|---|---|---|
 | 1 | **CLAUDE.md 瘦身** | 压缩至 ≤2,500 tokens，移除重复指令、强制 ASIN 补全、冗余示例；Developer Reference 外迁 | in-progress | with 2 | - | [plan](.claude/PRPs/plans/claude-md-slim-phase1.plan.md) |
 | 2 | **EAN/UPC 自动绑定** | 修改 `_auto_register_from_keepa()` 添加 EAN 匹配逻辑；验证覆盖率；添加测试 | in-progress | with 1 | - | [plan](.claude/PRPs/plans/ean-upc-auto-binding.plan.md) |
-| 3 | **查询直通模式** | 修改 webapp tool wrappers 返回摘要 + cl.File；添加 session 查询记录；压缩 tool docstrings | pending | - | 1 | - |
+| 3 | **查询直通模式** | 修改 webapp tool wrappers 返回摘要 + cl.File；添加 session 查询记录；压缩 tool docstrings | in-progress | - | 1 | [plan](.claude/PRPs/plans/query-passthrough-mode.plan.md) |
 | 4 | **验证 + 回归测试** | 对比瘦身前后 token 消耗；全量测试套件；手动验证关键查询场景 | pending | - | 1, 2, 3 | - |
 
 ### Phase Details
@@ -213,7 +213,7 @@ Keepa 数据写入 DB
 - **Success signal**: 对已有的跨市场产品（如 B09K7SRMX4），EAN 匹配正确绑定到同一 product_id
 - **与 Phase 1 并行**
 
-**Phase 3: 查询直通模式** (~4h)
+**Phase 3: 查询直通模式** (~4h) — **COMPLETE (2026-04-17)**
 - **Goal**: 查询模式 output tokens 降低 60%+
 - **Scope**:
   - 修改 `webapp/tools.py`：`_step_*` 返回摘要 dict 而非 trimmed data
@@ -223,6 +223,7 @@ Keepa 数据写入 DB
   - 压缩 tool schema docstrings（-250 tokens）
 - **Success signal**: 同一查询（"查 BE3600 UK 价格历史"）的 output tokens 降低 60%+
 - **依赖 Phase 1**（CLAUDE.md 指令需要先更新）
+- **Report**: `.claude/PRPs/reports/query-passthrough-mode-report.md` (277 tests pass; TOOL_SCHEMAS 6,500 → 4,458 chars; 60% end-to-end token audit pending manual run with `ANTHROPIC_API_KEY`)
 
 **Phase 4: 验证 + 回归测试** (~2h)
 - **Goal**: 确认零功能回归 + token 节省达标

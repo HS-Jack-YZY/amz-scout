@@ -279,19 +279,51 @@ class TestToolDispatch:
 
 
 @pytest.mark.unit
-class TestWebappTrimBoundary:
-    """Webapp boundary contract: ``dispatch_tool`` must apply ``trim_for_llm``
-    to the envelope ``data`` for every row-emitting tool, while ``meta`` and
-    failure envelopes pass through untouched.
+class TestQueryPassthrough:
+    """Phase 3 contract: row-emitting tools return summaries (not rows) to the
+    LLM, and attach full DB rows as ``cl.File`` entries on the session.
 
-    This is the regression guard for PR #7's correction: the trim helpers live
-    in ``amz_scout._llm_trim`` and used to be wired inside ``amz_scout.api``,
-    which silently bled into CLI output. Trimming must now happen at the
-    webapp boundary only — these tests fail loudly if anyone moves it back.
+    Supersedes the Phase 2 ``TestWebappTrimBoundary`` class whose row-shape
+    assertions (``data`` is a list of trimmed rows) no longer hold — ``data``
+    is now a summary dict. The regression surface is preserved here:
+    ``test_full_rows_land_in_xlsx_not_trimmed`` guards against the trim
+    decorator leaking back into the xlsx payload, and
+    ``test_failure_envelope_passes_through`` keeps the failed-envelope
+    passthrough rule.
     """
 
-    def _patch_chainlit_step(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def _patch_session_and_step(self, monkeypatch: pytest.MonkeyPatch) -> dict:
+        """Monkey-patch the three chainlit surfaces touched by Phase 3 wiring.
+
+        - ``cl.user_session`` → in-memory ``_FakeSession`` so we can assert on
+          ``pending_files`` / ``query_log`` without Chainlit running.
+        - ``cl.step`` → no-op decorator (same as TestToolDispatch).
+        - ``cl.File`` → dataclass stub. ``cl.File.__post_init__`` reads
+          ``context.session.thread_id`` and raises ``AttributeError`` when the
+          session is None (pytest, CLI, background threads), so ``cl.File(...)``
+          construction in ``_attach_file_to_session`` would explode inside its
+          try/except and silently swallow the attach. Stubbing keeps the
+          attach observable from the test.
+        """
+        from dataclasses import dataclass
+
         import chainlit as cl
+
+        store: dict = {}
+
+        class _FakeSession:
+            def get(self, k, default=None):
+                return store.get(k, default)
+
+            def set(self, k, v):
+                store[k] = v
+
+        @dataclass
+        class _FakeFile:
+            name: str = ""
+            content: bytes | str | None = None
+            mime: str | None = None
+            display: str = "inline"
 
         def _noop_step(**_kwargs):  # type: ignore[no-untyped-def]
             def _decorator(fn):  # type: ignore[no-untyped-def]
@@ -299,150 +331,119 @@ class TestWebappTrimBoundary:
 
             return _decorator
 
+        monkeypatch.setattr(cl, "user_session", _FakeSession())
         monkeypatch.setattr(cl, "step", _noop_step)
+        monkeypatch.setattr(cl, "File", _FakeFile)
+        return store
 
-    def test_query_latest_envelope_is_trimmed_at_webapp_boundary(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_query_trends_returns_summary_not_rows(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _set_fake_env(monkeypatch)
-        self._patch_chainlit_step(monkeypatch)
+        self._patch_session_and_step(monkeypatch)
         _reset_webapp_modules()
         from webapp import tools as webapp_tools
         from webapp.tools import dispatch_tool
 
-        wide_row = {
-            "id": 7,
-            "site": "UK",
-            "brand": "ExampleBrand",
-            "model": "XR-100",
-            "asin": "B0TESTTEST",
-            "title": "Should not leak",
-            "url": "https://example.test",
-            "price_cents": 14999,
-            "currency": "GBP",
-            "rating": 4.5,
-            "review_count": 99,
-            "bsr": 1,
-            "available": 1,
-            "fulfillment": "Amazon",
-            "sold_by": "ExampleBrand",
-            "scraped_at": "2026-04-01T10:00:00Z",
-        }
-
-        def _fake(*_args, **_kwargs) -> dict:  # type: ignore[no-untyped-def]
-            return {
-                "ok": True,
-                "data": [wide_row],
-                "error": None,
-                "meta": {"count": 1, "auto_fetched": False},
-            }
-
-        monkeypatch.setattr(webapp_tools, "_api_query_latest", _fake)
-
-        result = asyncio.run(dispatch_tool("query_latest", {"marketplace": "UK"}))
-
-        assert result["ok"] is True
-        assert len(result["data"]) == 1
-        trimmed = result["data"][0]
-        assert trimmed["brand"] == "ExampleBrand"
-        assert trimmed["model"] == "XR-100"
-        assert trimmed["asin"] == "B0TESTTEST"
-        assert trimmed["price_cents"] == 14999
-        for leaked in ("id", "title", "url", "fulfillment", "sold_by"):
-            assert leaked not in trimmed, (
-                f"{leaked!r} leaked into LLM envelope — trim is no longer "
-                f"applied at the webapp boundary"
-            )
-        assert result["meta"] == {"count": 1, "auto_fetched": False}
-
-    def test_query_trends_timeseries_is_trimmed(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        _set_fake_env(monkeypatch)
-        self._patch_chainlit_step(monkeypatch)
-        _reset_webapp_modules()
-        from webapp import tools as webapp_tools
-        from webapp.tools import dispatch_tool
-
-        wide_rows = [
-            {
-                "keepa_ts": 7584000 + i,
-                "value": 14999 + i,
-                "fetched_at": "2026-04-01T10:00:00Z",
-                "date": f"2026-04-{i + 1:02d} 10:00",
-            }
-            for i in range(3)
+        rows = [
+            {"date": f"2026-04-{i:02d} 10:00", "value": 100 + i, "keepa_ts": 7584000 + i}
+            for i in range(1, 88)
         ]
 
-        def _fake(*_args, **_kwargs) -> dict:  # type: ignore[no-untyped-def]
+        def _fake(**_kw) -> dict:  # type: ignore[no-untyped-def]
             return {
                 "ok": True,
-                "data": wide_rows,
+                "data": rows,
                 "error": None,
-                "meta": {"asin": "B0TEST", "series_name": "amazon_new"},
+                "meta": {"asin": "B0TEST0000", "model": "Slate 7"},
             }
 
         monkeypatch.setattr(webapp_tools, "_api_query_trends", _fake)
 
         result = asyncio.run(
-            dispatch_tool(
-                "query_trends",
-                {"product": "Slate 7", "marketplace": "UK"},
-            )
+            dispatch_tool("query_trends", {"product": "Slate 7", "marketplace": "UK"})
         )
 
         assert result["ok"] is True
-        assert len(result["data"]) == 3
-        for row in result["data"]:
-            assert set(row.keys()) == {"date", "value"}, (
-                f"timeseries row must be trimmed to date+value, got {row.keys()}"
-            )
-        assert result["meta"]["asin"] == "B0TEST"
+        assert isinstance(result["data"], dict), (
+            "Phase 3 contract: query_trends must return a summary dict, not a row list"
+        )
+        assert result["data"]["count"] == 87
+        assert "date_range" in result["data"]
+        assert result["data"]["file_attached"].endswith(".xlsx")
+        assert result["meta"]["asin"] == "B0TEST0000"
+        # Preview is capped at MAX_PREVIEW_ROWS (3) — never the full row set.
+        assert len(result["data"].get("preview", [])) <= 3
 
-    def test_query_deals_envelope_is_trimmed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_full_rows_land_in_xlsx_not_trimmed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Excel must carry full DB fields, not the LLM-safe trimmed set."""
+        from io import BytesIO
+
+        from openpyxl import load_workbook
+
         _set_fake_env(monkeypatch)
-        self._patch_chainlit_step(monkeypatch)
+        store = self._patch_session_and_step(monkeypatch)
         _reset_webapp_modules()
         from webapp import tools as webapp_tools
         from webapp.tools import dispatch_tool
 
-        wide_deal = {
-            "asin": "B0TEST",
+        wide_row = {
+            "id": 42,
             "site": "UK",
-            "deal_type": "LIGHTNING",
-            "badge": "Deal of the Day",
-            "percent_claimed": 60,
-            "deal_status": "ACTIVE",
-            "start_time": 7584000,
-            "end_time": 7590000,
-            "access_type": "ALL",
-            "fetched_at": "2026-04-01T10:00:00Z",
+            "brand": "ExampleBrand",
+            "model": "XR-100",
+            "asin": "B0TESTTEST",
+            "title": "MUST APPEAR IN XLSX",
+            "price_cents": 14999,
+            "url": "https://example.test",
         }
 
-        def _fake(*_args, **_kwargs) -> dict:  # type: ignore[no-untyped-def]
-            return {
-                "ok": True,
-                "data": [wide_deal],
-                "error": None,
-                "meta": {},
-            }
+        def _fake(**_kw) -> dict:  # type: ignore[no-untyped-def]
+            return {"ok": True, "data": [wide_row], "error": None, "meta": {}}
 
-        monkeypatch.setattr(webapp_tools, "_api_query_deals", _fake)
+        monkeypatch.setattr(webapp_tools, "_api_query_latest", _fake)
+        asyncio.run(dispatch_tool("query_latest", {"marketplace": "UK"}))
 
-        result = asyncio.run(dispatch_tool("query_deals", {"marketplace": "UK"}))
+        pending = store.get("pending_files", [])
+        assert len(pending) == 1, "exactly one xlsx should have been attached"
+        xlsx_bytes = pending[0].content
+        assert isinstance(xlsx_bytes, bytes)
+        wb = load_workbook(BytesIO(xlsx_bytes))
+        ws = wb.active
+        assert ws is not None
+        headers = [c.value for c in ws[1]]
+        for field in ("title", "url", "id"):
+            assert field in headers, (
+                f"{field!r} missing from xlsx — trim decorator is leaking "
+                f"into the full-rows attachment path"
+            )
 
-        assert result["ok"] is True
-        trimmed = result["data"][0]
-        assert "access_type" not in trimmed
-        assert "fetched_at" not in trimmed
-        assert trimmed["deal_type"] == "LIGHTNING"
-        assert trimmed["percent_claimed"] == 60
-
-    def test_failure_envelope_passes_through_without_trim(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """A failed envelope (ok=False) must skip trimming entirely so the
-        diagnostic ``error`` and any debug ``data`` reach the model intact."""
+    def test_query_log_appended_per_call(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _set_fake_env(monkeypatch)
-        self._patch_chainlit_step(monkeypatch)
+        store = self._patch_session_and_step(monkeypatch)
+        _reset_webapp_modules()
+        from webapp import tools as webapp_tools
+        from webapp.tools import dispatch_tool
+
+        def _fake(**_kw) -> dict:  # type: ignore[no-untyped-def]
+            return {"ok": True, "data": [{"x": 1}], "error": None, "meta": {}}
+
+        monkeypatch.setattr(webapp_tools, "_api_query_latest", _fake)
+
+        asyncio.run(dispatch_tool("query_latest", {"marketplace": "UK"}))
+        asyncio.run(dispatch_tool("query_latest", {"marketplace": "DE"}))
+
+        log = store.get("query_log", [])
+        assert len(log) == 2
+        assert log[0]["tool"] == "query_latest"
+        assert log[0]["args"]["marketplace"] == "UK"
+        assert log[1]["args"]["marketplace"] == "DE"
+        assert all("ts" in entry for entry in log)
+
+    def test_failure_envelope_passes_through(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Failure envelopes (``ok=False``) must skip summarization entirely:
+        no xlsx attach, no query_log append, so the LLM can see the full
+        ``error`` string and the user is not offered a stale/empty download."""
+        _set_fake_env(monkeypatch)
+        store = self._patch_session_and_step(monkeypatch)
         _reset_webapp_modules()
         from webapp import tools as webapp_tools
         from webapp.tools import dispatch_tool
@@ -454,14 +455,217 @@ class TestWebappTrimBoundary:
             "meta": {},
         }
 
-        def _fake(*_args, **_kwargs) -> dict:  # type: ignore[no-untyped-def]
+        def _fake(**_kw) -> dict:  # type: ignore[no-untyped-def]
             return failure
+
+        monkeypatch.setattr(webapp_tools, "_api_query_latest", _fake)
+        result = asyncio.run(dispatch_tool("query_latest", {"marketplace": "UK"}))
+
+        assert result is failure
+        assert store.get("pending_files", []) == []
+        assert store.get("query_log", []) == []
+
+    def test_query_deals_summary_has_no_date_range(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """``query_deals`` uses ``date_field=None`` because ``start_time`` /
+        ``end_time`` are Keepa-encoded minute integers; treating them as dates
+        would produce a garbage range like ``'7584000 to 7590000'``. Until a
+        decoder lands, the summary should simply omit ``date_range``."""
+        _set_fake_env(monkeypatch)
+        self._patch_session_and_step(monkeypatch)
+        _reset_webapp_modules()
+        from webapp import tools as webapp_tools
+        from webapp.tools import dispatch_tool
+
+        deal_row = {
+            "asin": "B0TESTTEST",
+            "site": "UK",
+            "deal_type": "LIGHTNING",
+            "start_time": 7584000,
+            "end_time": 7590000,
+        }
+
+        def _fake(**_kw) -> dict:  # type: ignore[no-untyped-def]
+            return {"ok": True, "data": [deal_row], "error": None, "meta": {}}
+
+        monkeypatch.setattr(webapp_tools, "_api_query_deals", _fake)
+        result = asyncio.run(dispatch_tool("query_deals", {"marketplace": "UK"}))
+
+        assert result["ok"] is True
+        assert isinstance(result["data"], dict)
+        assert "date_range" not in result["data"], (
+            "date_range on query_deals would stringify Keepa-encoded "
+            "minute integers as dates; the decorator must skip it"
+        )
+
+    def test_tool_schema_size_stays_within_regression_budget(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression guard, not a compression-target test.
+
+        Phase 2 baseline was ~6,500 chars. Phase 3 target is ≤5,500. The
+        6,000-char bound here catches future bloat without enforcing the tight
+        Phase 3 compression outcome (validated in the token_audit harness).
+        If this fires, someone expanded a tool docstring.
+        """
+        import json
+
+        _set_fake_env(monkeypatch)
+        _reset_webapp_modules()
+        from webapp.tools import TOOL_SCHEMAS
+
+        size = len(json.dumps(TOOL_SCHEMAS, ensure_ascii=False))
+        assert size <= 6000, (
+            f"TOOL_SCHEMAS size {size} chars exceeds 6,000 regression budget "
+            f"(Phase 2 baseline ~6,500, Phase 3 target ≤5,500)"
+        )
+
+    def test_attach_failure_drops_file_attached_from_summary(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """H1 regression: if the xlsx attach fails, the summary MUST NOT
+        carry ``file_attached``. Otherwise the LLM tells the user a download
+        is available that was never produced.
+        """
+        _set_fake_env(monkeypatch)
+        self._patch_session_and_step(monkeypatch)
+        _reset_webapp_modules()
+        from webapp import summaries as webapp_summaries
+        from webapp import tools as webapp_tools
+        from webapp.tools import dispatch_tool
+
+        def _fake(**_kw) -> dict:  # type: ignore[no-untyped-def]
+            return {"ok": True, "data": [{"x": 1}], "error": None, "meta": {}}
+
+        def _fail(*_args, **_kw) -> bool:  # type: ignore[no-untyped-def]
+            return False
+
+        monkeypatch.setattr(webapp_tools, "_api_query_latest", _fake)
+        # Simulate attach failure by patching the helper itself — covers
+        # both cl.File construction errors and session update errors.
+        monkeypatch.setattr(webapp_summaries, "_attach_file_to_session", _fail)
+
+        result = asyncio.run(dispatch_tool("query_latest", {"marketplace": "UK"}))
+
+        assert result["ok"] is True
+        data = result["data"]
+        assert isinstance(data, dict)
+        assert "file_attached" not in data, (
+            "LLM must not see file_attached when the xlsx never reached the user"
+        )
+        assert data["file_attach_failed"] is True
+
+    def test_xlsx_row_limit_truncates_and_flags_summary(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """M1 regression: a row list exceeding ``MAX_XLSX_ROWS`` must be
+        truncated to the cap and the summary must carry ``xlsx_truncated``
+        so the LLM can tell the user the attachment is incomplete.
+        """
+        from io import BytesIO
+
+        from openpyxl import load_workbook
+
+        _set_fake_env(monkeypatch)
+        store = self._patch_session_and_step(monkeypatch)
+        _reset_webapp_modules()
+        from webapp import summaries as webapp_summaries
+        from webapp import tools as webapp_tools
+        from webapp.tools import dispatch_tool
+
+        # Shrink the cap for a fast test — 5 rows out of 12.
+        monkeypatch.setattr(webapp_summaries, "MAX_XLSX_ROWS", 5)
+        rows = [{"i": i, "date": f"2026-04-{i:02d}"} for i in range(1, 13)]
+
+        def _fake(**_kw) -> dict:  # type: ignore[no-untyped-def]
+            return {"ok": True, "data": rows, "error": None, "meta": {}}
 
         monkeypatch.setattr(webapp_tools, "_api_query_latest", _fake)
 
         result = asyncio.run(dispatch_tool("query_latest", {"marketplace": "UK"}))
 
-        assert result is failure
+        data = result["data"]
+        assert isinstance(data, dict)
+        assert data["count"] == 12, "count reflects full DB rowset"
+        assert data["xlsx_truncated"] is True
+        assert data["xlsx_row_limit"] == 5
+        pending = store.get("pending_files", [])
+        wb = load_workbook(BytesIO(pending[0].content))
+        ws = wb.active
+        assert ws is not None
+        # Header row + 5 data rows == 6 total.
+        assert ws.max_row == 6, (
+            f"xlsx must cap at MAX_XLSX_ROWS data rows; got {ws.max_row - 1}"
+        )
+
+    def test_warnings_are_truncated_before_reaching_llm(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """M3 regression: ``meta['warnings']`` is cap-limited (count + per-
+        entry length) so a misbehaving upstream cannot silently 10x the
+        summary token cost.
+        """
+        _set_fake_env(monkeypatch)
+        self._patch_session_and_step(monkeypatch)
+        _reset_webapp_modules()
+        from webapp import summaries as webapp_summaries
+        from webapp import tools as webapp_tools
+        from webapp.tools import dispatch_tool
+
+        long_msg = "X" * (webapp_summaries.MAX_WARNING_CHARS + 500)
+        many_warnings = [long_msg] * (webapp_summaries.MAX_WARNINGS + 4)
+
+        def _fake(**_kw) -> dict:  # type: ignore[no-untyped-def]
+            return {
+                "ok": True,
+                "data": [{"x": 1}],
+                "error": None,
+                "meta": {"warnings": many_warnings},
+            }
+
+        monkeypatch.setattr(webapp_tools, "_api_query_latest", _fake)
+
+        result = asyncio.run(dispatch_tool("query_latest", {"marketplace": "UK"}))
+
+        data = result["data"]
+        assert isinstance(data, dict)
+        warnings = data["warnings"]
+        # MAX_WARNINGS entries + one "more truncated" pointer line.
+        assert len(warnings) == webapp_summaries.MAX_WARNINGS + 1
+        assert all(
+            len(w) <= webapp_summaries.MAX_WARNING_CHARS + 1
+            for w in warnings[: webapp_summaries.MAX_WARNINGS]
+        ), "each warning entry must be clipped to MAX_WARNING_CHARS (+ellipsis)"
+        assert "more warnings truncated" in warnings[-1]
+
+    def test_non_list_data_falls_back_without_crashing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Defensive: if upstream leaks a dict where a list was promised,
+        the decorator must log and return ``count=0`` instead of silently
+        treating the dict as empty rows via ``or []``.
+        """
+        _set_fake_env(monkeypatch)
+        self._patch_session_and_step(monkeypatch)
+        _reset_webapp_modules()
+        from webapp import tools as webapp_tools
+        from webapp.tools import dispatch_tool
+
+        def _fake(**_kw) -> dict:  # type: ignore[no-untyped-def]
+            return {
+                "ok": True,
+                "data": {"unexpected": "shape"},
+                "error": None,
+                "meta": {},
+            }
+
+        monkeypatch.setattr(webapp_tools, "_api_query_latest", _fake)
+        result = asyncio.run(dispatch_tool("query_latest", {"marketplace": "UK"}))
+
+        assert result["ok"] is True
+        data = result["data"]
+        assert isinstance(data, dict)
+        assert data["count"] == 0
+        assert "preview" not in data
 
 
 @pytest.mark.unit
