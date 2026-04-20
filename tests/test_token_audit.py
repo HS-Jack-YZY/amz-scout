@@ -78,10 +78,13 @@ def _envelope_summary(
     truncation). Delegating to the real helper guarantees the audit measures
     the exact envelope shape the LLM sees in production.
 
-    The token audit measures the **success path** (xlsx attached, no row
-    truncation), so we pin ``file_name`` non-None and ``truncated=False``
-    here. Failure-path token cost is covered by the unit tests in
-    ``tests/test_webapp_smoke.py``.
+    The token audit deliberately measures only the **success path** (xlsx
+    attached, no row truncation), so we pin ``file_name`` non-None and
+    ``truncated=False`` here. Failure-path token cost is not asserted
+    anywhere — ``tests/test_webapp_smoke.py`` covers the *structural*
+    correctness of those paths (that ``file_attach_failed`` /
+    ``xlsx_truncated`` / truncated warnings appear in the envelope), not
+    their token delta.
     """
     from webapp.summaries import _build_summary
 

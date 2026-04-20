@@ -1,8 +1,17 @@
 """Contract test: harness ``_envelope_summary`` vs production ``_build_summary``.
 
-Locks issue #14 (``test_token_audit._envelope_summary`` drift). Any future
-edit that reintroduces a hand-rolled summary in the audit harness, or that
-changes ``_build_summary`` without running the audit, will flip this test red.
+Locks issue #14 (``test_token_audit._envelope_summary`` drift). The current
+harness is a thin delegate over ``_build_summary``, so ``_build_summary``
+behavior changes propagate to both sides and this test stays green by
+design — that is the intended guarantee. What this test *does* flip red on:
+
+- Someone reintroduces a hand-rolled summary in the audit harness
+  (the original bug this closes).
+- Someone changes the wrapper's arguments in a way that diverges from
+  production (e.g., defaulting ``truncated=True``, dropping
+  ``preview_trimmer``, passing a different ``meta`` shape).
+- Someone changes the envelope shell (``ok`` / ``error`` / ``meta``) so
+  that the audit no longer mirrors the production envelope wrapper.
 
 Kept separate from ``tests/test_token_audit.py`` because that module is
 ``pytestmark = pytest.mark.network`` (skips without ANTHROPIC_API_KEY). This
