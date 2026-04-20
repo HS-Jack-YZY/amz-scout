@@ -7,11 +7,11 @@
 
 ## Summary
 
-Two-file change (1 update + 1 new file) that replaces the hand-rolled
-`_envelope_summary` helper with a thin wrapper over
-`webapp.summaries._build_summary`, and adds a unit-marked contract test
-pinning harness ↔ production equivalence. Zero production changes. All
-validation green.
+Two-file **code** change (1 update + 1 new test file) plus two PRP
+documentation artifacts. Replaces the hand-rolled `_envelope_summary`
+helper with a thin wrapper over `webapp.summaries._build_summary`, and
+adds a unit-marked contract test pinning harness ↔ production
+equivalence. Zero production changes. All validation green.
 
 ## Files Reviewed
 
