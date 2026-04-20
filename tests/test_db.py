@@ -946,3 +946,115 @@ class TestFindProductByEanBrandGuardV7:
 
         raw = {"eanList": ["1234567890123"], "brand": ""}
         assert _find_product_by_ean(conn, "B0NEW000001", raw) == pid
+
+
+# ─── register_product concurrency ────────────────────────────────
+
+
+class TestRegisterProductConcurrency:
+    """`register_product` must be race-safe: concurrent writers for
+    the same normalized (brand, model) must all return the same
+    product_id, with exactly one is_new=True and no IntegrityError
+    escaping. Regression guard against the pre-UPSERT TOCTOU window.
+    """
+
+    def _run_workers(self, db_path, variants):
+        import threading
+
+        results: list[tuple[int, bool] | Exception | None] = [None] * len(variants)
+        # Barrier forces all workers into the write-path simultaneously
+        # so contention is deterministic rather than order-of-start.
+        barrier = threading.Barrier(len(variants))
+
+        def worker(i, brand, model):
+            c = sqlite3.connect(str(db_path), timeout=5.0)
+            c.row_factory = sqlite3.Row
+            c.execute("PRAGMA foreign_keys = ON")
+            try:
+                from amz_scout.db import register_product
+                barrier.wait(timeout=5.0)
+                results[i] = register_product(c, "Router", brand, model)
+            except Exception as exc:
+                results[i] = exc
+            finally:
+                c.close()
+
+        threads = [
+            threading.Thread(target=worker, args=(i, b, m))
+            for i, (b, m) in enumerate(variants)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        return results
+
+    def test_concurrent_same_key_no_integrity_error(self, tmp_path):
+        """N workers all register the same normalized (brand, model).
+        Exactly one sees is_new=True; all share the same product_id;
+        no IntegrityError leaks out.
+        """
+        import amz_scout.db as db_mod
+
+        db_path = tmp_path / "concurrency.db"
+        c0 = sqlite3.connect(str(db_path))
+        c0.execute("PRAGMA journal_mode = WAL")
+        c0.execute("PRAGMA foreign_keys = ON")
+        init_schema(c0)
+        c0.close()
+        db_mod._schema_initialized.discard(str(db_path))
+
+        variants = [("TP-Link", "Archer BE400")] * 8
+        results = self._run_workers(db_path, variants)
+
+        for r in results:
+            assert isinstance(r, tuple), f"worker raised or missed: {r!r}"
+        tuple_results = [r for r in results if isinstance(r, tuple)]
+        ids = {r[0] for r in tuple_results}
+        new_flags = [r[1] for r in tuple_results]
+        assert len(ids) == 1, f"expected all workers to agree on id, got {ids}"
+        assert new_flags.count(True) == 1, (
+            f"expected exactly one is_new=True, got {new_flags}"
+        )
+        assert new_flags.count(False) == 7
+
+    def test_concurrent_variant_literals_display_is_first_writer(self, tmp_path):
+        """Concurrent writers pass different casing/whitespace variants
+        of the same normalized key. Regardless of which thread wins,
+        the stored display literal is one of the inputs (no corruption)
+        and all threads observe the same product_id.
+        """
+        import amz_scout.db as db_mod
+
+        db_path = tmp_path / "concurrency_variants.db"
+        c0 = sqlite3.connect(str(db_path))
+        c0.execute("PRAGMA journal_mode = WAL")
+        c0.execute("PRAGMA foreign_keys = ON")
+        init_schema(c0)
+        c0.close()
+        db_mod._schema_initialized.discard(str(db_path))
+
+        variants = [
+            ("TP-Link", "Archer BE400"),
+            ("tp-link", "archer be400"),
+            ("  TP-LINK  ", "Archer  BE400"),
+            ("Tp-Link", "archer\tbe400"),
+        ]
+        results = self._run_workers(db_path, variants)
+        for r in results:
+            assert isinstance(r, tuple), f"worker raised or missed: {r!r}"
+        tuple_results = [r for r in results if isinstance(r, tuple)]
+        ids = {r[0] for r in tuple_results}
+        assert len(ids) == 1, f"expected single canonical id, got {ids}"
+
+        c = sqlite3.connect(str(db_path))
+        c.row_factory = sqlite3.Row
+        row = c.execute(
+            "SELECT brand, model, brand_key, model_key FROM products"
+        ).fetchone()
+        c.close()
+        # Display literal is ONE of the raced inputs, not a merged
+        # string. Keys are canonical.
+        assert (row["brand"], row["model"]) in variants
+        assert row["brand_key"] == "tp-link"
+        assert row["model_key"] == "archer be400"

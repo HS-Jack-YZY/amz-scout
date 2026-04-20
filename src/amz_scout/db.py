@@ -1612,20 +1612,27 @@ def register_product(
     """
     brand_key = _normalize_key(brand)
     model_key = _normalize_key(model)
-    row = conn.execute(
+    with conn:
+        row = conn.execute(
+            "INSERT INTO products "
+            "(category, brand, model, brand_key, model_key, search_keywords) "
+            "VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(brand_key, model_key) DO NOTHING "
+            "RETURNING id",
+            (category, brand, model, brand_key, model_key, search_keywords),
+        ).fetchone()
+    if row is not None:
+        return row["id"], True
+    existing = conn.execute(
         "SELECT id FROM products WHERE brand_key = ? AND model_key = ?",
         (brand_key, model_key),
     ).fetchone()
-    if row:
-        return row["id"], False
-    with conn:
-        cur = conn.execute(
-            "INSERT INTO products "
-            "(category, brand, model, brand_key, model_key, search_keywords) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (category, brand, model, brand_key, model_key, search_keywords),
+    if existing is None:
+        raise RuntimeError(
+            "register_product conflict fallback found no row for "
+            f"brand_key={brand_key!r}, model_key={model_key!r}"
         )
-    return cur.lastrowid, True  # type: ignore[return-value]
+    return existing["id"], False
 
 
 def register_asin(
