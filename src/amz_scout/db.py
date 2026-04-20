@@ -1627,6 +1627,11 @@ def register_product(
         "SELECT id FROM products WHERE brand_key = ? AND model_key = ?",
         (brand_key, model_key),
     ).fetchone()
+    if existing is None:
+        raise RuntimeError(
+            "register_product conflict fallback found no row for "
+            f"brand_key={brand_key!r}, model_key={model_key!r}"
+        )
     return existing["id"], False
 
 

@@ -962,6 +962,9 @@ class TestRegisterProductConcurrency:
         import threading
 
         results: list[tuple[int, bool] | Exception | None] = [None] * len(variants)
+        # Barrier forces all workers into the write-path simultaneously
+        # so contention is deterministic rather than order-of-start.
+        barrier = threading.Barrier(len(variants))
 
         def worker(i, brand, model):
             c = sqlite3.connect(str(db_path), timeout=5.0)
@@ -969,6 +972,7 @@ class TestRegisterProductConcurrency:
             c.execute("PRAGMA foreign_keys = ON")
             try:
                 from amz_scout.db import register_product
+                barrier.wait(timeout=5.0)
                 results[i] = register_product(c, "Router", brand, model)
             except Exception as exc:
                 results[i] = exc
