@@ -92,6 +92,7 @@ r = check_freshness()
 12. **禁止直接调用 Keepa API**: 所有 Keepa 操作必须通过 `amz_scout.api`。找 ASIN 优先级：(1) 问用户 → (2) WebSearch 搜 Amazon URL → (3) `discover_asin()`。违规导致 60 token 耗尽，阻塞 1 小时。
 13. **product_tags 暂不使用**: 过滤用 `category` / `brand` / `marketplace`。
 14. **查询直通（webapp）**: row-emitting 工具（`latest`/`availability`/`compare`/`deals`/`ranking`/`sellers`/`trends`）在 webapp 中不返回数据行，只返回 `{count, date_range, file_attached, preview}` 摘要；完整数据以 Excel 附件（`cl.File`）下发给用户下载。AI **不应**逐条解读 `preview`，应引导用户看 Excel 或基于 `count`/`date_range` 总结。`check_freshness` / `keepa_budget` 保持原样（本身就是摘要）。
+15. **Brand/model 归一化匹配（schema v7+）**: `register_product` 按 `_normalize_key(s)=" ".join((s or "").lower().split())` 做身份匹配（小写 + 折叠空白）；`products.brand`/`model` 保留首次入库字面作显示。调用方**无需**自己归一化；查询侧也不要再依赖 `brand = ?` 字面精确比较。UNIQUE 在 `(brand_key, model_key)` 上。
 
 ### Data Source
 

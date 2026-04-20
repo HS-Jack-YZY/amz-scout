@@ -99,6 +99,37 @@ cli.py  ────────────────────────
 
 9 tables: **Data**: `competitive_snapshots` (browser), `keepa_time_series` (price arrays), `keepa_buybox_history`, `keepa_coupon_history`, `keepa_deals`, `keepa_products` (metadata + fetch_mode). **Product registry**: `products`, `product_asins` (per-marketplace ASIN + status), `product_tags`. Series types 0-35 follow Keepa's csv[] indices; 100 = monthly_sold, 200+ = category rankings.
 
+### Migration History
+
+| Version | Description | Notes |
+|---------|-------------|-------|
+| 1 | Initial schema | Baseline — `competitive_snapshots` + `keepa_*` tables |
+| 2 | `project` column on `competitive_snapshots` | Per-project scoping |
+| 3 | Product registry tables | `products`, `product_asins`, `product_tags` |
+| 4 | `fetch_mode` on `keepa_products` | Track basic vs full fetches |
+| 5 | Tighten `product_asins.status` CHECK | Drop zombie `'unavailable'` value |
+| 6 | Remove intent validation | Collapse status to `active` / `not_listed` |
+| 7 | Normalize brand/model matching | Add `brand_key`/`model_key` + `UNIQUE(brand_key, model_key)` on `products`; merges literal-variant duplicates on upgrade |
+
+### Brand/Model Normalization (v7+)
+
+`products.brand` and `products.model` store the first writer's literal
+value for display. Identity matching uses the normalized
+`products.brand_key` / `products.model_key` columns, populated by
+`_normalize_key(s) = " ".join((s or "").lower().split())` (lowercase +
+strip + internal-whitespace fold). This prevents Keepa's literal noise
+(e.g. `'TP-Link'` vs `'TP-Link '` vs `'tp-link'`) from fracturing a
+single physical product across multiple `product_id` rows.
+
+The v7 migration merges any such pre-existing duplicates, keeping the
+lowest `id` as canonical and re-pointing child rows in
+`product_asins` / `product_tags` via `UPDATE OR IGNORE` + `DELETE`.
+Conflicts where two duplicate products held an ASIN on the same
+marketplace are logged at `WARNING` level for manual reconciliation.
+The rebuild toggles `PRAGMA foreign_keys` off/on around the
+`DROP TABLE products` + `RENAME products_v7 → products` sequence, per
+SQLite's recommended 12-step migration pattern.
+
 ## ASIN Status Semantics
 
 `product_asins.status` (since schema v6) is a 2-value enum. It tracks

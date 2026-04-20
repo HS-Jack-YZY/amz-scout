@@ -102,7 +102,7 @@ SERIES_NAMES = {
     100: "MONTHLY_SOLD",
 }
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 # ─── Connection management ────────────────────────────────────────────
 
@@ -404,12 +404,152 @@ def _migrate(conn: sqlite3.Connection) -> None:
                     "status -> active/not_listed')"
                 )
                 logger.info("Migrated schema to version 6")
+
+        # v7 lives OUTSIDE the ``with conn`` above because it toggles
+        # ``PRAGMA foreign_keys``, which is a silent no-op inside an
+        # active transaction. We keep v2-v6 inside the original txn so
+        # their atomicity is unchanged, then run v7 as its own unit.
+        if current < 7:
+            _migrate_to_v7(conn)
     except Exception:
         logger.exception(
             "Schema migration failed at version %d. Database may need manual repair.",
             current,
         )
         raise
+
+
+def _migrate_to_v7(conn: sqlite3.Connection) -> None:
+    """Rebuild ``products`` with normalized ``brand_key``/``model_key`` columns.
+
+    SQLite cannot ``ALTER TABLE`` to change a UNIQUE constraint, so we
+    rebuild the table. ``product_asins`` and ``product_tags`` have
+    ``ON DELETE CASCADE`` foreign keys into ``products``; FK enforcement
+    must be disabled during the rebuild, per SQLite's recommended
+    "12-step migration" (https://sqlite.org/lang_altertable.html).
+    ``PRAGMA foreign_keys`` is a no-op inside an active transaction, so
+    this function runs outside the migrator's main ``with conn`` block.
+
+    Duplicates are merged by normalized key; the lowest ``id`` per
+    ``(brand_key, model_key)`` is kept as canonical, and child rows in
+    ``product_asins``/``product_tags`` are re-pointed at it.
+    ``UPDATE OR IGNORE`` + explicit ``DELETE`` resolves the
+    ``(product_id, marketplace)`` primary-key collision when two
+    duplicate products both held an ASIN in the same marketplace; the
+    losing row is logged so operators can reconcile manually.
+    """
+    conn.execute("PRAGMA foreign_keys = OFF")
+    try:
+        with conn:
+            legacy = conn.execute(
+                "SELECT id, category, brand, model, search_keywords, "
+                "created_at, updated_at FROM products"
+            ).fetchall()
+
+            # Group by normalized key; pick min(id) as canonical.
+            by_key: dict[tuple[str, str], dict] = {}
+            for row in legacy:
+                key = (_normalize_key(row["brand"]), _normalize_key(row["model"]))
+                if key not in by_key or row["id"] < by_key[key]["id"]:
+                    by_key[key] = dict(row)
+            id_remap: dict[int, int] = {
+                row["id"]: by_key[
+                    (_normalize_key(row["brand"]), _normalize_key(row["model"]))
+                ]["id"]
+                for row in legacy
+            }
+
+            # Build the replacement table and populate canonical rows,
+            # preserving original id/timestamps for the kept row.
+            conn.execute("""
+                CREATE TABLE products_v7 (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    category        TEXT NOT NULL,
+                    brand           TEXT NOT NULL,
+                    model           TEXT NOT NULL,
+                    brand_key       TEXT NOT NULL,
+                    model_key       TEXT NOT NULL,
+                    search_keywords TEXT NOT NULL DEFAULT '',
+                    created_at      TEXT NOT NULL
+                        DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                    updated_at      TEXT NOT NULL
+                        DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                    UNIQUE(brand_key, model_key)
+                )
+            """)
+            for (bkey, mkey), row in by_key.items():
+                conn.execute(
+                    "INSERT INTO products_v7 "
+                    "(id, category, brand, model, brand_key, model_key, "
+                    " search_keywords, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        row["id"],
+                        row["category"],
+                        row["brand"],
+                        row["model"],
+                        bkey,
+                        mkey,
+                        row["search_keywords"],
+                        row["created_at"],
+                        row["updated_at"],
+                    ),
+                )
+
+            # Re-point child rows at canonical ids. UPDATE OR IGNORE
+            # skips (product_id, marketplace) / (product_id, tag) PK
+            # collisions; DELETE then removes the superseded rows.
+            for old_id, new_id in id_remap.items():
+                if old_id == new_id:
+                    continue
+                conn.execute(
+                    "UPDATE OR IGNORE product_asins "
+                    "SET product_id = ? WHERE product_id = ?",
+                    (new_id, old_id),
+                )
+                dropped = conn.execute(
+                    "SELECT marketplace, asin FROM product_asins "
+                    "WHERE product_id = ?",
+                    (old_id,),
+                ).fetchall()
+                conn.execute(
+                    "DELETE FROM product_asins WHERE product_id = ?",
+                    (old_id,),
+                )
+                for row in dropped:
+                    logger.warning(
+                        "v7 merge: dropped duplicate ASIN %s on %s "
+                        "(product_id %d → %d conflict, canonical kept)",
+                        row["asin"],
+                        row["marketplace"],
+                        old_id,
+                        new_id,
+                    )
+                conn.execute(
+                    "UPDATE OR IGNORE product_tags "
+                    "SET product_id = ? WHERE product_id = ?",
+                    (new_id, old_id),
+                )
+                conn.execute(
+                    "DELETE FROM product_tags WHERE product_id = ?",
+                    (old_id,),
+                )
+
+            # Swap tables. FK is off, so dropping the old products does
+            # not cascade-delete child rows; the rename restores the
+            # canonical name referenced by child FK definitions.
+            conn.execute("DROP TABLE products")
+            conn.execute("ALTER TABLE products_v7 RENAME TO products")
+
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations "
+                "(version, description) VALUES "
+                "(7, 'normalize brand/model matching via "
+                "brand_key/model_key')"
+            )
+            logger.info("Migrated schema to version 7")
+    finally:
+        conn.execute("PRAGMA foreign_keys = ON")
 
 
 _SCHEMA_SQL = """
@@ -427,6 +567,8 @@ INSERT INTO schema_migrations (version, description)
     VALUES (5, 'drop zombie unavailable status from product_asins.CHECK');
 INSERT INTO schema_migrations (version, description)
     VALUES (6, 'remove intent validation: status -> active/not_listed');
+INSERT INTO schema_migrations (version, description)
+    VALUES (7, 'normalize brand/model matching via brand_key/model_key');
 
 CREATE TABLE competitive_snapshots (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -569,12 +711,19 @@ CREATE TABLE keepa_products (
 CREATE TABLE products (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     category        TEXT NOT NULL,
+    -- brand/model keep the first-writer's literal string for display.
     brand           TEXT NOT NULL,
     model           TEXT NOT NULL,
+    -- brand_key/model_key are the normalized identity keys populated by
+    -- _normalize_key() (lowercase + trim + internal-whitespace fold).
+    -- Uniqueness is enforced on the keys, not the display literals, so
+    -- "TP-Link" / " tp-link " / "tp-link" all map to one product_id.
+    brand_key       TEXT NOT NULL,
+    model_key       TEXT NOT NULL,
     search_keywords TEXT NOT NULL DEFAULT '',
     created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
     updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
-    UNIQUE(brand, model)
+    UNIQUE(brand_key, model_key)
 );
 
 CREATE TABLE product_asins (
@@ -686,6 +835,18 @@ def _safe_json_list(s: str | None) -> list:
         return []
 
 
+def _normalize_key(s: str | None) -> str:
+    """Normalize a brand/model string for identity matching.
+
+    Lowercases, strips surrounding whitespace, and folds any internal
+    whitespace runs (spaces, tabs) into a single space. Used as the
+    uniqueness basis for ``products.brand_key`` / ``products.model_key``
+    so that Keepa's literal casing/whitespace noise does not split one
+    physical product across multiple ``product_id`` rows.
+    """
+    return " ".join((s or "").lower().split())
+
+
 def _find_product_by_ean(
     conn: sqlite3.Connection,
     asin: str,
@@ -721,7 +882,11 @@ def _find_product_by_ean(
 
     # No brand available — EAN alone is sufficient evidence; skip brand guard
     if brand:
-        sql += "    AND kp.brand = ?\n"
+        # Compare case-insensitively, trimming whitespace, so Keepa
+        # casing/spacing variance doesn't split a valid EAN hit.
+        # SQLite LOWER is ASCII-only, which is acceptable because
+        # brand/model values in this project are ASCII.
+        sql += "    AND LOWER(TRIM(kp.brand)) = LOWER(TRIM(?))\n"
         params.append(brand)
 
     rows = conn.execute(sql, params).fetchall()
@@ -1434,20 +1599,31 @@ def register_product(
     model: str,
     search_keywords: str = "",
 ) -> tuple[int, bool]:
-    """Insert a product, or return existing id if (brand, model) already exists.
+    """Insert a product, or return existing id if normalized (brand, model) matches.
 
-    Returns ``(product_id, is_new)`` where *is_new* is True when the row was
-    just inserted.
+    Matching uses :func:`_normalize_key` on brand/model so surrounding
+    whitespace, casing, and internal multi-space differences fold to the
+    same identity. The original ``brand`` / ``model`` strings are
+    preserved on the stored row for display; subsequent calls that hit
+    an existing row do **not** overwrite the display literal.
+
+    Returns ``(product_id, is_new)`` where *is_new* is True when the row
+    was just inserted.
     """
+    brand_key = _normalize_key(brand)
+    model_key = _normalize_key(model)
     row = conn.execute(
-        "SELECT id FROM products WHERE brand = ? AND model = ?", (brand, model)
+        "SELECT id FROM products WHERE brand_key = ? AND model_key = ?",
+        (brand_key, model_key),
     ).fetchone()
     if row:
         return row["id"], False
     with conn:
         cur = conn.execute(
-            "INSERT INTO products (category, brand, model, search_keywords) VALUES (?, ?, ?, ?)",
-            (category, brand, model, search_keywords),
+            "INSERT INTO products "
+            "(category, brand, model, brand_key, model_key, search_keywords) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (category, brand, model, brand_key, model_key, search_keywords),
         )
     return cur.lastrowid, True  # type: ignore[return-value]
 
@@ -1571,8 +1747,10 @@ def list_registered_products(
         sql += " AND p.category = ?"
         params.append(category)
     if brand:
-        sql += " AND p.brand = ?"
-        params.append(brand)
+        # Match on normalized brand_key so callers can pass casing or
+        # whitespace variants of the stored display literal (v7+).
+        sql += " AND p.brand_key = ?"
+        params.append(_normalize_key(brand))
     if marketplace:
         sql += " AND pa.marketplace = ?"
         params.append(marketplace)
@@ -1614,8 +1792,9 @@ def load_products_from_db(
         wheres.append("p.category = ?")
         params.append(category)
     if brand:
-        wheres.append("p.brand = ?")
-        params.append(brand)
+        # Match on normalized brand_key (v7+) — see list_registered_products.
+        wheres.append("p.brand_key = ?")
+        params.append(_normalize_key(brand))
 
     if joins:
         sql += " " + " ".join(joins)
@@ -1690,10 +1869,19 @@ def find_product_exact(
     brand: str,
     model: str,
 ) -> dict | None:
-    """Find a product by exact brand + model match. Returns dict with id or None."""
+    """Find a product by normalized brand + model match.
+
+    Matching mirrors :func:`register_product`: inputs are passed
+    through :func:`_normalize_key` (lowercase + whitespace fold) and
+    compared against the stored ``brand_key`` / ``model_key`` columns.
+    Callers may pass casing or whitespace variants of the literal used
+    at registration time; the stored display ``brand`` / ``model``
+    strings are not used for matching. Returns a dict with ``id`` or
+    None.
+    """
     row = conn.execute(
-        "SELECT id FROM products WHERE brand = ? AND model = ?",
-        (brand, model),
+        "SELECT id FROM products WHERE brand_key = ? AND model_key = ?",
+        (_normalize_key(brand), _normalize_key(model)),
     ).fetchone()
     return dict(row) if row else None
 

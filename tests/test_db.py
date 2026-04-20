@@ -62,11 +62,11 @@ class TestSchema:
     def test_init_schema_idempotent(self, conn):
         init_schema(conn)  # Second call should not raise
         row = conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()
-        assert row[0] == 6  # v1 + v2 + v3 + v4 + v5 + v6
+        assert row[0] == 7  # v1 + v2 + v3 + v4 + v5 + v6 + v7
 
     def test_schema_version(self, conn):
         row = conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()
-        assert row[0] == 6
+        assert row[0] == 7
 
 
 # ─── Keepa write tests ──────────────────────────────────────────────
@@ -427,7 +427,10 @@ class TestStatusMigrationV6:
         c0 = sqlite3.connect(str(db_path))
         c0.row_factory = sqlite3.Row
         init_schema(c0)
-        c0.execute("DELETE FROM schema_migrations WHERE version = 6")
+        # Drop v6 *and* v7 records so MAX(version)=5 and the v6
+        # migration path actually runs on reopen. (v7 records are
+        # seeded by _SCHEMA_SQL even for a "fresh v5 downgrade".)
+        c0.execute("DELETE FROM schema_migrations WHERE version IN (6, 7)")
         c0.execute("ALTER TABLE product_asins RENAME TO _pa_tmp")
         c0.execute("""
             CREATE TABLE product_asins (
@@ -497,11 +500,12 @@ class TestStatusMigrationV6:
         ).fetchone()
         assert idx is not None, "v6 migration must recreate idx_pa_asin"
 
-        # Migration record inserted.
+        # Migration records inserted. Reopen runs v6 AND v7 since both
+        # records were cleared in Step 1, so MAX(version) advances to 7.
         ver = c2.execute(
             "SELECT MAX(version) AS v FROM schema_migrations"
         ).fetchone()
-        assert ver["v"] == 6
+        assert ver["v"] == 7
 
         # Tightened CHECK is in force: legacy values now rejected.
         with pytest.raises(sqlite3.IntegrityError):
@@ -512,3 +516,433 @@ class TestStatusMigrationV6:
                 (pid,),
             )
         c2.close()
+
+
+# ─── Schema v7 migration tests ───────────────────────────────────────
+
+
+class TestBrandModelKeyMigrationV7:
+    """Verify schema v7: normalize brand/model identity via
+    ``brand_key``/``model_key``. ``register_product`` matches on the
+    normalized keys; display literals ``brand``/``model`` preserve
+    whatever the first writer wrote.
+    """
+
+    def test_v7_normalize_key_basic(self):
+        from amz_scout.db import _normalize_key
+
+        assert _normalize_key("TP-Link") == "tp-link"
+        assert _normalize_key("  TP-Link  ") == "tp-link"
+        assert _normalize_key("Archer  BE400") == "archer be400"
+        assert _normalize_key("\tArcher\nBE400\t") == "archer be400"
+        assert _normalize_key(None) == ""
+        assert _normalize_key("") == ""
+        assert _normalize_key("GL.iNet") == "gl.inet"
+
+    def test_v7_register_product_matches_whitespace_variants(self, conn):
+        from amz_scout.db import register_product
+
+        pid1, new1 = register_product(conn, "Router", "TP-Link", "Archer BE400")
+        pid2, new2 = register_product(conn, "Router", "  tp-link  ", "archer  be400")
+        pid3, new3 = register_product(conn, "Router", "TP-LINK", "Archer\tBE400")
+        assert pid1 == pid2 == pid3
+        assert new1 is True
+        assert new2 is False
+        assert new3 is False
+
+    def test_v7_register_product_preserves_display(self, conn):
+        """First writer's literal is preserved; later calls that match
+        on normalized keys do NOT overwrite ``products.brand``/``model``.
+        """
+        from amz_scout.db import register_product
+
+        pid, _ = register_product(conn, "Router", "TP-Link", "Archer BE400")
+        register_product(conn, "Router", "tp-link", "archer be400")
+        row = conn.execute(
+            "SELECT brand, model FROM products WHERE id = ?", (pid,)
+        ).fetchone()
+        assert row["brand"] == "TP-Link"
+        assert row["model"] == "Archer BE400"
+
+    def test_v7_unique_constraint_on_keys(self, conn):
+        """Two rows with different literals but identical normalized
+        keys must violate UNIQUE(brand_key, model_key) on direct INSERT.
+        """
+        conn.execute(
+            "INSERT INTO products "
+            "(category, brand, model, brand_key, model_key) "
+            "VALUES ('Router', 'TP-Link', 'Archer BE400', "
+            "'tp-link', 'archer be400')"
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO products "
+                "(category, brand, model, brand_key, model_key) "
+                "VALUES ('Router', 'tp-link', 'archer be400', "
+                "'tp-link', 'archer be400')"
+            )
+
+    def test_v7_idempotent(self, conn):
+        init_schema(conn)  # second call
+        row = conn.execute(
+            "SELECT COUNT(*) AS c FROM schema_migrations WHERE version = 7"
+        ).fetchone()
+        assert row["c"] == 1
+
+    def test_v7_migrates_v6_db_and_merges_duplicates(self, tmp_path, caplog):
+        """v6 → v7 upgrade: rebuild products with brand_key/model_key,
+        merge rows whose normalized (brand, model) collide, and re-point
+        product_asins / product_tags at the surviving canonical id.
+
+        Forcibly downgrade a fresh DB to v6 shape (drop v7 migration
+        record + rebuild products without the key columns), insert
+        literal duplicates that v6 UNIQUE(brand, model) does not
+        reject, then reopen so the real v7 migration path runs.
+        """
+        import amz_scout.db as db_mod
+
+        db_path = tmp_path / "v6tov7.db"
+
+        c0 = sqlite3.connect(str(db_path))
+        c0.row_factory = sqlite3.Row
+        c0.execute("PRAGMA foreign_keys = ON")
+        init_schema(c0)
+
+        c0.execute("PRAGMA foreign_keys = OFF")
+        c0.execute("DELETE FROM schema_migrations WHERE version = 7")
+        c0.execute("DROP TABLE products")
+        c0.execute("""
+            CREATE TABLE products (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                category        TEXT NOT NULL,
+                brand           TEXT NOT NULL,
+                model           TEXT NOT NULL,
+                search_keywords TEXT NOT NULL DEFAULT '',
+                created_at      TEXT NOT NULL
+                    DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                updated_at      TEXT NOT NULL
+                    DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                UNIQUE(brand, model)
+            )
+        """)
+
+        c0.execute(
+            "INSERT INTO products (id, category, brand, model) "
+            "VALUES (10, 'Router', 'TP-Link', 'Archer BE400')"
+        )
+        c0.execute(
+            "INSERT INTO products (id, category, brand, model) "
+            "VALUES (11, 'Router', 'TP-Link ', 'Archer BE400')"
+        )
+        c0.execute(
+            "INSERT INTO products (id, category, brand, model) "
+            "VALUES (12, 'Router', 'tp-link', 'Archer BE400')"
+        )
+        c0.execute(
+            "INSERT INTO products (id, category, brand, model) "
+            "VALUES (20, 'Router', 'GL.iNet', 'Slate 7')"
+        )
+
+        for pid, mp, asin in [
+            (10, "UK", "B0UK000001"),
+            (11, "DE", "B0DE000001"),
+            (11, "UK", "B0UK000099"),
+            (12, "FR", "B0FR000001"),
+            (20, "UK", "B0SLATE0001"),
+        ]:
+            c0.execute(
+                "INSERT INTO product_asins "
+                "(product_id, marketplace, asin) VALUES (?, ?, ?)",
+                (pid, mp, asin),
+            )
+
+        for pid, tag in [
+            (10, "travel-router"),
+            (11, "travel-router"),
+            (12, "tplink-alpha"),
+        ]:
+            c0.execute(
+                "INSERT INTO product_tags (product_id, tag) "
+                "VALUES (?, ?)",
+                (pid, tag),
+            )
+
+        c0.execute("PRAGMA foreign_keys = ON")
+        c0.commit()
+        c0.close()
+
+        db_mod._schema_initialized.discard(str(db_path))
+        c2 = sqlite3.connect(str(db_path))
+        c2.row_factory = sqlite3.Row
+        c2.execute("PRAGMA foreign_keys = ON")
+        import logging as _logging
+
+        with caplog.at_level(_logging.WARNING, logger="amz_scout.db"):
+            init_schema(c2)
+
+        # The v7 merge drops B0UK000099 (product 11 UK) because its
+        # (product_id, marketplace) conflicts with (10, UK) after the
+        # merge. The migrator must log which ASIN was dropped so an
+        # operator can reconcile the loser manually.
+        assert "B0UK000099" in caplog.text, (
+            "expected dropped-ASIN warning; got:\n" + caplog.text
+        )
+        assert "UK" in caplog.text
+
+        rows = c2.execute(
+            "SELECT id, brand, model, brand_key, model_key "
+            "FROM products ORDER BY id"
+        ).fetchall()
+        ids = [r["id"] for r in rows]
+        assert ids == [10, 20], f"expected merged ids [10, 20], got {ids}"
+        tp = next(r for r in rows if r["id"] == 10)
+        assert tp["brand"] == "TP-Link"
+        assert tp["model"] == "Archer BE400"
+        assert tp["brand_key"] == "tp-link"
+        assert tp["model_key"] == "archer be400"
+
+        asins = {
+            (r["product_id"], r["marketplace"]): r["asin"]
+            for r in c2.execute(
+                "SELECT product_id, marketplace, asin FROM product_asins"
+            ).fetchall()
+        }
+        assert asins == {
+            (10, "UK"): "B0UK000001",
+            (10, "DE"): "B0DE000001",
+            (10, "FR"): "B0FR000001",
+            (20, "UK"): "B0SLATE0001",
+        }
+
+        tags = {
+            (r["product_id"], r["tag"])
+            for r in c2.execute(
+                "SELECT product_id, tag FROM product_tags"
+            ).fetchall()
+        }
+        assert tags == {(10, "travel-router"), (10, "tplink-alpha")}
+
+        ver = c2.execute(
+            "SELECT MAX(version) AS v FROM schema_migrations"
+        ).fetchone()["v"]
+        assert ver == 7
+
+        with pytest.raises(sqlite3.IntegrityError):
+            c2.execute(
+                "INSERT INTO products "
+                "(category, brand, model, brand_key, model_key) "
+                "VALUES ('Router', 'TP-Link', 'Archer BE400', "
+                "'tp-link', 'archer be400')"
+            )
+        c2.close()
+
+    def test_v7_fk_integrity_after_migration(self, tmp_path):
+        """After the v7 migration, product_asins FK enforcement is back
+        on and every product_id resolves to a valid row in the new
+        ``products``. This test seeds a single product (no merge path)
+        and focuses on FK restoration; the merge path is covered by
+        ``test_v7_migrates_v6_db_and_merges_duplicates``.
+        """
+        import amz_scout.db as db_mod
+
+        db_path = tmp_path / "v6tov7_fk.db"
+
+        c0 = sqlite3.connect(str(db_path))
+        c0.row_factory = sqlite3.Row
+        c0.execute("PRAGMA foreign_keys = ON")
+        init_schema(c0)
+
+        c0.execute("PRAGMA foreign_keys = OFF")
+        c0.execute("DELETE FROM schema_migrations WHERE version = 7")
+        c0.execute("DROP TABLE products")
+        c0.execute("""
+            CREATE TABLE products (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                category        TEXT NOT NULL,
+                brand           TEXT NOT NULL,
+                model           TEXT NOT NULL,
+                search_keywords TEXT NOT NULL DEFAULT '',
+                created_at      TEXT NOT NULL
+                    DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                updated_at      TEXT NOT NULL
+                    DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                UNIQUE(brand, model)
+            )
+        """)
+        c0.execute(
+            "INSERT INTO products (id, category, brand, model) "
+            "VALUES (1, 'Router', 'TP-Link', 'Archer BE400')"
+        )
+        c0.execute(
+            "INSERT INTO product_asins (product_id, marketplace, asin) "
+            "VALUES (1, 'UK', 'B0UK000001')"
+        )
+        c0.execute("PRAGMA foreign_keys = ON")
+        c0.commit()
+        c0.close()
+
+        db_mod._schema_initialized.discard(str(db_path))
+        c2 = sqlite3.connect(str(db_path))
+        c2.row_factory = sqlite3.Row
+        c2.execute("PRAGMA foreign_keys = ON")
+        init_schema(c2)
+
+        # FK check: no orphan product_ids.
+        orphans = c2.execute("PRAGMA foreign_key_check").fetchall()
+        assert orphans == [], f"FK orphans after v7: {orphans}"
+
+        # FK is enforced again: inserting an ASIN with unknown
+        # product_id must fail.
+        with pytest.raises(sqlite3.IntegrityError):
+            c2.execute(
+                "INSERT INTO product_asins "
+                "(product_id, marketplace, asin) "
+                "VALUES (999, 'XX', 'B0NOSUCHPID')"
+            )
+        c2.close()
+
+
+# ─── Query-side normalization (v7 contract) ──────────────────────────
+
+
+class TestQuerySideNormalizationV7:
+    """v7 stores brand/model under normalized keys. The *query* helpers
+    must honor the same identity contract so callers can pass casing or
+    whitespace variants and still hit the registered row.
+
+    These cover the follow-up to schema v7 where ``register_product``
+    was the only path normalized. Literal ``brand = ?`` comparisons in
+    ``find_product_exact`` / ``list_registered_products`` /
+    ``load_products_from_db`` produced silent "registered but not
+    findable" failures.
+    """
+
+    def test_find_product_exact_matches_normalized_variants(self, conn):
+        from amz_scout.db import find_product_exact, register_product
+
+        pid, _ = register_product(conn, "Router", "TP-Link", "Archer BE400")
+
+        for b, m in [
+            ("TP-Link", "Archer BE400"),
+            ("tp-link", "archer be400"),
+            ("  TP-Link  ", "Archer\tBE400"),
+            ("TP-LINK", "Archer  BE400"),
+        ]:
+            row = find_product_exact(conn, b, m)
+            assert row is not None, f"expected hit for ({b!r}, {m!r})"
+            assert row["id"] == pid
+        assert find_product_exact(conn, "nope", "Archer BE400") is None
+
+    def test_list_registered_products_brand_filter_normalized(self, conn):
+        from amz_scout.db import (
+            list_registered_products,
+            register_asin,
+            register_product,
+        )
+
+        pid, _ = register_product(conn, "Router", "TP-Link", "Archer BE400")
+        register_asin(conn, pid, "UK", "B0UK000001")
+
+        # Stored display literal is "TP-Link"; querying with variants
+        # must still return the row.
+        assert len(list_registered_products(conn, brand="TP-Link")) == 1
+        assert len(list_registered_products(conn, brand="tp-link")) == 1
+        assert len(list_registered_products(conn, brand="  TP-LINK  ")) == 1
+        assert list_registered_products(conn, brand="wrong") == []
+
+    def test_load_products_from_db_brand_filter_normalized(self, conn):
+        from amz_scout.db import (
+            load_products_from_db,
+            register_asin,
+            register_product,
+        )
+
+        pid, _ = register_product(conn, "Router", "TP-Link", "Archer BE400")
+        register_asin(conn, pid, "UK", "B0UK000001")
+
+        assert len(load_products_from_db(conn, brand="TP-Link")) == 1
+        assert len(load_products_from_db(conn, brand="tp-link")) == 1
+        assert len(load_products_from_db(conn, brand="\tTP-Link\n")) == 1
+        assert load_products_from_db(conn, brand="wrong") == []
+
+
+# ─── _find_product_by_ean brand-guard normalization ──────────────────
+
+
+class TestFindProductByEanBrandGuardV7:
+    """The v7 refactor relaxed the ``_find_product_by_ean`` brand guard
+    from literal ``brand = ?`` to ``LOWER(TRIM(kp.brand)) = LOWER(TRIM(?))``.
+    This lets Keepa's casing/spacing variance (the raw source of the
+    registry identity drift that v7 exists to fix) still hit the
+    matching EAN/UPC row instead of silently returning None and
+    producing a duplicate product_id on cross-market bind.
+
+    These tests pin the new behavior directly; prior to this PR the
+    helper had no test coverage at all for the brand-guard branch.
+    """
+
+    def _seed_keepa_row(
+        self,
+        conn: sqlite3.Connection,
+        asin: str,
+        site: str,
+        brand: str,
+        ean: str,
+    ) -> None:
+        conn.execute(
+            "INSERT INTO keepa_products "
+            "(asin, site, brand, ean_list, upc_list, fetch_mode, fetched_at) "
+            "VALUES (?, ?, ?, ?, '[]', 'full', '2026-04-20T00:00:00Z')",
+            (asin, site, brand, f'["{ean}"]'),
+        )
+
+    def test_brand_guard_hits_on_case_and_whitespace_variants(self, conn):
+        from amz_scout.db import _find_product_by_ean, register_asin, register_product
+
+        pid, _ = register_product(conn, "Router", "GL.iNet", "Slate 7")
+        # Seed an existing Keepa row whose brand has Keepa-typical
+        # surrounding whitespace that the old literal `brand = ?`
+        # guard would have missed.
+        self._seed_keepa_row(
+            conn, "B0REF000001", "UK", "  GL.iNet  ", "1234567890123"
+        )
+        register_asin(conn, pid, "UK", "B0REF000001")
+
+        # A new ASIN shares the EAN and names the same brand with
+        # different casing. The guard must still accept this as a hit.
+        raw = {"eanList": ["1234567890123"], "brand": "gl.inet"}
+        assert _find_product_by_ean(conn, "B0NEW000001", raw) == pid
+
+        raw = {"eanList": ["1234567890123"], "brand": " GL.INET "}
+        assert _find_product_by_ean(conn, "B0NEW000001", raw) == pid
+
+    def test_brand_guard_rejects_true_mismatch(self, conn):
+        from amz_scout.db import _find_product_by_ean, register_asin, register_product
+
+        pid, _ = register_product(conn, "Router", "GL.iNet", "Slate 7")
+        self._seed_keepa_row(
+            conn, "B0REF000001", "UK", "GL.iNet", "1234567890123"
+        )
+        register_asin(conn, pid, "UK", "B0REF000001")
+
+        # Same EAN, genuinely different brand — guard must still reject.
+        raw = {"eanList": ["1234567890123"], "brand": "TP-Link"}
+        assert _find_product_by_ean(conn, "B0NEW000001", raw) is None
+
+    def test_brand_guard_skipped_when_brand_absent(self, conn):
+        """Comment in production code promises: 'No brand available —
+        EAN alone is sufficient evidence; skip brand guard'. Pin it."""
+        from amz_scout.db import _find_product_by_ean, register_asin, register_product
+
+        pid, _ = register_product(conn, "Router", "GL.iNet", "Slate 7")
+        self._seed_keepa_row(
+            conn, "B0REF000001", "UK", "GL.iNet", "1234567890123"
+        )
+        register_asin(conn, pid, "UK", "B0REF000001")
+
+        # No brand in raw => guard skipped, EAN alone binds.
+        raw = {"eanList": ["1234567890123"]}
+        assert _find_product_by_ean(conn, "B0NEW000001", raw) == pid
+
+        raw = {"eanList": ["1234567890123"], "brand": ""}
+        assert _find_product_by_ean(conn, "B0NEW000001", raw) == pid
