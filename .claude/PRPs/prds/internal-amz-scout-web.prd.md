@@ -129,7 +129,7 @@ The other 4 colleagues (PMs + market analysts). Their specific use cases are for
 | **Should** | `cl.Step` progress display for long-running tools | Prevents "did it freeze?" misinterpretation |
 | **Should** | Chainlit built-in thumbs up/down feedback stored in SQLite | Required infrastructure to measure the <10% error rate |
 | **Could** | Wrap product registry tools (`list_products`, `add_product`, `remove_product_by_model`, `update_product_asin`, `register_market_asins`, `import_yaml`) | Jack chose "open all permissions" in MVP; register functions are safe and lightweight |
-| **Could** | Wrap high-risk tools (`ensure_keepa_data`, `validate_and_discover`, `batch_discover`, `discover_asin`, `validate_asins`, `sync_registry`) with explicit confirmation dialogs | Honor Jack's "open all permissions" MVP decision; protect users from accidental cost |
+| **Could** | Wrap high-risk tools (`ensure_keepa_data`, `batch_discover`, `discover_asin`, `sync_registry`) with explicit confirmation dialogs | Honor Jack's "open all permissions" MVP decision; protect users from accidental cost |
 | **Won't** | Scheduled monitoring (scenario 2) | Deferred to v1.1 |
 | **Won't** | Multi-tenant / per-user quotas | 6-user scale doesn't need it |
 | **Won't** | Mobile UI optimization | Company laptops only |
@@ -229,7 +229,7 @@ The other 4 colleagues (PMs + market analysts). Their specific use cases are for
 |---|---|---|---|
 | **LLM parameter translation errors** (wrong marketplace, wrong series type, missing/extra days param) | Medium | Medium | (1) Detailed Chinese + English docstrings on each Chainlit tool. (2) Every tool response displays resolved parameters + data source so user can self-verify. (3) Chainlit thumbs-down reveals bad patterns over time. (4) Use `amz_scout.api`'s marketplace aliases (accepts `uk`/`GB`/`amazon.co.uk`/`GBP` — already implemented) to absorb LLM variation. |
 | **browser-use CLI fails on AWS headless Linux** | Low-Medium | Medium | Default `headed=False` uses built-in headless Chromium (confirmed via Phase 3 code audit at `browser.py:24,36`). Verify in W2 D5 deployment smoke test. Never expose `headed=True` to users. |
-| **Long-running tools** (`batch_discover`, `validate_asins`) **block UI** | Medium | Low (MVP scope) | `cl.Step` shows progress; explicit confirmation dialog before starting; 5-minute timeout with partial results; `batch_discover` honors existing `phase="pending_confirmation"` protocol to gate execution. |
+| **Long-running tools** (`batch_discover`) **block UI** | Medium | Low (MVP scope) | `cl.Step` shows progress; explicit confirmation dialog before starting; 5-minute timeout with partial results; `batch_discover` honors existing `phase="pending_confirmation"` protocol to gate execution. |
 | **Keepa token burn from concurrent users** | Low | Low | 60 tokens + 1/min refill is comfortable for 6 users. Token budget visible in top bar. Existing `phase="needs_confirmation"` gates ≥6-token operations — front-end just consumes it. |
 | **Sonnet 4.6 monthly cost exceeds expectations** | Low | Low | Prompt caching from day 1 (~90% input token savings). Expected $40-80/month. Monitor weekly via Anthropic usage dashboard. Hybrid Haiku/Sonnet routing is a v1.1 optimization if needed. |
 | **Sensitive competitive data routed through Anthropic API** | Medium | Medium | MVP accepts Anthropic's default 30-day retention (no model training). Post-MVP: apply for Zero Data Retention (tracked in `memory/project_web_deploy_zdr_todo.md`, target reminder ~2026-05-04). |
@@ -252,7 +252,7 @@ The other 4 colleagues (PMs + market analysts). Their specific use cases are for
 | 1 | **Scaffolding** | `webapp/` module, Chainlit hello-world, password auth callback with `@gl-inet.com` whitelist, 1 tool (`query_latest`) wired end-to-end, local dev run verified | in-progress | - | - | [phase1-webapp-scaffolding.plan.md](../plans/phase1-webapp-scaffolding.plan.md) |
 | 2 | **Query tools** | Wrap 9 read-only query functions as Chainlit tools with bilingual docstrings + `amz_scout.api` marketplace aliasing support | complete | with 3 | 1 | [phase2-query-tools.plan.md](../plans/completed/phase2-query-tools.plan.md) |
 | 3 | **Management tools** | Wrap 6 product registry functions (`list_products`, `add_product`, `remove_product_by_model`, `update_product_asin`, `register_market_asins`, `import_yaml`); honor `phase="needs_confirmation"` protocol in UI | pending | with 2 | 1 | - |
-| 4 | **High-risk tools + long task UX** | Wrap `ensure_keepa_data`, `validate_and_discover`, `batch_discover`, `discover_asin`, `validate_asins`, `sync_registry` with `cl.Step` progress + explicit confirmation dialogs for token-consuming / long-running operations | pending | - | 2, 3 | - |
+| 4 | **High-risk tools + long task UX** | Wrap `ensure_keepa_data`, `batch_discover`, `discover_asin`, `sync_registry` with `cl.Step` progress + explicit confirmation dialogs for token-consuming / long-running operations | pending | - | 2, 3 | - |
 | 5 | **Excel export layer** | `webapp/export.py`: pandas-based XLSX builder (multi-sheet where appropriate), attached via `cl.File` to every query tool reply. **Requires Q3 answer from 小李.** | pending | with 4 | 2 | - |
 | 6 | **Deployment** | Dockerfile (`python:3.12-slim-bookworm` + `pip install uv browser-use` + `browser-use install`), `docker-compose.yml`, AWS Lightsail provisioning, block storage mount, HTTP-only for rehearsal (HTTPS deferred until domain available), smoke test | complete | - | 1 | [phase6-deployment.plan.md](../plans/completed/phase6-deployment.plan.md) |
 | 7 | **Alpha (Jack + 小李)** | Internal test with 小李 as first real user; iterate on tool docstrings + prompts based on observed failures; measure one real research task end-to-end; confirm Excel export format | pending | - | 4, 5, 6 | - |
@@ -280,7 +280,7 @@ The other 4 colleagues (PMs + market analysts). Their specific use cases are for
 
 **Phase 4: High-risk tools + long-task UX** (~W2 D3, 3h)
 - **Goal**: All 25 `amz_scout.api` functions exposed; long-running ops don't confuse users
-- **Scope**: `ensure_keepa_data`, `validate_and_discover`, `batch_discover`, `discover_asin`, `validate_asins`, `sync_registry` with `cl.Step` + confirmation dialogs
+- **Scope**: `ensure_keepa_data`, `batch_discover`, `discover_asin`, `sync_registry` with `cl.Step` + confirmation dialogs
 - **Success signal**: Triggering `ensure_keepa_data(fresh)` for 10 products shows step-by-step progress; `batch_discover` for 3 candidates shows per-candidate status
 - **Hard constraint**: `headed=True` is hard-wired OFF in the web layer — not exposed as a user toggle
 

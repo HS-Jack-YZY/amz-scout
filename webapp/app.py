@@ -26,8 +26,16 @@ logger.info("Webapp starting: model=%s db=%s", config.MODEL_ID, config.DB_PATH)
 
 @cl.on_chat_start
 async def on_chat_start() -> None:
-    """Initialize a fresh conversation history for this session."""
+    """Initialize a fresh conversation history for this session.
+
+    Also seeds the Phase 3 query-passthrough state: ``query_log`` records
+    each tool call for the (future) project-analysis mode, and
+    ``pending_files`` buffers ``cl.File`` attachments produced by
+    ``summarize_for_llm`` until ``on_message`` ships them.
+    """
     cl.user_session.set("history", [])
+    cl.user_session.set("query_log", [])
+    cl.user_session.set("pending_files", [])
     user = cl.user_session.get("user")
     if user:
         await cl.Message(
@@ -40,25 +48,44 @@ async def on_chat_start() -> None:
 
 @cl.on_message
 async def on_message(msg: cl.Message) -> None:
-    """Handle a user message: run through the LLM + tool loop, send the reply."""
-    history: list[dict] = cl.user_session.get("history", [])
+    """Handle a user message: run through the LLM + tool loop, send the reply.
+
+    Phase 3: any xlsx attachments accumulated in ``pending_files`` during the
+    turn are drained onto this reply's ``cl.Message.elements``. The drain is
+    wrapped in ``try/finally`` so the session buffer is cleared on every
+    exit path (success / LLM failure / future send failures) — the next
+    turn must never inherit files from a previous turn.
+    """
+    history: list[dict] = cl.user_session.get("history", []) or []
     history.append({"role": "user", "content": msg.content})
 
+    success = False
+    final_text: str
     try:
         final_text, updated_history = await run_chat_turn(history)
+        cl.user_session.set("history", updated_history)
+        success = True
     except Exception:
         # Keep stack + exception detail in server logs only — never echo the
         # raw exception to authenticated users since it can leak file paths,
-        # configuration values, or internal error strings. Operators read the
-        # actual cause from `logger.exception` server-side.
+        # configuration values, or internal error strings. Operators read
+        # the actual cause from `logger.exception` server-side.
         logger.exception("run_chat_turn failed")
-        await cl.Message(
-            content=(
-                "⚠️ Sorry, something went wrong on the server. "
-                "Please try again — if it keeps happening, ping the operator."
-            )
-        ).send()
-        return
+        final_text = (
+            "⚠️ Sorry, something went wrong on the server. "
+            "Please try again — if it keeps happening, ping the operator."
+        )
+    finally:
+        # Invariant: pending_files is empty at the end of every turn. The
+        # failure branch discards any partially-attached files since the
+        # LLM never finished describing them to the user.
+        pending = cl.user_session.get("pending_files", []) or []
+        cl.user_session.set("pending_files", [])
 
-    cl.user_session.set("history", updated_history)
-    await cl.Message(content=final_text).send()
+    # Only attach files on a successful turn — a mid-turn exception means
+    # the LLM reply referencing those files is gone, so shipping them
+    # alone would confuse the user.
+    if success and pending:
+        await cl.Message(content=final_text, elements=pending).send()
+    else:
+        await cl.Message(content=final_text).send()

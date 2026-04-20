@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -56,7 +57,39 @@ def _envelope_untrimmed(data: list[dict], meta: dict | None = None) -> dict:
     return {"ok": True, "data": data, "error": None, "meta": meta if meta is not None else {}}
 
 
-def _count_tokens_for_tool_result(client: Any, payload: dict) -> int:
+def _envelope_summary(
+    rows: list[dict],
+    *,
+    preview_trimmer,
+    date_field: str | None,
+    file_name: str,
+    meta: dict | None = None,
+) -> dict:
+    """Build a Phase 3 summary envelope locally (without importing ``webapp.*``).
+
+    Mirrors ``webapp.summaries._build_summary`` field-for-field so this harness
+    measures the same shape the LLM will receive in production. Full rows still
+    exist — they live in the xlsx attachment, which never hits tool_result
+    content and therefore is not counted here.
+    """
+    meta = meta or {}
+    summary: dict = {
+        "count": len(rows),
+        "file_attached": file_name,
+    }
+    if date_field and rows and date_field in rows[0]:
+        dates = [r[date_field] for r in rows if r.get(date_field)]
+        if dates:
+            summary["date_range"] = f"{min(dates)} to {max(dates)}"
+    if rows and preview_trimmer is not None:
+        summary["preview"] = preview_trimmer(rows[:3])
+    for k in ("asin", "model", "brand", "series_name", "hint", "phase", "warnings"):
+        if k in meta and k not in summary:
+            summary[k] = meta[k]
+    return {"ok": True, "data": summary, "error": None, "meta": meta}
+
+
+def _count_tokens_for_tool_result(client: Any, payload: Mapping[str, Any]) -> int:
     """Ask Anthropic how many input tokens a given ``tool_result`` payload costs.
 
     Mirrors the webapp's wire shape: user question → assistant tool_use →
@@ -124,27 +157,68 @@ def _assert_nonregressive(tool: str, before: int, after: int) -> dict:
     return {"tool": tool, "before": before, "after": after, "pct_saved": pct}
 
 
+def _record_phase_metrics(tool: str, raw: int, trimmed: int, summary: int) -> dict:
+    """Build a three-phase metric row for one tool.
+
+    - ``raw``: untrimmed DB rows envelope (Phase 0 baseline).
+    - ``trimmed``: Phase 2 LLM-safe allow-list trim envelope.
+    - ``summary``: Phase 3 summary-dict envelope (count/date_range/preview).
+
+    ``pct_saved_vs_raw`` is the PRD's headline number (success signal is 60%+);
+    ``pct_saved_vs_trimmed`` is an incremental-gain sanity check showing
+    summarization still wins on top of trimming alone.
+    """
+    assert trimmed <= raw, f"{tool}: trim increased tokens ({raw} -> {trimmed})"
+    assert summary <= raw, f"{tool}: summary increased tokens vs raw ({raw} -> {summary})"
+    pct_raw = 0.0 if raw == 0 else round((raw - summary) / raw * 100, 1)
+    pct_trimmed = 0.0 if trimmed == 0 else round((trimmed - summary) / trimmed * 100, 1)
+    return {
+        "tool": tool,
+        "raw": raw,
+        "trimmed": trimmed,
+        "summary": summary,
+        "pct_saved_vs_raw": pct_raw,
+        "pct_saved_vs_trimmed": pct_trimmed,
+    }
+
+
 # ─── Per-tool audits ─────────────────────────────────────────────────
 
 
 def test_query_latest_token_delta(
     anthropic_client: Any, real_db: Path, audit_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Three-phase comparison for the UK competitive snapshot.
+
+    ``query_latest`` typically carries ~10 rows (one per registered product),
+    so the absolute token delta is smaller than ``query_trends``. We still
+    record the Phase 3 summary metric for the audit JSON but only enforce
+    non-regression here — ``query_trends`` carries the 60% PRD gate.
+    """
     monkeypatch.chdir(real_db.parent.parent)
     from amz_scout import api as amz_api
+    from amz_scout._llm_trim import trim_competitive_rows
     from amz_scout.db import open_db
     from amz_scout.db import query_latest as db_query_latest
 
     with open_db(real_db) as conn:
-        raw = db_query_latest(conn, site="UK", category=None)
-    if not raw:
+        raw_rows = db_query_latest(conn, site="UK", category=None)
+    if not raw_rows:
         pytest.skip("competitive_snapshots has no UK rows — trim measurement is meaningless")
-    after_env = amz_api.query_latest(marketplace="UK")
-    before_env = _envelope_untrimmed(raw, meta=after_env.get("meta", {}))
+    trimmed_env = amz_api.query_latest(marketplace="UK")
+    raw_env = _envelope_untrimmed(raw_rows, meta=trimmed_env.get("meta", {}))
+    summary_env = _envelope_summary(
+        raw_rows,
+        preview_trimmer=trim_competitive_rows,
+        date_field="scraped_at",
+        file_name="query_latest_UK_audit.xlsx",
+        meta=trimmed_env.get("meta", {}),
+    )
 
-    before = _count_tokens_for_tool_result(anthropic_client, before_env)
-    after = _count_tokens_for_tool_result(anthropic_client, after_env)
-    entry = _assert_nonregressive("query_latest", before, after)
+    raw = _count_tokens_for_tool_result(anthropic_client, raw_env)
+    trimmed = _count_tokens_for_tool_result(anthropic_client, trimmed_env)
+    summary = _count_tokens_for_tool_result(anthropic_client, summary_env)
+    entry = _record_phase_metrics("query_latest", raw, trimmed, summary)
     _record(audit_path, entry)
 
 
@@ -217,11 +291,18 @@ def test_query_compare_token_delta(
 def test_query_trends_token_delta(
     anthropic_client: Any, real_db: Path, audit_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Compare direct DB read vs. trimmed envelope using a known ASIN in DB."""
+    """Three-phase comparison for a known ASIN in the live DB.
+
+    Baseline is untrimmed raw envelope (Phase 0); not the Phase 2 trimmed
+    envelope. PRD's 60% success target is stated against the pre-refactor
+    shape — using trim as baseline would silently re-anchor the goal and
+    under-report Phase 3 savings.
+    """
     monkeypatch.chdir(real_db.parent.parent)
     from datetime import timedelta
 
     from amz_scout import api as amz_api
+    from amz_scout._llm_trim import trim_timeseries_rows
     from amz_scout.api import KEEPA_EPOCH, SERIES_MAP
     from amz_scout.db import SERIES_NEW, open_db, query_price_trends
 
@@ -235,27 +316,49 @@ def test_query_trends_token_delta(
         pytest.skip("keepa_time_series has no NEW series rows — cannot audit query_trends")
     asin, site = row["asin"], row["site"]
 
-    after_env = amz_api.query_trends(
+    trimmed_env = amz_api.query_trends(
         product=asin, marketplace=site, series="new", days=90, auto_fetch=False
     )
 
     # Build an equivalent untrimmed envelope by hand: same _add_dates transform,
     # no field trimming.
     with open_db(real_db) as conn:
-        raw = query_price_trends(conn, asin, site, SERIES_MAP["new"], days=90)
+        raw_rows = query_price_trends(conn, asin, site, SERIES_MAP["new"], days=90)
     dated = [
         {
             **r,
             "date": (KEEPA_EPOCH + timedelta(minutes=r["keepa_ts"])).strftime("%Y-%m-%d %H:%M"),
         }
-        for r in raw
+        for r in raw_rows
     ]
-    before_env = _envelope_untrimmed(dated, meta=after_env.get("meta", {}))
+    raw_env = _envelope_untrimmed(dated, meta=trimmed_env.get("meta", {}))
+    summary_env = _envelope_summary(
+        dated,
+        preview_trimmer=trim_timeseries_rows,
+        date_field="date",
+        file_name=f"query_trends_{asin}_{site}_new_audit.xlsx",
+        meta=trimmed_env.get("meta", {}),
+    )
 
-    before = _count_tokens_for_tool_result(anthropic_client, before_env)
-    after = _count_tokens_for_tool_result(anthropic_client, after_env)
-    entry = _assert_nonregressive("query_trends", before, after)
+    raw = _count_tokens_for_tool_result(anthropic_client, raw_env)
+    trimmed = _count_tokens_for_tool_result(anthropic_client, trimmed_env)
+    summary = _count_tokens_for_tool_result(anthropic_client, summary_env)
+    entry = _record_phase_metrics("query_trends", raw, trimmed, summary)
     _record(audit_path, entry)
+
+    # Primary assertion aligned with the PRD's 60% end-to-end savings goal.
+    # query_trends carries ~87 rows × 2 LLM-safe fields; summary collapses to
+    # a single dict + 3-row preview, so well above the threshold.
+    assert entry["pct_saved_vs_raw"] >= 60.0, (
+        f"query_trends Phase 3 savings {entry['pct_saved_vs_raw']}% below the "
+        f"60% PRD target. raw={raw} trimmed={trimmed} summary={summary}."
+    )
+    # Incremental-gain sanity check: summary should still win materially
+    # over the already-trimmed envelope.
+    assert entry["pct_saved_vs_trimmed"] >= 30.0, (
+        f"query_trends summary vs trimmed delta {entry['pct_saved_vs_trimmed']}% "
+        f"below 30% — investigate whether preview is too large."
+    )
 
 
 def test_query_sellers_token_delta(

@@ -102,7 +102,7 @@ SERIES_NAMES = {
     100: "MONTHLY_SOLD",
 }
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 6
 
 # ─── Connection management ────────────────────────────────────────────
 
@@ -264,6 +264,146 @@ def _migrate(conn: sqlite3.Connection) -> None:
                     "VALUES (4, 'add fetch_mode to keepa_products')"
                 )
                 logger.info("Migrated schema to version 4")
+
+            if current < 5:
+                # v5: drop zombie 'unavailable' status; tighten CHECK to 4 values.
+                # SQLite cannot ALTER CHECK constraints — rebuild the table.
+
+                # Sanity check: defensive against undocumented writes.
+                bad = conn.execute(
+                    "SELECT COUNT(*) AS c FROM product_asins "
+                    "WHERE status = 'unavailable'"
+                ).fetchone()
+                if bad and bad["c"] > 0:
+                    raise RuntimeError(
+                        f"Migration v5: found {bad['c']} rows with "
+                        "status='unavailable'. These rows were never written "
+                        "by current code (zombie status). To proceed:\n"
+                        "  UPDATE product_asins SET status='not_listed' "
+                        "WHERE status='unavailable';\n"
+                        "Then re-run init_schema() to complete v5."
+                    )
+
+                # Rebuild table with tightened CHECK.
+                conn.execute(
+                    "ALTER TABLE product_asins RENAME TO product_asins_v4_old"
+                )
+                conn.execute("""
+                    CREATE TABLE product_asins (
+                        product_id      INTEGER NOT NULL
+                            REFERENCES products(id) ON DELETE CASCADE,
+                        marketplace     TEXT NOT NULL,
+                        asin            TEXT NOT NULL,
+                        -- Status semantics (see docs/DEVELOPER.md
+                        -- "ASIN Status Semantics"):
+                        --   unverified    : registered but not yet
+                        --                   validated against Keepa title
+                        --   verified      : Keepa title matches expected
+                        --                   brand+model
+                        --   wrong_product : Keepa title disagrees with
+                        --                   brand+model (mis-mapped ASIN)
+                        --   not_listed    : Keepa returned empty title
+                        --                   (ASIN dead/removed on Amazon)
+                        -- Phase A queries reject 'wrong_product' and
+                        -- 'not_listed' to prevent silent empty results.
+                        status          TEXT NOT NULL DEFAULT 'unverified'
+                            CHECK(status IN (
+                                'unverified','verified',
+                                'wrong_product','not_listed'
+                            )),
+                        notes           TEXT NOT NULL DEFAULT '',
+                        last_checked    TEXT,
+                        created_at      TEXT NOT NULL
+                            DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                        updated_at      TEXT NOT NULL
+                            DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                        PRIMARY KEY (product_id, marketplace)
+                    )
+                """)
+                conn.execute(
+                    "INSERT INTO product_asins "
+                    "(product_id, marketplace, asin, status, notes, "
+                    "last_checked, created_at, updated_at) "
+                    "SELECT product_id, marketplace, asin, status, notes, "
+                    "last_checked, created_at, updated_at "
+                    "FROM product_asins_v4_old"
+                )
+                conn.execute("DROP TABLE product_asins_v4_old")
+                conn.execute(
+                    "CREATE INDEX idx_pa_asin ON product_asins(asin)"
+                )
+
+                conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations "
+                    "(version, description) VALUES "
+                    "(5, 'drop zombie unavailable status from "
+                    "product_asins.CHECK')"
+                )
+                logger.info("Migrated schema to version 5")
+
+            if current < 6:
+                # v6: remove intent validation — collapse status to 2 values.
+                # Map legacy statuses:
+                #   'unverified', 'verified', 'wrong_product' -> 'active'
+                #   'not_listed'                              -> 'not_listed'
+                # SQLite cannot ALTER CHECK — rebuild the table and map
+                # statuses in a single INSERT ... SELECT CASE so the new
+                # CHECK never sees a disallowed legacy value.
+
+                conn.execute(
+                    "ALTER TABLE product_asins RENAME TO product_asins_v5_old"
+                )
+                conn.execute("""
+                    CREATE TABLE product_asins (
+                        product_id      INTEGER NOT NULL
+                            REFERENCES products(id) ON DELETE CASCADE,
+                        marketplace     TEXT NOT NULL,
+                        asin            TEXT NOT NULL,
+                        -- Status semantics (since v6):
+                        --   active      : default; queryable; not observed
+                        --                 as delisted
+                        --   not_listed  : Keepa returned empty title +
+                        --                 no csv data (ASIN dead/removed
+                        --                 on Amazon)
+                        -- No intent validation — trust user input + Keepa
+                        -- identity.  See docs/DEVELOPER.md
+                        -- "ASIN Status Semantics".
+                        status          TEXT NOT NULL DEFAULT 'active'
+                            CHECK(status IN ('active', 'not_listed')),
+                        notes           TEXT NOT NULL DEFAULT '',
+                        last_checked    TEXT,
+                        created_at      TEXT NOT NULL
+                            DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                        updated_at      TEXT NOT NULL
+                            DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                        PRIMARY KEY (product_id, marketplace)
+                    )
+                """)
+                conn.execute("""
+                    INSERT INTO product_asins
+                        (product_id, marketplace, asin, status, notes,
+                         last_checked, created_at, updated_at)
+                    SELECT
+                        product_id, marketplace, asin,
+                        CASE
+                            WHEN status = 'not_listed' THEN 'not_listed'
+                            ELSE 'active'
+                        END AS status,
+                        notes, last_checked, created_at, updated_at
+                    FROM product_asins_v5_old
+                """)
+                conn.execute("DROP TABLE product_asins_v5_old")
+                conn.execute(
+                    "CREATE INDEX idx_pa_asin ON product_asins(asin)"
+                )
+
+                conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations "
+                    "(version, description) VALUES "
+                    "(6, 'remove intent validation: "
+                    "status -> active/not_listed')"
+                )
+                logger.info("Migrated schema to version 6")
     except Exception:
         logger.exception(
             "Schema migration failed at version %d. Database may need manual repair.",
@@ -283,6 +423,10 @@ INSERT INTO schema_migrations (version, description)
     VALUES (2, 'add project column to competitive_snapshots');
 INSERT INTO schema_migrations (version, description) VALUES (3, 'add product registry tables');
 INSERT INTO schema_migrations (version, description) VALUES (4, 'add fetch_mode to keepa_products');
+INSERT INTO schema_migrations (version, description)
+    VALUES (5, 'drop zombie unavailable status from product_asins.CHECK');
+INSERT INTO schema_migrations (version, description)
+    VALUES (6, 'remove intent validation: status -> active/not_listed');
 
 CREATE TABLE competitive_snapshots (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -437,10 +581,12 @@ CREATE TABLE product_asins (
     product_id      INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
     marketplace     TEXT NOT NULL,
     asin            TEXT NOT NULL,
-    status          TEXT NOT NULL DEFAULT 'unverified'
-                    CHECK(status IN (
-                        'unverified','verified','wrong_product','not_listed','unavailable'
-                    )),
+    -- Status semantics (since v6; see docs/DEVELOPER.md "ASIN Status Semantics"):
+    --   active      : default; queryable; not observed as delisted
+    --   not_listed  : Keepa returned empty title + no csv (ASIN dead/removed)
+    -- No intent validation — trust user input + Keepa identity.
+    status          TEXT NOT NULL DEFAULT 'active'
+                    CHECK(status IN ('active', 'not_listed')),
     notes           TEXT NOT NULL DEFAULT '',
     last_checked    TEXT,
     created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
@@ -507,7 +653,7 @@ def _try_register_product(
         return None
 
     product_id, is_new = register_product(conn, category, brand, model)
-    register_asin(conn, product_id, site, asin, status="unverified")
+    register_asin(conn, product_id, site, asin)
 
     logger.info(
         "%s %s/%s → product %d (%s %s)",
@@ -529,6 +675,104 @@ def _try_register_product(
     }
 
 
+def _safe_json_list(s: str | None) -> list:
+    """Parse a JSON string as a list, returning [] on None or malformed input."""
+    if not s:
+        return []
+    try:
+        return json_mod.loads(s)
+    except (json_mod.JSONDecodeError, TypeError):
+        logger.warning("Malformed JSON list in DB: %r", s)
+        return []
+
+
+def _find_product_by_ean(
+    conn: sqlite3.Connection,
+    asin: str,
+    raw: dict,
+) -> int | None:
+    """Find an existing product_id by matching EAN/UPC codes.
+
+    Extracts EAN and UPC lists from Keepa raw data, then searches
+    keepa_products for other ASINs that share the same codes AND are
+    already registered in product_asins. Returns the first matching
+    product_id, or None if no match.
+    """
+    ean_list = raw.get("eanList") or []
+    upc_list = raw.get("upcList") or []
+    codes = set(ean_list + upc_list)
+    if not codes:
+        return None
+
+    brand = (raw.get("brand") or "").strip()
+
+    placeholders = ",".join(["?"] * len(codes))
+    sql = f"""
+        SELECT DISTINCT pa.product_id
+        FROM keepa_products kp
+        JOIN product_asins pa ON pa.asin = kp.asin AND pa.marketplace = kp.site
+        WHERE kp.asin != ?
+        AND (
+            EXISTS (SELECT 1 FROM json_each(kp.ean_list) WHERE value IN ({placeholders}))
+            OR EXISTS (SELECT 1 FROM json_each(kp.upc_list) WHERE value IN ({placeholders}))
+        )
+    """
+    params: list = [asin] + list(codes) + list(codes)
+
+    # No brand available — EAN alone is sufficient evidence; skip brand guard
+    if brand:
+        sql += "    AND kp.brand = ?\n"
+        params.append(brand)
+
+    rows = conn.execute(sql, params).fetchall()
+    if len(rows) > 1:
+        ids = [r["product_id"] for r in rows]
+        logger.warning(
+            "EAN ambiguity for %s: codes match %d products %s, skipping auto-bind",
+            asin,
+            len(ids),
+            ids,
+        )
+        return None
+    return rows[0]["product_id"] if rows else None
+
+
+def _bind_asin_to_product(
+    conn: sqlite3.Connection,
+    product_id: int,
+    site: str,
+    asin: str,
+) -> dict:
+    """Bind an ASIN to an existing product via EAN/UPC match.
+
+    Registers the ASIN, looks up product metadata, logs the binding,
+    and returns a result dict with ``match_type='ean'``.
+    """
+    register_asin(conn, product_id, site, asin)
+    prod = conn.execute(
+        "SELECT brand, model, category FROM products WHERE id = ?",
+        (product_id,),
+    ).fetchone()
+    logger.info(
+        "EAN-bound %s/%s → product %d (%s %s)",
+        site,
+        asin,
+        product_id,
+        prod["brand"],
+        prod["model"],
+    )
+    return {
+        "product_id": product_id,
+        "brand": prod["brand"],
+        "model": prod["model"],
+        "category": prod["category"],
+        "asin": asin,
+        "marketplace": site,
+        "new_product": False,
+        "match_type": "ean",
+    }
+
+
 def _auto_register_from_keepa(
     conn: sqlite3.Connection,
     asin: str,
@@ -537,8 +781,10 @@ def _auto_register_from_keepa(
 ) -> dict | None:
     """Auto-register a product from Keepa metadata if not already registered.
 
-    Skips silently when the ASIN is already in ``product_asins`` for this
-    marketplace, or when the Keepa data lacks *brand* or *title*.
+    Registration priority:
+    1. Skip if ASIN already in product_asins for this marketplace
+    2. EAN/UPC match: bind to existing product if codes match
+    3. Brand+title fallback: create new product entry
 
     Returns a dict with registration details, or *None* if skipped.
     """
@@ -549,6 +795,12 @@ def _auto_register_from_keepa(
     if existing:
         return None
 
+    # Priority 1: EAN/UPC match — zero-cost cross-market binding
+    ean_product_id = _find_product_by_ean(conn, asin, raw)
+    if ean_product_id is not None:
+        return _bind_asin_to_product(conn, ean_product_id, site, asin)
+
+    # Priority 2: brand+title fallback
     result = _try_register_product(
         conn,
         asin,
@@ -564,6 +816,8 @@ def _auto_register_from_keepa(
             site,
             asin,
         )
+    else:
+        result["match_type"] = "brand_title"
     return result
 
 
@@ -1203,7 +1457,7 @@ def register_asin(
     product_id: int,
     marketplace: str,
     asin: str,
-    status: str = "unverified",
+    status: str = "active",
     notes: str = "",
 ) -> None:
     """Set or update the ASIN for a product on a marketplace."""
@@ -1234,12 +1488,13 @@ def tag_product(
 def sync_registry_from_keepa(conn: sqlite3.Connection) -> list[dict]:
     """Register orphan ASINs from keepa_products that are missing from product_asins.
 
-    Only registers products with non-empty brand and title.
+    Matching priority: (1) EAN/UPC → (2) brand+title.
+    Only registers products with non-empty brand and title (for brand+title path).
     Returns a list of dicts describing each registration.
     """
     orphans = conn.execute(
         """SELECT kp.asin, kp.site, kp.brand, kp.model, kp.title,
-                  kp.product_group
+                  kp.product_group, kp.ean_list, kp.upc_list
            FROM keepa_products kp
            WHERE NOT EXISTS (
                SELECT 1 FROM product_asins pa
@@ -1249,6 +1504,21 @@ def sync_registry_from_keepa(conn: sqlite3.Connection) -> list[dict]:
 
     results: list[dict] = []
     for row in orphans:
+        # Build a raw-like dict for _find_product_by_ean compatibility
+        raw_compat = {
+            "eanList": _safe_json_list(row["ean_list"]),
+            "upcList": _safe_json_list(row["upc_list"]),
+            "brand": row["brand"],
+        }
+        ean_product_id = _find_product_by_ean(conn, row["asin"], raw_compat)
+
+        if ean_product_id is not None:
+            bound = _bind_asin_to_product(
+                conn, ean_product_id, row["site"], row["asin"],
+            )
+            results.append({"registered": True, **bound})
+            continue
+
         reg = _try_register_product(
             conn,
             asin=row["asin"],
@@ -1259,6 +1529,7 @@ def sync_registry_from_keepa(conn: sqlite3.Connection) -> list[dict]:
             category=row["product_group"] or "",
         )
         if reg:
+            reg["match_type"] = "brand_title"
             results.append({"registered": True, **reg})
         else:
             results.append(
@@ -1334,7 +1605,9 @@ def load_products_from_db(
 
     if marketplace:
         joins.append("JOIN product_asins pa ON p.id = pa.product_id")
-        wheres.append("pa.marketplace = ? AND pa.status != 'wrong_product'")
+        wheres.append(
+            "pa.marketplace = ? AND pa.status != 'not_listed'"
+        )
         params.append(marketplace)
 
     if category:
@@ -1360,7 +1633,7 @@ def load_products_from_db(
     asin_rows = conn.execute(
         f"SELECT product_id, marketplace, asin, status "
         f"FROM product_asins WHERE product_id IN ({placeholders}) "
-        f"AND status != 'wrong_product'",
+        f"AND status != 'not_listed'",
         product_ids,
     ).fetchall()
 
@@ -1412,25 +1685,6 @@ def update_asin_status(
         )
 
 
-def get_unverified_asins(
-    conn: sqlite3.Connection,
-    marketplace: str | None = None,
-) -> list[dict]:
-    """Return product/ASIN pairs with status 'unverified'."""
-    sql = """
-        SELECT p.id AS product_id, p.brand, p.model, pa.marketplace, pa.asin
-        FROM products p
-        JOIN product_asins pa ON p.id = pa.product_id
-        WHERE pa.status = 'unverified'
-    """
-    params: list = []
-    if marketplace:
-        sql += " AND pa.marketplace = ?"
-        params.append(marketplace)
-    sql += " ORDER BY p.brand, p.model, pa.marketplace"
-    return [dict(r) for r in conn.execute(sql, params)]
-
-
 def find_product_exact(
     conn: sqlite3.Connection,
     brand: str,
@@ -1469,10 +1723,16 @@ def find_product(
 
     # Model, search_keywords, or Keepa title substring match
     like = f"%{query_str}%"
-    sql = """
+    if marketplace:
+        join_on = "p.id = pa.product_id AND pa.marketplace = ?"
+        params: list = [marketplace, like, like, like]
+    else:
+        join_on = "p.id = pa.product_id"
+        params: list = [like, like, like]
+    sql = f"""
         SELECT p.id, p.category, p.brand, p.model, pa.asin, pa.marketplace
         FROM products p
-        LEFT JOIN product_asins pa ON p.id = pa.product_id
+        LEFT JOIN product_asins pa ON {join_on}
         WHERE (
             p.model LIKE ?
             OR p.search_keywords LIKE ?
@@ -1482,12 +1742,8 @@ def find_product(
                 WHERE pa2.product_id = p.id AND kp.title LIKE ?
             )
         )
+        LIMIT 1
     """
-    params: list = [like, like, like]
-    if marketplace:
-        sql += " AND pa.marketplace = ?"
-        params.append(marketplace)
-    sql += " LIMIT 1"
     row = conn.execute(sql, params).fetchone()
     return dict(row) if row else None
 

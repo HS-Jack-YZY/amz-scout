@@ -4,12 +4,20 @@ Phase 2 exposes all 9 read-only query tools so the LLM can answer the full
 Scenario-1 research surface (latest snapshots, trends, compare, ranking,
 availability, sellers, deals, freshness, Keepa budget).
 
-Trimming policy (see ``amz_scout._llm_trim``): ``amz_scout.api`` deliberately
-returns full DB rows so that CLI/admin callers keep the complete schema. This
-module is the LLM boundary, so each ``_step_*`` wrapper that emits
-competitive-snapshot / time-series / seller / deal rows is decorated with
-``trim_for_llm(...)``, which projects the envelope's ``data`` list to the
-LLM-safe allow-list before the result reaches the model.
+Phase 3 query-passthrough boundary
+-----------------------------------
+Row-emitting tools (latest/availability/compare/deals/ranking/sellers/trends)
+no longer return row data to the LLM. ``summarize_for_llm`` rewrites the
+envelope's ``data`` list into ``{count, date_range, file_attached, preview}``
+and attaches the full DB rows as an in-memory xlsx to
+``cl.user_session['pending_files']``; ``webapp.app.on_message`` then ships
+those files as ``cl.File`` elements on the final ``cl.Message``. The LLM only
+sees summaries — the user downloads the complete data.
+
+``trim_for_llm`` is retained for ``preview`` generation (3 sample rows kept
+inside the summary) and as a regression safety valve; ``check_freshness`` /
+``keepa_budget`` already return summary-shaped dicts so they skip the
+decorator.
 """
 
 import functools
@@ -25,6 +33,7 @@ from amz_scout._llm_trim import (
     trim_seller_rows,
     trim_timeseries_rows,
 )
+from amz_scout.api import ApiResponse
 from amz_scout.api import check_freshness as _api_check_freshness
 from amz_scout.api import keepa_budget as _api_keepa_budget
 from amz_scout.api import query_availability as _api_query_availability
@@ -34,6 +43,7 @@ from amz_scout.api import query_latest as _api_query_latest
 from amz_scout.api import query_ranking as _api_query_ranking
 from amz_scout.api import query_sellers as _api_query_sellers
 from amz_scout.api import query_trends as _api_query_trends
+from webapp.summaries import summarize_for_llm
 
 logger = logging.getLogger(__name__)
 
@@ -43,10 +53,10 @@ def trim_for_llm(
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Project the ``data`` list of an api envelope through ``trimmer``.
 
-    Wrap an async ``_step_*`` wrapper so successful envelopes have their
-    ``data`` rows passed through the LLM-safe allow-list. Failed envelopes
-    (``ok=False``) and ``meta`` are passed through untouched. Returns a NEW
-    envelope dict so the api-layer return value is never mutated.
+    Retained after Phase 3 for (a) generating the 3-row ``preview`` inside
+    ``summarize_for_llm`` and (b) as a regression safety valve if
+    ``summarize_for_llm`` is ever bypassed. Row-emitting wrappers no longer
+    stack this on top — see module docstring.
     """
 
     def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
@@ -63,7 +73,7 @@ def trim_for_llm(
     return decorator
 
 
-def _missing_required(tool_name: str, field: str) -> dict[str, Any]:
+def _missing_required(tool_name: str, field: str) -> ApiResponse:
     """Envelope-shaped validation error for a required tool field the LLM dropped.
 
     The Anthropic tool schema marks some fields as `required`, but LLMs occasionally
@@ -82,28 +92,31 @@ def _missing_required(tool_name: str, field: str) -> dict[str, Any]:
 # ─── Anthropic tool schemas ──────────────────────────────────────
 # IMPORTANT: cache_control goes on the LAST tool only — it caches all
 # preceding tools. Scattered cache_control = cache hit rate of 0.
+#
+# Phase 3 compression: docstrings trimmed ~250 tokens. LLM is told "returns
+# summary + xlsx" so it stops trying to iterate row data — that plus Key
+# Behavior #14 in CLAUDE.md are the levers that make summaries work.
+_MARKETPLACE_DESC = (
+    "Marketplace code ('UK'/'DE'/'US'/'JP'...). Accepts aliases "
+    "('uk', 'amazon.co.uk', 'GB', 'GBP')."
+)
+_PRODUCT_DESC = "Product identifier — brand/model name (e.g. 'Slate 7') or ASIN. Required."
+
 TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "name": "query_latest",
         "description": (
-            "Get the latest Amazon competitive snapshot (current price, rating, BSR, "
-            "availability) for products in a specific marketplace. Use this when the user "
-            "asks about 'current' or 'latest' product data. Returns a list of product rows "
-            "from the competitive_snapshots table in the database."
+            "Latest competitive snapshot (price/rating/BSR/availability) per product "
+            "in a marketplace. For '当前/最新'. Reads competitive_snapshots; 0 Keepa "
+            "tokens. Returns summary + xlsx download — do NOT iterate rows."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "marketplace": {
-                    "type": "string",
-                    "description": (
-                        "Marketplace code (e.g., 'UK', 'DE', 'US', 'JP'). "
-                        "Also accepts aliases like 'uk', 'amazon.co.uk', 'GB', 'GBP'."
-                    ),
-                },
+                "marketplace": {"type": "string", "description": _MARKETPLACE_DESC},
                 "category": {
                     "type": "string",
-                    "description": "Optional product category filter (e.g., 'Travel Router').",
+                    "description": "Optional category filter (e.g. 'Travel Router').",
                 },
             },
             "required": ["marketplace"],
@@ -112,23 +125,19 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "name": "check_freshness",
         "description": (
-            "Show how stale the cached Keepa data is for each product × marketplace, "
-            "as a freshness matrix (e.g., '0d', '3d', 'never'). Use this when the user "
-            "asks '数据多久没更新了' / 'how fresh is the data' / 'when was X last updated'. "
-            "Read-only — does NOT fetch from Keepa, costs 0 tokens."
+            "Cached Keepa data staleness matrix per product × marketplace "
+            "('0d'/'3d'/'never'). For '数据多久没更新'. Read-only, 0 Keepa tokens."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "marketplace": {
                     "type": "string",
-                    "description": (
-                        "Optional marketplace filter (e.g., 'UK', 'DE'). Omit to check all."
-                    ),
+                    "description": "Optional marketplace filter. Omit for all.",
                 },
                 "product": {
                     "type": "string",
-                    "description": "Optional product filter (brand/model/ASIN). Omit to check all.",
+                    "description": "Optional product filter (brand/model/ASIN). Omit for all.",
                 },
             },
             "required": [],
@@ -137,9 +146,8 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "name": "keepa_budget",
         "description": (
-            "Check the current Keepa API token balance and refill rate. Use when the user "
-            "asks 'Keepa 还有多少 token' / 'how many Keepa tokens left' / 'token余额'. "
-            "Costs 0 Keepa tokens to call."
+            "Current Keepa token balance and refill rate. For 'token余额'/'多少 token'. "
+            "Costs 0 Keepa tokens."
         ),
         "input_schema": {
             "type": "object",
@@ -150,9 +158,9 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "name": "query_availability",
         "description": (
-            "Show which products are listed on which marketplaces — an availability matrix "
-            "across all sites. Use when the user asks '哪些国家有卖' / 'which countries sell X' / "
-            "'availability'. Reads from the competitive_snapshots table; does NOT call Keepa."
+            "Availability matrix: which products listed on which marketplaces. "
+            "For '哪些国家有卖'/'availability'. Reads competitive_snapshots; 0 Keepa "
+            "tokens. Returns summary + xlsx."
         ),
         "input_schema": {
             "type": "object",
@@ -163,20 +171,13 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "name": "query_compare",
         "description": (
-            "Compare ONE product across ALL marketplaces using the latest snapshot "
-            "(price, rating, BSR per marketplace). Use when the user asks "
-            "'对比 X 在所有市场' / 'compare X across markets' / 'cross-market'. "
-            "Reads browser-scraped snapshots, not Keepa history."
+            "Cross-market compare ONE product: latest snapshot (price/rating/BSR) per "
+            "marketplace. For '对比'/'cross-market'. 0 Keepa tokens. Returns summary + xlsx."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "product": {
-                    "type": "string",
-                    "description": (
-                        "Product identifier — brand/model name (e.g., 'Slate 7') or ASIN. Required."
-                    ),
-                },
+                "product": {"type": "string", "description": _PRODUCT_DESC},
             },
             "required": ["product"],
         },
@@ -184,21 +185,17 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "name": "query_deals",
         "description": (
-            "Show deal/promotion/discount history for products on a marketplace. Use when "
-            "the user asks '促销' / '折扣' / 'deals' / 'discounts' / 'sale history'. "
-            "Auto-fetches missing Keepa data using the LAZY strategy (zero tokens if "
-            "cached). For ≥6-token batches the API returns phase='needs_confirmation' "
-            "— surface that to the user and ask them to confirm."
+            "Deal/promotion/discount history per marketplace. For '促销'/'折扣'/'deals'. "
+            "Auto-fetches Keepa (LAZY, 0 tokens if cached); ≥6-token batches return "
+            "phase='needs_confirmation' — surface it and ask user to confirm. "
+            "Returns summary + xlsx."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "marketplace": {
                     "type": "string",
-                    "description": (
-                        "Marketplace code (e.g., 'UK', 'DE', 'US'). Omit to query all "
-                        "marketplaces in the registry."
-                    ),
+                    "description": ("Marketplace code. Omit to query all registered marketplaces."),
                 },
             },
             "required": [],
@@ -207,23 +204,16 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "name": "query_ranking",
         "description": (
-            "Show products ranked by Amazon Best Sellers Rank (BSR) for a marketplace. "
-            "Use when the user asks '排名' / 'BSR' / 'best sellers' / 'who's #1 in X'. "
-            "Reads browser-scraped snapshots; does NOT call Keepa."
+            "Products ranked by Amazon BSR for a marketplace. For '排名'/'BSR'/'best sellers'. "
+            "Reads competitive_snapshots; 0 Keepa tokens. Returns summary + xlsx."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "marketplace": {
-                    "type": "string",
-                    "description": (
-                        "Marketplace code (e.g., 'UK', 'DE'). Required. Accepts aliases "
-                        "like 'uk', 'amazon.co.uk', 'GB', 'GBP'."
-                    ),
-                },
+                "marketplace": {"type": "string", "description": _MARKETPLACE_DESC},
                 "category": {
                     "type": "string",
-                    "description": "Optional category filter (e.g., 'Travel Router').",
+                    "description": "Optional category filter.",
                 },
             },
             "required": ["marketplace"],
@@ -232,23 +222,17 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "name": "query_sellers",
         "description": (
-            "Show Buy Box seller history for ONE product on ONE marketplace — who has "
-            "owned the Buy Box over time. Use when the user asks '卖家' / 'Buy Box' / "
-            "'seller history' / 'who is selling X'. Auto-fetches missing Keepa data using "
-            "the LAZY strategy (zero tokens if cached)."
+            "Buy Box seller history over time for ONE product × marketplace. For "
+            "'卖家'/'Buy Box'. Auto-fetches Keepa (LAZY, 0 tokens if cached). "
+            "Returns summary + xlsx."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "product": {
-                    "type": "string",
-                    "description": ("Product identifier — brand/model name or ASIN. Required."),
-                },
+                "product": {"type": "string", "description": _PRODUCT_DESC},
                 "marketplace": {
                     "type": "string",
-                    "description": (
-                        "Marketplace code (e.g., 'UK', 'DE'). Defaults to 'UK' if omitted."
-                    ),
+                    "description": f"{_MARKETPLACE_DESC} Defaults to 'UK'.",
                 },
             },
             "required": ["product"],
@@ -257,38 +241,22 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "name": "query_trends",
         "description": (
-            "Show price/BSR/sales time series for ONE product on ONE marketplace over a "
-            "given window. Use when the user asks '价格趋势' / '历史价格' / 'price trends' "
-            "/ 'past N days/months'. Series options: 'new' (Amazon new price), 'used', "
-            "'buybox', 'sales_rank', 'rating', 'review_count', 'monthly_sold'. "
-            "Auto-fetches missing Keepa data using the LAZY strategy (zero tokens if "
-            "cached). Prices in the response are encoded as cents — divide by 100 for the "
-            "real price. To compare multiple products or marketplaces, call this tool "
-            "multiple times (once per product × marketplace)."
+            "Price/BSR/sales time series for ONE product × marketplace over a window. "
+            "For '价格趋势'/'历史价格'/'past N days'. Auto-fetches Keepa (LAZY, 0 tokens "
+            "if cached). Prices encoded as cents (÷100 for real price). Call once per "
+            "product × marketplace for multi-compare. Returns summary + xlsx."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "product": {
-                    "type": "string",
-                    "description": (
-                        "Product identifier — brand/model name (e.g., 'Slate 7', "
-                        "'GL-MT3000') or ASIN. Required."
-                    ),
-                },
+                "product": {"type": "string", "description": _PRODUCT_DESC},
                 "marketplace": {
                     "type": "string",
-                    "description": (
-                        "Marketplace code (e.g., 'UK', 'DE', 'US', 'JP'). Defaults to 'UK'. "
-                        "Accepts aliases like 'uk', 'amazon.co.uk', 'GB', 'GBP'."
-                    ),
+                    "description": f"{_MARKETPLACE_DESC} Defaults to 'UK'.",
                 },
                 "series": {
                     "type": "string",
-                    "description": (
-                        "Series type. One of: 'new' (default), 'used', 'buybox', "
-                        "'sales_rank', 'rating', 'review_count', 'monthly_sold'."
-                    ),
+                    "description": "Series type. Default 'new'.",
                     "enum": [
                         "new",
                         "used",
@@ -301,10 +269,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 },
                 "days": {
                     "type": "integer",
-                    "description": (
-                        "Lookback window in days. Default 90. Use 7/30/90/180/365 for "
-                        "common windows (e.g., 'past 6 months' → 180)."
-                    ),
+                    "description": "Lookback in days. Default 90. Common: 7/30/90/180/365.",
                     "minimum": 1,
                     "maximum": 730,
                 },
@@ -319,68 +284,119 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
 
 # ─── Tool dispatcher ─────────────────────────────────────────────
 @cl.step(type="tool", name="query_latest")
-@trim_for_llm(trim_competitive_rows)
-async def _step_query_latest(marketplace: str, category: str | None = None) -> dict:
+@summarize_for_llm(
+    tool_name="query_latest",
+    file_name_parts=lambda kw: ["query_latest", kw.get("marketplace"), kw.get("category")],
+    preview_trimmer=trim_competitive_rows,
+    date_field="scraped_at",
+    sheet_name="latest_snapshot",
+)
+async def _step_query_latest(marketplace: str, category: str | None = None) -> ApiResponse:
     """Chainlit step wrapper that shows tool inputs/outputs in the UI."""
     logger.info("query_latest called: marketplace=%s category=%s", marketplace, category)
     return _api_query_latest(marketplace=marketplace, category=category)
 
 
 @cl.step(type="tool", name="check_freshness")
-async def _step_check_freshness(marketplace: str | None = None, product: str | None = None) -> dict:
+async def _step_check_freshness(
+    marketplace: str | None = None, product: str | None = None
+) -> ApiResponse:
     logger.info("check_freshness called: marketplace=%s product=%s", marketplace, product)
     return _api_check_freshness(marketplace=marketplace, product=product)
 
 
 @cl.step(type="tool", name="keepa_budget")
-async def _step_keepa_budget() -> dict:
+async def _step_keepa_budget() -> ApiResponse:
     logger.info("keepa_budget called")
     return _api_keepa_budget()
 
 
 @cl.step(type="tool", name="query_availability")
-@trim_for_llm(trim_competitive_rows)
-async def _step_query_availability() -> dict:
+@summarize_for_llm(
+    tool_name="query_availability",
+    file_name_parts=lambda _kw: ["query_availability"],
+    preview_trimmer=trim_competitive_rows,
+    date_field="scraped_at",
+    sheet_name="availability",
+)
+async def _step_query_availability() -> ApiResponse:
     logger.info("query_availability called")
     return _api_query_availability()
 
 
 @cl.step(type="tool", name="query_compare")
-@trim_for_llm(trim_competitive_rows)
-async def _step_query_compare(product: str) -> dict:
+@summarize_for_llm(
+    tool_name="query_compare",
+    file_name_parts=lambda kw: ["query_compare", kw.get("product")],
+    preview_trimmer=trim_competitive_rows,
+    date_field="scraped_at",
+    sheet_name="compare",
+)
+async def _step_query_compare(product: str) -> ApiResponse:
     logger.info("query_compare called: product=%s", product)
     return _api_query_compare(product=product)
 
 
 @cl.step(type="tool", name="query_deals")
-@trim_for_llm(trim_deals_rows)
-async def _step_query_deals(marketplace: str | None = None) -> dict:
+@summarize_for_llm(
+    tool_name="query_deals",
+    file_name_parts=lambda kw: ["query_deals", kw.get("marketplace")],
+    preview_trimmer=trim_deals_rows,
+    # start_time/end_time are Keepa-encoded minute integers; min/max on them
+    # produces garbage date_range like "7584000 to 7590000". Disable for now.
+    date_field=None,
+    sheet_name="deals",
+)
+async def _step_query_deals(marketplace: str | None = None) -> ApiResponse:
     logger.info("query_deals called: marketplace=%s", marketplace)
     return _api_query_deals(marketplace=marketplace)
 
 
 @cl.step(type="tool", name="query_ranking")
-@trim_for_llm(trim_competitive_rows)
-async def _step_query_ranking(marketplace: str, category: str | None = None) -> dict:
+@summarize_for_llm(
+    tool_name="query_ranking",
+    file_name_parts=lambda kw: ["query_ranking", kw.get("marketplace"), kw.get("category")],
+    preview_trimmer=trim_competitive_rows,
+    date_field="scraped_at",
+    sheet_name="ranking",
+)
+async def _step_query_ranking(marketplace: str, category: str | None = None) -> ApiResponse:
     logger.info("query_ranking called: marketplace=%s category=%s", marketplace, category)
     return _api_query_ranking(marketplace=marketplace, category=category)
 
 
 @cl.step(type="tool", name="query_sellers")
-@trim_for_llm(trim_seller_rows)
-async def _step_query_sellers(product: str, marketplace: str = "UK") -> dict:
+@summarize_for_llm(
+    tool_name="query_sellers",
+    file_name_parts=lambda kw: ["query_sellers", kw.get("product"), kw.get("marketplace")],
+    preview_trimmer=trim_seller_rows,
+    date_field="date",
+    sheet_name="sellers",
+)
+async def _step_query_sellers(product: str, marketplace: str = "UK") -> ApiResponse:
     logger.info("query_sellers called: product=%s marketplace=%s", product, marketplace)
     return _api_query_sellers(product=product, marketplace=marketplace)
 
 
 @cl.step(type="tool", name="query_trends")
-@trim_for_llm(trim_timeseries_rows)
+@summarize_for_llm(
+    tool_name="query_trends",
+    file_name_parts=lambda kw: [
+        "query_trends",
+        kw.get("product"),
+        kw.get("marketplace"),
+        kw.get("series"),
+    ],
+    preview_trimmer=trim_timeseries_rows,
+    date_field="date",
+    sheet_name="trends",
+)
 async def _step_query_trends(
     product: str,
     marketplace: str = "UK",
     series: str = "new",
     days: int = 90,
-) -> dict:
+) -> ApiResponse:
     logger.info(
         "query_trends called: product=%s marketplace=%s series=%s days=%s",
         product,
@@ -391,15 +407,16 @@ async def _step_query_trends(
     return _api_query_trends(product=product, marketplace=marketplace, series=series, days=days)
 
 
-async def dispatch_tool(name: str, args: dict) -> dict:
+async def dispatch_tool(name: str, args: dict) -> ApiResponse:
     """Route a tool call from the LLM to the right Python function.
 
-    Returns the amz_scout.api envelope dict. For tools that emit row data
-    (latest/availability/compare/deals/ranking/sellers/trends), the ``data``
-    list has been projected through ``trim_for_llm`` to the LLM-safe
-    allow-list defined in ``amz_scout._llm_trim``; ``meta`` and ``error``
-    are always passed through untouched. The LLM consumes meta/error/hint
-    fields directly.
+    Returns the amz_scout.api envelope dict. For row-emitting tools
+    (latest/availability/compare/deals/ranking/sellers/trends), Phase 3
+    rewrites the ``data`` field into a summary dict via ``summarize_for_llm``
+    and attaches the full DB rows to ``cl.user_session['pending_files']`` as
+    xlsx. ``check_freshness`` / ``keepa_budget`` pass through unchanged —
+    they're already summary-shaped. ``meta`` and ``error`` are always
+    passed through untouched.
     """
     if name == "query_latest":
         marketplace = args.get("marketplace")

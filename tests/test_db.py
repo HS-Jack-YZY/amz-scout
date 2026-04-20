@@ -62,11 +62,11 @@ class TestSchema:
     def test_init_schema_idempotent(self, conn):
         init_schema(conn)  # Second call should not raise
         row = conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()
-        assert row[0] == 4  # v1 + v2 + v3 + v4
+        assert row[0] == 6  # v1 + v2 + v3 + v4 + v5 + v6
 
     def test_schema_version(self, conn):
         row = conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()
-        assert row[0] == 4
+        assert row[0] == 6
 
 
 # ─── Keepa write tests ──────────────────────────────────────────────
@@ -358,3 +358,157 @@ class TestDataIntegrity:
 
         actual = conn.execute("SELECT COUNT(*) FROM keepa_coupon_history").fetchone()[0]
         assert actual == expected
+
+
+# ─── Schema v6 migration tests ───────────────────────────────────────
+
+
+class TestStatusMigrationV6:
+    """Verify schema v6 migration: collapse status to 2 values
+    (active / not_listed) — intent validation removed."""
+
+    def test_v6_check_constraint_rejects_legacy_values(self, conn):
+        from amz_scout.db import register_product
+
+        pid, _ = register_product(conn, "Router", "Test", "M1")
+        for i, bad in enumerate(("unverified", "verified", "wrong_product")):
+            with pytest.raises(sqlite3.IntegrityError):
+                conn.execute(
+                    "INSERT INTO product_asins "
+                    "(product_id, marketplace, asin, status) "
+                    "VALUES (?, ?, ?, ?)",
+                    (pid, f"M{i:02d}", f"B0LEG{i:05d}", bad),
+                )
+
+    def test_v6_check_constraint_accepts_two_values(self, conn):
+        from amz_scout.db import register_product
+
+        pid, _ = register_product(conn, "Router", "Test", "M2")
+        for i, status in enumerate(["active", "not_listed"]):
+            conn.execute(
+                "INSERT INTO product_asins "
+                "(product_id, marketplace, asin, status) "
+                "VALUES (?, ?, ?, ?)",
+                (pid, f"MK{i}", f"B0CC{i:06d}", status),
+            )
+
+    def test_v6_default_status_is_active(self, conn):
+        from amz_scout.db import register_asin, register_product
+
+        pid, _ = register_product(conn, "Router", "Test", "M3")
+        register_asin(conn, pid, "UK", "B0DDDD0001")
+        row = conn.execute(
+            "SELECT status FROM product_asins WHERE asin = 'B0DDDD0001'"
+        ).fetchone()
+        assert row["status"] == "active"
+
+    def test_v6_idempotent(self, conn):
+        init_schema(conn)  # second call
+        row = conn.execute(
+            "SELECT COUNT(*) AS c FROM schema_migrations WHERE version = 6"
+        ).fetchone()
+        assert row["c"] == 1
+
+    def test_v6_migrates_legacy_statuses_to_active(self, tmp_path):
+        """v5 → v6 upgrade: {unverified, verified, wrong_product} → active;
+        not_listed preserved. Index and migration record rebuilt.
+
+        Forcibly downgrades a fresh DB to the v5 shape (4-value CHECK,
+        no v6 migration record) so that reopening runs the real v6 code
+        path. Monkey-patching ``SCHEMA_VERSION`` alone is insufficient
+        because ``_SCHEMA_SQL`` unconditionally seeds the v6 record.
+        """
+        import amz_scout.db as db_mod
+        from amz_scout.db import register_product
+
+        db_path = tmp_path / "v5tov6.db"
+
+        # Step 1: fresh init, then forcibly downgrade to v5 shape.
+        c0 = sqlite3.connect(str(db_path))
+        c0.row_factory = sqlite3.Row
+        init_schema(c0)
+        c0.execute("DELETE FROM schema_migrations WHERE version = 6")
+        c0.execute("ALTER TABLE product_asins RENAME TO _pa_tmp")
+        c0.execute("""
+            CREATE TABLE product_asins (
+                product_id  INTEGER NOT NULL
+                    REFERENCES products(id) ON DELETE CASCADE,
+                marketplace TEXT NOT NULL,
+                asin        TEXT NOT NULL,
+                status      TEXT NOT NULL DEFAULT 'unverified'
+                    CHECK(status IN (
+                        'unverified','verified',
+                        'wrong_product','not_listed'
+                    )),
+                notes       TEXT NOT NULL DEFAULT '',
+                last_checked TEXT,
+                created_at  TEXT NOT NULL
+                    DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                updated_at  TEXT NOT NULL
+                    DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                PRIMARY KEY (product_id, marketplace)
+            )
+        """)
+        c0.execute("INSERT INTO product_asins SELECT * FROM _pa_tmp")
+        c0.execute("DROP TABLE _pa_tmp")
+        c0.execute("DROP INDEX IF EXISTS idx_pa_asin")
+        c0.commit()
+
+        # Step 2: write one row per legacy status under v5 shape.
+        pid, _ = register_product(c0, "R", "B", "M")
+        for mp, asin, status in [
+            ("UK", "B0UNVER0001", "unverified"),
+            ("DE", "B0VERIF0001", "verified"),
+            ("FR", "B0WRONG0001", "wrong_product"),
+            ("JP", "B0NOTLI0001", "not_listed"),
+        ]:
+            c0.execute(
+                "INSERT INTO product_asins "
+                "(product_id, marketplace, asin, status) "
+                "VALUES (?, ?, ?, ?)",
+                (pid, mp, asin, status),
+            )
+        c0.commit()
+        c0.close()
+
+        # Clear the schema-init cache so init_schema re-runs _migrate.
+        db_mod._schema_initialized.discard(str(db_path))
+
+        # Step 3: reopen — v6 migration should now run for real.
+        c2 = sqlite3.connect(str(db_path))
+        c2.row_factory = sqlite3.Row
+        init_schema(c2)
+
+        rows = {
+            r["marketplace"]: r["status"]
+            for r in c2.execute(
+                "SELECT marketplace, status FROM product_asins"
+            ).fetchall()
+        }
+        assert rows["UK"] == "active"          # was unverified
+        assert rows["DE"] == "active"          # was verified
+        assert rows["FR"] == "active"          # was wrong_product
+        assert rows["JP"] == "not_listed"      # preserved
+
+        # Index recreated by the migration.
+        idx = c2.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='index' AND name='idx_pa_asin'"
+        ).fetchone()
+        assert idx is not None, "v6 migration must recreate idx_pa_asin"
+
+        # Migration record inserted.
+        ver = c2.execute(
+            "SELECT MAX(version) AS v FROM schema_migrations"
+        ).fetchone()
+        assert ver["v"] == 6
+
+        # Tightened CHECK is in force: legacy values now rejected.
+        with pytest.raises(sqlite3.IntegrityError):
+            c2.execute(
+                "INSERT INTO product_asins "
+                "(product_id, marketplace, asin, status) "
+                "VALUES (?, 'XX', 'B0ZZZZZZZZ', 'verified')",
+                (pid,),
+            )
+        c2.close()
