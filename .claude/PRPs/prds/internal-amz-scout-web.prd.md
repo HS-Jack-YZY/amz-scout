@@ -249,11 +249,11 @@ The other 4 colleagues (PMs + market analysts). Their specific use cases are for
 
 | # | Phase | Description | Status | Parallel | Depends | PRP Plan |
 |---|---|---|---|---|---|---|
-| 1 | **Scaffolding** | `webapp/` module, Chainlit hello-world, password auth callback with `@gl-inet.com` whitelist, 1 tool (`query_latest`) wired end-to-end, local dev run verified | in-progress | - | - | [phase1-webapp-scaffolding.plan.md](../plans/phase1-webapp-scaffolding.plan.md) |
+| 1 | **Scaffolding** | `webapp/` module, Chainlit hello-world, password auth callback with `@gl-inet.com` whitelist, 1 tool (`query_latest`) wired end-to-end, local dev run verified | complete | - | - | [phase1-webapp-scaffolding.plan.md](../plans/completed/phase1-webapp-scaffolding.plan.md) |
 | 2 | **Query tools** | Wrap 9 read-only query functions as Chainlit tools with bilingual docstrings + `amz_scout.api` marketplace aliasing support | complete | with 3 | 1 | [phase2-query-tools.plan.md](../plans/completed/phase2-query-tools.plan.md) |
 | 3 | **Management tools** | Wrap 6 product registry functions (`list_products`, `add_product`, `remove_product_by_model`, `update_product_asin`, `register_market_asins`, `import_yaml`); honor `phase="needs_confirmation"` protocol in UI | pending | with 2 | 1 | - |
 | 4 | **High-risk tools + long task UX** | Wrap `ensure_keepa_data`, `batch_discover`, `discover_asin`, `sync_registry` with `cl.Step` progress + explicit confirmation dialogs for token-consuming / long-running operations | pending | - | 2, 3 | - |
-| 5 | **Excel export layer** | `webapp/export.py`: pandas-based XLSX builder (multi-sheet where appropriate), attached via `cl.File` to every query tool reply. **Requires Q3 answer from 小李.** | pending | with 4 | 2 | - |
+| 5 | **Excel export layer** | 底层 xlsx 导出管道已随 slim-refactor Phase 3「查询直通模式」交付（`webapp/summaries.py::_rows_to_xlsx_bytes` + `cl.File` 附件通道；所有 row-emitting 工具自动附带单表 xlsx）。**剩余 scope**：(a) multi-sheet per query（product × market 分表）尚未实现 — 当前每个查询落成单表；(b) Q3 小李 Excel 格式访谈尚未进行，格式未针对性调优。 | partial | with 4 | 2 | inherited from [query-passthrough-mode.plan.md](../plans/completed/query-passthrough-mode.plan.md) |
 | 6 | **Deployment** | Dockerfile (`python:3.12-slim-bookworm` + `pip install uv browser-use` + `browser-use install`), `docker-compose.yml`, AWS Lightsail provisioning, block storage mount, HTTP-only for rehearsal (HTTPS deferred until domain available), smoke test | complete | - | 1 | [phase6-deployment.plan.md](../plans/completed/phase6-deployment.plan.md) |
 | 7 | **Alpha (Jack + 小李)** | Internal test with 小李 as first real user; iterate on tool docstrings + prompts based on observed failures; measure one real research task end-to-end; confirm Excel export format | pending | - | 4, 5, 6 | - |
 | 8 | **Beta (full 5 colleagues)** | Roll out to remaining 4 colleagues with **Q4 interview done first**; establish feedback channel (Slack/Feishu); daily monitoring of error rate + token burn | pending | - | 7 | - |
@@ -284,10 +284,18 @@ The other 4 colleagues (PMs + market analysts). Their specific use cases are for
 - **Success signal**: Triggering `ensure_keepa_data(fresh)` for 10 products shows step-by-step progress; `batch_discover` for 3 candidates shows per-candidate status
 - **Hard constraint**: `headed=True` is hard-wired OFF in the web layer — not exposed as a user toggle
 
-**Phase 5: Excel export** (~W2 D4, 3h)
+**Phase 5: Excel export** (~W2 D4, 3h) — **PARTIAL (底层管道已交付，2026-04-20)**
 - **Goal**: 小李's workflow terminator — queries return downloadable artifacts
-- **Scope**: `webapp/export.py` with pandas + openpyxl; multi-sheet XLSX per-query; format per 小李's Q3 answer
-- **Success signal**: Every query tool reply includes a `cl.File` attachment rendering as a download button
+- **Scope (original)**: `webapp/export.py` with pandas + openpyxl; multi-sheet XLSX per-query; format per 小李's Q3 answer
+- **Delivered via slim-refactor Phase 3**:
+  - `webapp/summaries.py::_rows_to_xlsx_bytes` 用 openpyxl 生成 in-memory xlsx（无 pandas 依赖；走 `summarize_for_llm` decorator 自动附加到 `cl.File`）
+  - 所有 row-emitting 工具（`query_latest` / `query_trends` / `query_compare` / `query_ranking` / `query_availability` / `query_sellers` / `query_deals`）每次查询自动产出单表 xlsx 附件
+  - 每个工具有独立 `sheet_name`（如 `latest_snapshot` / `compare` / `deals`）
+  - `MAX_XLSX_ROWS = 50_000` 保护，超限时 summary 标 `xlsx_truncated=True`
+- **Remaining scope**:
+  - Multi-sheet per query（原 Golden Path 描述的「one sheet per product × market」）尚未实现 — 跨市场对比当前也是单表
+  - Q3 小李 Excel 格式访谈尚未进行 — 多表 / 单表 / pivot / 条件格式等偏好未确认
+- **Success signal (original)**: Every query tool reply includes a `cl.File` attachment rendering as a download button ✅ 已达成
 - **Runs in parallel with Phase 4**; depends on Phase 2 (query tools must exist first)
 
 **Phase 6: Deployment** (~W2 D5 – W3 D1, 6h)
@@ -359,4 +367,5 @@ The other 4 colleagues (PMs + market analysts). Their specific use cases are for
 ---
 
 *Generated: 2026-04-13*
-*Status: DRAFT — awaiting pre-launch baseline + Q3/Q4 interviews*
+*Status: IN PROGRESS — 3/8 phases complete + 1 partial (Phase 1 scaffolding #3, Phase 2 query tools #4, Phase 6 deployment #6 all merged 2026-04-13; Phase 5 Excel export — xlsx 底层管道已随 slim-refactor Phase 3 间接交付 2026-04-20，multi-sheet + Q3 访谈仍待做). Phase 3/4/7/8 still pending; awaiting pre-launch baseline + Q3/Q4 interviews before W3 Beta rollout.*
+*Drift reconciled: 2026-04-21 — Phase 1 status corrected from `in-progress` to `complete` (PR #3 merged 2026-04-13; plan moved to `plans/completed/`); Phase 5 status corrected from `pending` to `partial` (xlsx pipeline delivered via slim-refactor Phase 3 query-passthrough-mode, 2026-04-20).*
