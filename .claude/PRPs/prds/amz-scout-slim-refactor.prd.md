@@ -1,5 +1,7 @@
 # amz-scout 瘦身重构：Token 优化 + 跨市场绑定 + 查询直通
 
+> **Archived 2026-04-21** · Status: CLOSED — all 4 phases + intent validation v6 complete. See commit `1126654` and reports under `.claude/PRPs/reports/`.
+
 ## Problem Statement
 
 amz-scout 的 webapp（Chainlit + Claude Sonnet function calling）在每次对话中消耗过多 LLM token，主要来源是：(1) CLAUDE.md 每轮注入 ~5,287 tokens 的固定开销，(2) "强制 ASIN 补全"指令迫使 AI 对每个新产品执行 11 次 WebSearch（每次消耗大量 token 解析搜索结果），(3) AI 会"自觉"读取和分析 raw data，而用户大部分时候只需要查询数据、不需要 AI 解读。这三个问题导致 Anthropic API 月费偏高，阻碍了 webapp 的内部推广。
