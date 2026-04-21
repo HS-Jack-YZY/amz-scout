@@ -973,13 +973,30 @@ def ensure_keepa_data(
 
                 for o in fetched_outcomes:
                     ph = o.price_history
-                    fetch_error = ph.fetch_error if ph else ""
                     title = title_map.get((o.asin, o.site), "")
                     has_csv = ph and (
                         ph.buybox_current is not None
                         or ph.new_current is not None
                     )
 
+                    # Defensive: scraper.keepa always returns
+                    # ``_empty_history(..., fetch_error=...)`` for every
+                    # fetched ASIN, but ``keepa_service`` builds outcomes
+                    # via ``history_map.get(pf.asin)`` — a future scraper
+                    # refactor that drops a record would feed ``None``
+                    # here. Treat the missing record as transient (no
+                    # strike, no flip) instead of a "Keepa says ASIN is
+                    # dead" signal.
+                    if ph is None:
+                        warnings.append(
+                            f"{o.model} / {o.site} ({o.asin}): "
+                            "Internal fetch miss (no price_history "
+                            "record); status unchanged, treating as "
+                            "transient."
+                        )
+                        continue
+
+                    fetch_error = ph.fetch_error
                     if fetch_error:
                         # Transient Keepa failure (rate_limited, network,
                         # partial JSON, …). Do NOT touch status or strikes —

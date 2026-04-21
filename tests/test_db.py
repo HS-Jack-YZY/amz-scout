@@ -1480,3 +1480,103 @@ class TestRegisterProductConcurrency:
         assert (row["brand"], row["model"]) in variants
         assert row["brand_key"] == "tp-link"
         assert row["model_key"] == "archer be400"
+
+
+# ─── Migration ordering: v8 must wait for v7 (Copilot PR #20) ────────
+
+
+class TestMigrationOrderingV8AfterV7:
+    """Regression guard for the schema_migrations stranding bug.
+
+    If v8 is recorded *before* v7 commits, a v7 failure leaves the DB
+    at MAX(version)=8 with v7 un-applied. The next ``init_schema()``
+    short-circuits on ``current >= SCHEMA_VERSION`` and never retries
+    v7 — silent permanent corruption.
+    """
+
+    def test_v7_failure_does_not_strand_v8_record(self, tmp_path, monkeypatch):
+        from amz_scout import db as db_mod
+
+        db_path = tmp_path / "ordering.db"
+        c0 = sqlite3.connect(str(db_path))
+        c0.row_factory = sqlite3.Row
+        init_schema(c0)
+        # Force schema_migrations back to MAX(version)=6 so the v7 + v8
+        # paths both rerun on next open. (Underlying tables are already
+        # at v8 shape — that's fine; v8's ALTER is column-existence
+        # guarded and v7 is monkey-patched out.)
+        c0.execute("DELETE FROM schema_migrations WHERE version >= 7")
+        c0.commit()
+        c0.close()
+        # init_schema caches db_paths it has fully migrated and short-
+        # circuits on cache hit. Clear that one entry so the next open
+        # actually re-runs _migrate (where the patched v7 lives).
+        db_mod._schema_initialized.discard(str(db_path))
+
+        def fake_migrate_v7(_conn):
+            raise RuntimeError("simulated v7 failure")
+
+        monkeypatch.setattr(db_mod, "_migrate_to_v7", fake_migrate_v7)
+
+        c1 = sqlite3.connect(str(db_path))
+        c1.row_factory = sqlite3.Row
+        with pytest.raises(RuntimeError, match="simulated v7"):
+            init_schema(c1)
+
+        versions = {
+            r["version"]
+            for r in c1.execute("SELECT version FROM schema_migrations")
+        }
+        assert 7 not in versions, "v7 record must not appear after raise"
+        assert 8 not in versions, (
+            "v8 record must not appear if v7 hasn't completed — "
+            "otherwise MAX(version)=8 would block v7 retry forever"
+        )
+        c1.close()
+
+    def test_v7_recovery_after_failure_completes_to_v8(
+        self, tmp_path, monkeypatch
+    ):
+        """After a v7 failure, removing the patch must let init_schema
+        complete v7 AND v8 cleanly on the next call.
+        """
+        from amz_scout import db as db_mod
+
+        db_path = tmp_path / "recovery.db"
+        c0 = sqlite3.connect(str(db_path))
+        c0.row_factory = sqlite3.Row
+        init_schema(c0)
+        c0.execute("DELETE FROM schema_migrations WHERE version >= 7")
+        c0.commit()
+        c0.close()
+        db_mod._schema_initialized.discard(str(db_path))
+
+        original_v7 = db_mod._migrate_to_v7
+
+        def fake_migrate_v7(_conn):
+            raise RuntimeError("simulated v7 failure")
+
+        monkeypatch.setattr(db_mod, "_migrate_to_v7", fake_migrate_v7)
+
+        c1 = sqlite3.connect(str(db_path))
+        c1.row_factory = sqlite3.Row
+        with pytest.raises(RuntimeError):
+            init_schema(c1)
+        c1.close()
+
+        # init_schema doesn't add to the cache when _migrate raises (the
+        # ``_schema_initialized.add(...)`` is unreachable past the
+        # exception), so we don't strictly need a discard before c2 — but
+        # clear it anyway in case future refactors flip the order.
+        db_mod._schema_initialized.discard(str(db_path))
+
+        # Restore real v7 and reopen — both v7 and v8 should now apply.
+        monkeypatch.setattr(db_mod, "_migrate_to_v7", original_v7)
+        c2 = sqlite3.connect(str(db_path))
+        c2.row_factory = sqlite3.Row
+        init_schema(c2)
+        max_v = c2.execute(
+            "SELECT MAX(version) AS v FROM schema_migrations"
+        ).fetchone()["v"]
+        assert max_v == 8
+        c2.close()

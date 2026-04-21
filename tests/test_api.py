@@ -1324,6 +1324,67 @@ class TestEnsureKeepaDataTransientVsPermanent:
         assert any("strike 1/" in w for w in warnings), warnings
         c.close()
 
+    def test_missing_price_history_treated_as_transient(
+        self, config_dir, monkeypatch
+    ):
+        """Copilot review (PR #20): KeepaProductOutcome with
+        ``source='fetched'`` + ``price_history=None`` must NOT
+        increment strikes — it's an internal fetch miss (scraper
+        dropped a record), not a "Keepa says ASIN is dead" signal.
+        """
+        from amz_scout.freshness import ProductFreshness
+        from amz_scout.keepa_service import KeepaProductOutcome, KeepaResult
+
+        tmp_path, proj_path = config_dir
+        db_path, _pid = self._register(
+            tmp_path, "B0MISSNG001", status="active"
+        )
+
+        pf = ProductFreshness(
+            asin="B0MISSNG001",
+            site="UK",
+            model="ModelY",
+            brand="BrandY",
+            fetched_at=None,
+            age_days=None,
+            action="fetch",
+            reason="test-fixture",
+        )
+        outcome = KeepaProductOutcome(
+            asin="B0MISSNG001",
+            site="UK",
+            model="ModelY",
+            source="fetched",
+            price_history=None,  # ← scraper miss
+            freshness=pf,
+        )
+
+        def fake_get_keepa_data(conn, products, sites, marketplaces, **_kw):
+            return KeepaResult(
+                outcomes=[outcome],
+                tokens_used=0,
+                tokens_remaining=60,
+            )
+
+        monkeypatch.setattr(
+            "amz_scout.keepa_service.get_keepa_data", fake_get_keepa_data
+        )
+        r = ensure_keepa_data(proj_path, marketplace="UK", confirm=True)
+        assert r["ok"] is True
+
+        c = sqlite3.connect(str(db_path))
+        c.row_factory = sqlite3.Row
+        row = c.execute(
+            "SELECT status, not_listed_strikes FROM product_asins "
+            "WHERE asin = 'B0MISSNG001' AND marketplace = 'UK'"
+        ).fetchone()
+        # Status preserved, strikes NOT incremented.
+        assert row["status"] == "active"
+        assert row["not_listed_strikes"] == 0
+        warnings = r["meta"].get("warnings", [])
+        assert any("Internal fetch miss" in w for w in warnings), warnings
+        c.close()
+
     def test_already_not_listed_emits_observational_log_copy(
         self, config_dir, monkeypatch
     ):
