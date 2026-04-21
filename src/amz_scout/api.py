@@ -1019,12 +1019,13 @@ def ensure_keepa_data(
                                 f"{o.model} / {o.site} ({o.asin}): "
                                 f"Marked not_listed after {strikes} "
                                 "consecutive empty responses. "
-                                f"Run discover_asin('{brand}', '{o.model}', "
-                                f"'{o.site}') for a valid ASIN, or restore "
-                                "via SQL if re-listed: "
-                                "UPDATE product_asins SET status='active' "
-                                f"WHERE asin='{o.asin}' AND "
-                                f"marketplace='{o.site}'"
+                                f"Run discover_asin(brand={brand!r}, "
+                                f"model={o.model!r}, marketplace={o.site!r}) "
+                                "for a valid ASIN, or restore via "
+                                f"db.update_asin_status(conn, product_id, "
+                                f"{o.site!r}, 'active') after looking up "
+                                f"product_id with list_products("
+                                f"brand={brand!r}, model={o.model!r})."
                             )
                         elif was_active and strikes > 0:
                             warnings.append(
@@ -1043,12 +1044,14 @@ def ensure_keepa_data(
                                 f"{o.model} / {o.site} ({o.asin}): "
                                 "Still observed as not_listed "
                                 f"(empty observations: {strikes}). "
-                                "Restore via SQL if re-listed: "
-                                "UPDATE product_asins SET status='active' "
-                                f"WHERE asin='{o.asin}' AND "
-                                f"marketplace='{o.site}'. Otherwise run "
-                                f"discover_asin('{brand}', '{o.model}', "
-                                f"'{o.site}') for the correct ASIN."
+                                f"Restore via db.update_asin_status(conn, "
+                                f"product_id, {o.site!r}, 'active') after "
+                                f"looking up product_id with list_products("
+                                f"brand={brand!r}, model={o.model!r}). "
+                                f"Otherwise run discover_asin("
+                                f"brand={brand!r}, model={o.model!r}, "
+                                f"marketplace={o.site!r}) for the correct "
+                                "ASIN."
                             )
                         else:
                             # Unregistered ASIN — preserve the legacy
@@ -1057,9 +1060,10 @@ def ensure_keepa_data(
                             warnings.append(
                                 f"{o.model} / {o.site} ({o.asin}): "
                                 "ASIN has no data — likely wrong or not "
-                                "listed. Call discover_asin("
-                                f"'{brand}', '{o.model}', '{o.site}') to "
-                                "search for the correct ASIN."
+                                f"listed. Call discover_asin("
+                                f"brand={brand!r}, model={o.model!r}, "
+                                f"marketplace={o.site!r}) to search for "
+                                "the correct ASIN."
                             )
                         continue
 
