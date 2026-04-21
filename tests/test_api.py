@@ -1100,3 +1100,300 @@ class TestResolveAsinStatusGate:
         assert r["ok"] is False
         assert "not_listed" in r["error"]
         assert r["data"] == []
+
+
+# ─── Transient-failure guard (issue #11) ─────────────────────────────
+
+
+class TestEmptyObservationStrikes:
+    """Strike counter behaviour for _record_empty_observation.
+
+    Covers the internal state machine: unregistered ASIN no-op,
+    incremental counting, threshold flip, and reset-on-success.
+    """
+
+    def _seed(self, tmp_path, asin="B0STRIKE01", status="active"):
+        db_path = tmp_path / "strikes.db"
+        c = sqlite3.connect(str(db_path))
+        c.row_factory = sqlite3.Row
+        init_schema(c)
+        pid, _ = register_product(c, "Router", "BrandX", "ModelX")
+        register_asin(c, pid, "UK", asin, status=status, notes="")
+        return c, pid
+
+    def test_unregistered_asin_is_noop(self, tmp_path):
+        from amz_scout.api import _record_empty_observation
+
+        c, _ = self._seed(tmp_path)
+        strikes, flipped, was_active = _record_empty_observation(
+            c, "B0UNREG0001", "UK"
+        )
+        assert (strikes, flipped, was_active) == (0, False, False)
+        c.close()
+
+    def test_first_empty_increments_only(self, tmp_path):
+        from amz_scout.api import _record_empty_observation
+
+        c, pid = self._seed(tmp_path)
+        strikes, flipped, was_active = _record_empty_observation(
+            c, "B0STRIKE01", "UK"
+        )
+        assert strikes == 1
+        assert flipped is False
+        assert was_active is True
+        row = c.execute(
+            "SELECT status, not_listed_strikes FROM product_asins "
+            "WHERE product_id = ? AND marketplace = 'UK'",
+            (pid,),
+        ).fetchone()
+        assert row["status"] == "active"
+        assert row["not_listed_strikes"] == 1
+        c.close()
+
+    def test_threshold_flips_to_not_listed(self, tmp_path):
+        from amz_scout.api import _record_empty_observation
+        from amz_scout.db import NOT_LISTED_STRIKE_THRESHOLD
+
+        c, pid = self._seed(tmp_path)
+        for _ in range(NOT_LISTED_STRIKE_THRESHOLD - 1):
+            _record_empty_observation(c, "B0STRIKE01", "UK")
+        strikes, flipped, was_active = _record_empty_observation(
+            c, "B0STRIKE01", "UK"
+        )
+        assert strikes == NOT_LISTED_STRIKE_THRESHOLD
+        assert flipped is True
+        # The threshold-crossing call itself saw the row as ``active``
+        # — ``was_active_on_entry`` captures pre-flip state.
+        assert was_active is True
+        row = c.execute(
+            "SELECT status FROM product_asins "
+            "WHERE product_id = ? AND marketplace = 'UK'",
+            (pid,),
+        ).fetchone()
+        assert row["status"] == "not_listed"
+        c.close()
+
+    def test_successful_observation_resets_strikes(self, tmp_path):
+        from amz_scout.api import (
+            _record_empty_observation,
+            _record_successful_observation,
+        )
+
+        c, pid = self._seed(tmp_path)
+        _record_empty_observation(c, "B0STRIKE01", "UK")
+        _record_empty_observation(c, "B0STRIKE01", "UK")
+        _record_successful_observation(c, "B0STRIKE01", "UK")
+        row = c.execute(
+            "SELECT not_listed_strikes FROM product_asins "
+            "WHERE product_id = ? AND marketplace = 'UK'",
+            (pid,),
+        ).fetchone()
+        assert row["not_listed_strikes"] == 0
+        c.close()
+
+    def test_already_not_listed_does_not_flip(self, tmp_path):
+        """Already-not_listed rows still count strikes but don't re-flip.
+
+        Intended side-effect: ``flipped=False`` protects us from
+        rewriting ``notes`` every fetch, while ``strikes`` keeps
+        accumulating as an observational log. ``was_active_on_entry``
+        is False so callers can pick log-style copy instead of
+        "strike N/THRESHOLD" progression text.
+        """
+        from amz_scout.api import _record_empty_observation
+
+        c, _ = self._seed(tmp_path, status="not_listed")
+        strikes, flipped, was_active = _record_empty_observation(
+            c, "B0STRIKE01", "UK"
+        )
+        assert flipped is False
+        assert strikes == 1
+        assert was_active is False
+        c.close()
+
+
+class TestEnsureKeepaDataTransientVsPermanent:
+    """End-to-end: ensure_keepa_data distinguishes transient from genuine empty."""
+
+    def _register(self, tmp_path, asin, status="active"):
+        db_path = tmp_path / "output" / "amz_scout.db"
+        c = sqlite3.connect(str(db_path))
+        c.row_factory = sqlite3.Row
+        pid, _ = register_product(c, "Router", "BrandY", "ModelY")
+        register_asin(c, pid, "UK", asin, status=status, notes="")
+        c.close()
+        return db_path, pid
+
+    @staticmethod
+    def _make_outcome(asin, site, fetch_error=""):
+        from amz_scout.freshness import ProductFreshness
+        from amz_scout.keepa_service import KeepaProductOutcome
+        from amz_scout.models import PriceHistory
+
+        pf = ProductFreshness(
+            asin=asin,
+            site=site,
+            model="ModelY",
+            brand="BrandY",
+            fetched_at=None,
+            age_days=None,
+            action="fetch",
+            reason="test-fixture",
+        )
+        ph = PriceHistory(
+            date="2026-04-21",
+            site=site,
+            category="Router",
+            brand="BrandY",
+            model="ModelY",
+            asin=asin,
+            fetch_error=fetch_error,
+        )
+        return KeepaProductOutcome(
+            asin=asin,
+            site=site,
+            model="ModelY",
+            source="fetched",
+            price_history=ph,
+            freshness=pf,
+        )
+
+    def test_transient_blip_preserves_status(self, config_dir, monkeypatch):
+        """fetch_error != '' must not touch status or strikes."""
+        from amz_scout.keepa_service import KeepaResult
+
+        tmp_path, proj_path = config_dir
+        db_path, _pid = self._register(tmp_path, "B0TRANS0001", status="active")
+
+        def fake_get_keepa_data(conn, products, sites, marketplaces, **_kw):
+            return KeepaResult(
+                outcomes=[self._make_outcome("B0TRANS0001", "UK", "rate_limited")],
+                tokens_used=0,
+                tokens_remaining=60,
+            )
+
+        monkeypatch.setattr(
+            "amz_scout.keepa_service.get_keepa_data", fake_get_keepa_data
+        )
+        r = ensure_keepa_data(proj_path, marketplace="UK", confirm=True)
+        assert r["ok"] is True
+
+        c = sqlite3.connect(str(db_path))
+        c.row_factory = sqlite3.Row
+        row = c.execute(
+            "SELECT status, not_listed_strikes FROM product_asins "
+            "WHERE asin = 'B0TRANS0001' AND marketplace = 'UK'"
+        ).fetchone()
+        assert row["status"] == "active"
+        assert row["not_listed_strikes"] == 0
+        warnings = r["meta"].get("warnings", [])
+        assert any("Transient Keepa failure" in w for w in warnings), warnings
+        c.close()
+
+    def test_genuine_empty_increments_strike_under_threshold(
+        self, config_dir, monkeypatch
+    ):
+        """fetch_error='' + empty body → strike counter bumps, status stays."""
+        from amz_scout.keepa_service import KeepaResult
+
+        tmp_path, proj_path = config_dir
+        db_path, _pid = self._register(tmp_path, "B0EMPTY0001", status="active")
+
+        def fake_get_keepa_data(conn, products, sites, marketplaces, **_kw):
+            return KeepaResult(
+                outcomes=[self._make_outcome("B0EMPTY0001", "UK", "")],
+                tokens_used=0,
+                tokens_remaining=60,
+            )
+
+        monkeypatch.setattr(
+            "amz_scout.keepa_service.get_keepa_data", fake_get_keepa_data
+        )
+        r = ensure_keepa_data(proj_path, marketplace="UK", confirm=True)
+        assert r["ok"] is True
+
+        c = sqlite3.connect(str(db_path))
+        c.row_factory = sqlite3.Row
+        row = c.execute(
+            "SELECT status, not_listed_strikes FROM product_asins "
+            "WHERE asin = 'B0EMPTY0001' AND marketplace = 'UK'"
+        ).fetchone()
+        assert row["status"] == "active"
+        assert row["not_listed_strikes"] == 1
+        warnings = r["meta"].get("warnings", [])
+        assert any("strike 1/" in w for w in warnings), warnings
+        c.close()
+
+    def test_already_not_listed_emits_observational_log_copy(
+        self, config_dir, monkeypatch
+    ):
+        """Re-fetching an already-not_listed ASIN must NOT emit
+        'strike N/THRESHOLD; will mark not_listed after consecutive
+        threshold' — the threshold has already been crossed, so that
+        copy is misleading. Instead, emit a log-style message.
+        """
+        from amz_scout.keepa_service import KeepaResult
+
+        tmp_path, proj_path = config_dir
+        db_path, _pid = self._register(
+            tmp_path, "B0DELIST001", status="not_listed"
+        )
+
+        def fake_get_keepa_data(conn, products, sites, marketplaces, **_kw):
+            return KeepaResult(
+                outcomes=[self._make_outcome("B0DELIST001", "UK", "")],
+                tokens_used=0,
+                tokens_remaining=60,
+            )
+
+        monkeypatch.setattr(
+            "amz_scout.keepa_service.get_keepa_data", fake_get_keepa_data
+        )
+        r = ensure_keepa_data(proj_path, marketplace="UK", confirm=True)
+        assert r["ok"] is True
+
+        c = sqlite3.connect(str(db_path))
+        c.row_factory = sqlite3.Row
+        row = c.execute(
+            "SELECT status, not_listed_strikes FROM product_asins "
+            "WHERE asin = 'B0DELIST001' AND marketplace = 'UK'"
+        ).fetchone()
+        # Status unchanged; strikes still advance as observational log.
+        assert row["status"] == "not_listed"
+        assert row["not_listed_strikes"] == 1
+        warnings = r["meta"].get("warnings", [])
+        # Observational-log copy, NOT progression copy.
+        assert any(
+            "Still observed as not_listed" in w for w in warnings
+        ), warnings
+        assert not any("strike 1/" in w for w in warnings), warnings
+        assert not any(
+            "Will mark not_listed after consecutive threshold" in w
+            for w in warnings
+        ), warnings
+        c.close()
+
+
+class TestAsinStatusRecovery:
+    """Manual not_listed -> active recovery via update_asin_status (issue #11)."""
+
+    def test_update_asin_status_restores_active(self, tmp_path):
+        from amz_scout.api import _resolve_asin
+        from amz_scout.db import update_asin_status
+
+        db_path = tmp_path / "recovery.db"
+        c = sqlite3.connect(str(db_path))
+        c.row_factory = sqlite3.Row
+        init_schema(c)
+        pid, _ = register_product(c, "Router", "B", "M")
+        register_asin(c, pid, "UK", "B0RECOV001", status="not_listed", notes="")
+
+        with pytest.raises(ValueError, match="not_listed"):
+            _resolve_asin([], "B0RECOV001", marketplace="UK", conn=c)
+
+        update_asin_status(
+            c, pid, "UK", "active", notes="operator confirmed re-listed"
+        )
+        asin, *_ = _resolve_asin([], "B0RECOV001", marketplace="UK", conn=c)
+        assert asin == "B0RECOV001"
+        c.close()

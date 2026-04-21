@@ -111,13 +111,18 @@ cli.py  ────────────────────────
 | 6 | Remove intent validation | Collapse status to `active` / `not_listed` |
 | 7 | Normalize brand/model matching | Add `brand_key`/`model_key` + `UNIQUE(brand_key, model_key)` on `products`; merges literal-variant duplicates on upgrade |
 | 8 | Canonicalize `ean_list`/`upc_list` to GTIN-13 | Rewrite `keepa_products.ean_list` / `upc_list` JSON in place so UPC-12 and EAN-13 of the same physical product collide; no DDL |
+| 9 | Transient-failure guard | Add `not_listed_strikes` counter to `product_asins`; require N consecutive genuine empty observations before flipping to `not_listed` (issue #11) |
 
-**Partial-failure note (v7 ↔ v8 ordering)**: v7 runs outside the
+**Partial-failure note (v7 ↔ v8/v9 ordering)**: v7 runs outside the
 inner migration txn because it toggles `PRAGMA foreign_keys`; v8 runs
 inside. `_migrate` gates v7 by checking the actual `schema_migrations`
 record (not `MAX(version)`) so a pre-v7 DB whose v8 record commits
 before v7 fails will still retry v7 on reopen instead of treating
-`current = 8` as "all migrations applied".
+`current = 8` as "all migrations applied". v9 runs in its own
+`with conn:` after v7 so the `INSERT INTO schema_migrations (9, ...)`
+is committed independently of caller behavior — without the wrap,
+Python sqlite3 leaves an implicit transaction open and `conn.close()`
+without explicit commit would silently roll back the v9 record.
 
 ### Brand/Model Normalization (v7+)
 
@@ -177,7 +182,7 @@ queries should use the canonical GTIN-13 form.
 | Value | Meaning | Typical Trigger |
 |-------|---------|-----------------|
 | `active` | Default; queryable. Registered and not observed as delisted. | Default on insert; `add_product`, `discover_asin`, `_auto_register_from_keepa`, `register_asin` |
-| `not_listed` | Observed empty-title response from Keepa (ASIN dead/removed on Amazon) | `_try_mark_not_listed()` during `ensure_keepa_data` post-fetch validation |
+| `not_listed` | Observed empty-title response from Keepa (ASIN dead/removed on Amazon) | `_record_empty_observation()` during `ensure_keepa_data` post-fetch validation — flipped only after `NOT_LISTED_STRIKE_THRESHOLD` consecutive empty observations (transient-failure guard, v8+) |
 
 ### Design Principle — Intent vs Availability
 
@@ -195,13 +200,37 @@ queries should use the canonical GTIN-13 form.
 `active` rows pass through. This prevents the silent-failure bug where
 users would see "no data" when the real cause was a dead ASIN.
 
+### Transient-Failure Guard (v8+)
+
+A single Keepa blip (rate limit, network error, partial JSON) must not
+blacklist a live ASIN, so the `active → not_listed` transition is
+gated by a counter column `product_asins.not_listed_strikes`:
+
+- Only `PriceHistory.fetch_error == ""` responses are **eligible** —
+  anything with a populated `fetch_error` (`rate_limited`,
+  `invalid_response`, `api_error`, `network`, `unexpected`,
+  `max_retries_exhausted`) is treated as transient and leaves status
+  and strikes untouched.
+- Eligible responses with an empty title **and** no csv increment the
+  counter. The flip to `not_listed` fires only when strikes reach
+  `NOT_LISTED_STRIKE_THRESHOLD` (currently **3**, defined in `db.py`).
+- Any fetch that returns data resets the counter to 0 via
+  `_record_successful_observation`. One healthy response fully clears
+  the in-flight streak.
+
+Already-`not_listed` rows still increment the counter (as an
+observational log) but don't re-flip or rewrite `notes`.
+
 ### State Diagram
 
 ```mermaid
 stateDiagram-v2
     [*] --> active: register / discover / auto-register
-    active --> not_listed: ensure_keepa_data post-fetch observes empty title + no csv
-    not_listed --> active: manual recovery via update_asin_status after re-listing
+    active --> active: transient fetch_error → log only
+    active --> active: genuine empty, strikes < N → increment counter
+    active --> not_listed: N consecutive genuine empty responses
+    active --> active: any fetch with data → strikes reset to 0
+    not_listed --> active: manual recovery via update_asin_status
 ```
 
 ### Single Write Entry Point

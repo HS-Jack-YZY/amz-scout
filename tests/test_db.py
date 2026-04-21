@@ -62,11 +62,11 @@ class TestSchema:
     def test_init_schema_idempotent(self, conn):
         init_schema(conn)  # Second call should not raise
         row = conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()
-        assert row[0] == 8  # v1..v8
+        assert row[0] == 9  # v1..v9 inclusive
 
     def test_schema_version(self, conn):
         row = conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()
-        assert row[0] == 8
+        assert row[0] == 9
 
 
 # ─── Keepa write tests ──────────────────────────────────────────────
@@ -427,10 +427,13 @@ class TestStatusMigrationV6:
         c0 = sqlite3.connect(str(db_path))
         c0.row_factory = sqlite3.Row
         init_schema(c0)
-        # Drop v6, v7, *and* v8 records so MAX(version)=5 and the v6
-        # migration path actually runs on reopen. (v7/v8 records are
-        # seeded by _SCHEMA_SQL even for a "fresh v5 downgrade".)
-        c0.execute("DELETE FROM schema_migrations WHERE version IN (6, 7, 8)")
+        # Drop v6+ records so MAX(version)=5 and the v6 migration path
+        # actually runs on reopen. (Every version record is seeded by
+        # _SCHEMA_SQL even for a "fresh v5 downgrade" — so later
+        # migrations like v7/v8/v9 must be dropped too, otherwise
+        # _migrate short-circuits on its `current >= SCHEMA_VERSION`
+        # check.)
+        c0.execute("DELETE FROM schema_migrations WHERE version >= 6")
         c0.execute("ALTER TABLE product_asins RENAME TO _pa_tmp")
         c0.execute("""
             CREATE TABLE product_asins (
@@ -452,7 +455,17 @@ class TestStatusMigrationV6:
                 PRIMARY KEY (product_id, marketplace)
             )
         """)
-        c0.execute("INSERT INTO product_asins SELECT * FROM _pa_tmp")
+        # List columns explicitly so future schema additions (like v8's
+        # not_listed_strikes) don't break this "force to v5 shape"
+        # scaffolding — _pa_tmp carries the live baseline's extra
+        # columns and `SELECT *` would produce a column-count mismatch.
+        c0.execute(
+            "INSERT INTO product_asins "
+            "(product_id, marketplace, asin, status, notes, "
+            " last_checked, created_at, updated_at) "
+            "SELECT product_id, marketplace, asin, status, notes, "
+            "       last_checked, created_at, updated_at FROM _pa_tmp"
+        )
         c0.execute("DROP TABLE _pa_tmp")
         c0.execute("DROP INDEX IF EXISTS idx_pa_asin")
         c0.commit()
@@ -500,13 +513,13 @@ class TestStatusMigrationV6:
         ).fetchone()
         assert idx is not None, "v6 migration must recreate idx_pa_asin"
 
-        # Migration records inserted. Reopen runs v6, v7, and v8 since
-        # all three records were cleared in Step 1, so MAX(version)
-        # advances to 8.
+        # Migration records inserted. Reopen runs v6, v7, v8 and v9
+        # since all four records were cleared in Step 1, so MAX(version)
+        # advances to the current SCHEMA_VERSION.
         ver = c2.execute(
             "SELECT MAX(version) AS v FROM schema_migrations"
         ).fetchone()
-        assert ver["v"] == 8
+        assert ver["v"] == 9
 
         # Tightened CHECK is in force: legacy values now rejected.
         with pytest.raises(sqlite3.IntegrityError):
@@ -610,7 +623,7 @@ class TestBrandModelKeyMigrationV7:
         init_schema(c0)
 
         c0.execute("PRAGMA foreign_keys = OFF")
-        c0.execute("DELETE FROM schema_migrations WHERE version IN (7, 8)")
+        c0.execute("DELETE FROM schema_migrations WHERE version >= 7")
         c0.execute("DROP TABLE products")
         c0.execute("""
             CREATE TABLE products (
@@ -754,7 +767,7 @@ class TestBrandModelKeyMigrationV7:
         init_schema(c0)
 
         c0.execute("PRAGMA foreign_keys = OFF")
-        c0.execute("DELETE FROM schema_migrations WHERE version IN (7, 8)")
+        c0.execute("DELETE FROM schema_migrations WHERE version >= 7")
         c0.execute("DROP TABLE products")
         c0.execute("""
             CREATE TABLE products (
