@@ -739,7 +739,7 @@ class TestBrandModelKeyMigrationV7:
         ver = c2.execute(
             "SELECT MAX(version) AS v FROM schema_migrations"
         ).fetchone()["v"]
-        assert ver == 8
+        assert ver == 9
 
         with pytest.raises(sqlite3.IntegrityError):
             c2.execute(
@@ -1194,7 +1194,10 @@ class TestGtinBackfillMigrationV8:
         c0 = sqlite3.connect(str(db_path))
         c0.row_factory = sqlite3.Row
         init_schema(c0)
-        c0.execute("DELETE FROM schema_migrations WHERE version = 8")
+        # Drop v8+ records so MAX(version)=7 and the v8 backfill actually
+        # reruns on reopen. (Just deleting v8 leaves MAX=9 from the v9
+        # not_listed_strikes record, which short-circuits _migrate.)
+        c0.execute("DELETE FROM schema_migrations WHERE version >= 8")
         c0.execute(
             "INSERT INTO keepa_products "
             "(asin, site, brand, ean_list, upc_list, "
@@ -1232,7 +1235,7 @@ class TestGtinBackfillMigrationV8:
                     "SELECT MAX(version) AS v FROM schema_migrations"
                 ).fetchone()["v"]
 
-        assert version == 8
+        assert version == 9
         assert json.loads(us["upc_list"]) == ["0850018166010"]
         assert us["ean_list"] is None
         assert json.loads(eu["ean_list"]) == ["0850018166010"]
@@ -1264,7 +1267,10 @@ class TestGtinBackfillMigrationV8:
         c0 = sqlite3.connect(str(db_path))
         c0.row_factory = sqlite3.Row
         init_schema(c0)
-        c0.execute("DELETE FROM schema_migrations WHERE version = 8")
+        # Drop v8+ records so MAX(version)=7 and the v8 backfill actually
+        # reruns on reopen. (Just deleting v8 leaves MAX=9 from the v9
+        # not_listed_strikes record, which short-circuits _migrate.)
+        c0.execute("DELETE FROM schema_migrations WHERE version >= 8")
         c0.execute(
             "INSERT INTO keepa_products "
             "(asin, site, brand, ean_list, upc_list, "
@@ -1340,12 +1346,12 @@ class TestV7RetryAfterV8Commit:
         c0.execute("PRAGMA foreign_keys = ON")
         c0.commit()
 
-        # Sanity: without the fix, current = MAX(version) = 8 would
+        # Sanity: without the fix, current = MAX(version) >= 8 would
         # bypass v7 on reopen.
         max_ver = c0.execute(
             "SELECT MAX(version) AS v FROM schema_migrations"
         ).fetchone()["v"]
-        assert max_ver == 8
+        assert max_ver == 9
         c0.close()
 
         db_mod._schema_initialized.discard(str(db_path))
@@ -1485,16 +1491,18 @@ class TestRegisterProductConcurrency:
 # ─── Migration ordering: v8 must wait for v7 (Copilot PR #20) ────────
 
 
-class TestMigrationOrderingV8AfterV7:
+class TestMigrationOrderingV9AfterV7:
     """Regression guard for the schema_migrations stranding bug.
 
-    If v8 is recorded *before* v7 commits, a v7 failure leaves the DB
-    at MAX(version)=8 with v7 un-applied. The next ``init_schema()``
+    If v9 is recorded *before* v7 commits, a v7 failure leaves the DB
+    at MAX(version)=9 with v7 un-applied. The next ``init_schema()``
     short-circuits on ``current >= SCHEMA_VERSION`` and never retries
-    v7 — silent permanent corruption.
+    v7 — silent permanent corruption. (Note: main has its own v8 ↔ v7
+    safety via the ``v7_applied`` flag in ``_migrate``; v9 sits after
+    v7 in the migration sequence and is gated by ``current < 9``.)
     """
 
-    def test_v7_failure_does_not_strand_v8_record(self, tmp_path, monkeypatch):
+    def test_v7_failure_does_not_strand_v9_record(self, tmp_path, monkeypatch):
         from amz_scout import db as db_mod
 
         db_path = tmp_path / "ordering.db"
@@ -1528,17 +1536,19 @@ class TestMigrationOrderingV8AfterV7:
             for r in c1.execute("SELECT version FROM schema_migrations")
         }
         assert 7 not in versions, "v7 record must not appear after raise"
-        assert 8 not in versions, (
-            "v8 record must not appear if v7 hasn't completed — "
-            "otherwise MAX(version)=8 would block v7 retry forever"
+        assert 9 not in versions, (
+            "v9 record must not appear if v7 hasn't completed — "
+            "v9 runs after v7 and must not be stranded by a v7 failure. "
+            "(v8 is in the main txn and may already be present — that "
+            "is main's existing GTIN migration, unrelated to v7 ordering.)"
         )
         c1.close()
 
-    def test_v7_recovery_after_failure_completes_to_v8(
+    def test_v7_recovery_after_failure_completes_to_v9(
         self, tmp_path, monkeypatch
     ):
         """After a v7 failure, removing the patch must let init_schema
-        complete v7 AND v8 cleanly on the next call.
+        complete v7 AND v9 cleanly on the next call.
         """
         from amz_scout import db as db_mod
 
@@ -1578,10 +1588,10 @@ class TestMigrationOrderingV8AfterV7:
         max_v = c2.execute(
             "SELECT MAX(version) AS v FROM schema_migrations"
         ).fetchone()["v"]
-        assert max_v == 8
+        assert max_v == 9
         c2.close()
 
-    def test_v8_persisted_across_connection_close(self, tmp_path):
+    def test_v9_persisted_across_connection_close(self, tmp_path):
         """Copilot follow-up review on PR #20: the v8 block runs outside
         any ``with conn:`` block, so its INSERT into ``schema_migrations``
         is in an open implicit transaction when ``init_schema`` returns.
@@ -1620,10 +1630,10 @@ class TestMigrationOrderingV8AfterV7:
             r[1] for r in c2.execute("PRAGMA table_info(product_asins)")
         ]
         assert 7 in versions, "v7 record must survive close without commit"
-        assert 8 in versions, (
-            "v8 record must survive close without commit. v8 INSERT runs "
-            "outside any ``with conn:`` and gets rolled back on close — "
-            "wrap the v8 block in its own ``with conn:`` to fix."
+        assert 9 in versions, (
+            "v9 record must survive close without commit. v9 INSERT runs "
+            "outside the main txn and gets rolled back on close unless "
+            "wrapped in its own ``with conn:`` — that wrap is the fix."
         )
         assert "not_listed_strikes" in cols, (
             "ALTER TABLE (DDL) auto-commits in SQLite, so the column "
