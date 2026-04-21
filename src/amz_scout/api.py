@@ -1021,11 +1021,11 @@ def ensure_keepa_data(
                                 "consecutive empty responses. "
                                 f"Run discover_asin(brand={brand!r}, "
                                 f"model={o.model!r}, marketplace={o.site!r}) "
-                                "for a valid ASIN, or restore via "
-                                f"db.update_asin_status(conn, product_id, "
-                                f"{o.site!r}, 'active') after looking up "
-                                f"product_id with list_products("
-                                f"brand={brand!r}, model={o.model!r})."
+                                "for a valid ASIN, or "
+                                f"update_product_asin(brand={brand!r}, "
+                                f"model={o.model!r}, marketplace={o.site!r}, "
+                                f"asin={o.asin!r}, status='active') "
+                                "if re-listed."
                             )
                         elif was_active and strikes > 0:
                             warnings.append(
@@ -1044,14 +1044,13 @@ def ensure_keepa_data(
                                 f"{o.model} / {o.site} ({o.asin}): "
                                 "Still observed as not_listed "
                                 f"(empty observations: {strikes}). "
-                                f"Restore via db.update_asin_status(conn, "
-                                f"product_id, {o.site!r}, 'active') after "
-                                f"looking up product_id with list_products("
-                                f"brand={brand!r}, model={o.model!r}). "
-                                f"Otherwise run discover_asin("
+                                f"Restore via update_product_asin("
                                 f"brand={brand!r}, model={o.model!r}, "
-                                f"marketplace={o.site!r}) for the correct "
-                                "ASIN."
+                                f"marketplace={o.site!r}, asin={o.asin!r}, "
+                                "status='active') if re-listed. Otherwise "
+                                f"run discover_asin(brand={brand!r}, "
+                                f"model={o.model!r}, marketplace={o.site!r}) "
+                                "for the correct ASIN."
                             )
                         else:
                             # Unregistered ASIN — preserve the legacy
