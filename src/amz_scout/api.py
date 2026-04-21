@@ -1020,17 +1020,20 @@ def ensure_keepa_data(
                                 f"Marked not_listed after {strikes} "
                                 "consecutive empty responses. "
                                 f"Run discover_asin('{brand}', '{o.model}', "
-                                f"'{o.site}') for a valid ASIN, or "
-                                "update_asin_status(status='active') if "
-                                "re-listed."
+                                f"'{o.site}') for a valid ASIN, or restore "
+                                "via SQL if re-listed: "
+                                "UPDATE product_asins SET status='active' "
+                                f"WHERE asin='{o.asin}' AND "
+                                f"marketplace='{o.site}'"
                             )
                         elif was_active and strikes > 0:
                             warnings.append(
                                 f"{o.model} / {o.site} ({o.asin}): "
                                 f"Empty Keepa response (strike {strikes}/"
                                 f"{_STRIKE_THRESHOLD}); status unchanged. "
-                                "Will mark not_listed after consecutive "
-                                "threshold."
+                                f"Will mark not_listed after "
+                                f"{_STRIKE_THRESHOLD} consecutive genuine "
+                                "empty responses."
                             )
                         elif strikes > 0:
                             # Already not_listed: observational log only —
@@ -1040,10 +1043,12 @@ def ensure_keepa_data(
                                 f"{o.model} / {o.site} ({o.asin}): "
                                 "Still observed as not_listed "
                                 f"(empty observations: {strikes}). "
-                                "Use update_asin_status(status='active') "
-                                "if re-listed, or discover_asin("
-                                f"'{brand}', '{o.model}', '{o.site}') "
-                                "for the correct ASIN."
+                                "Restore via SQL if re-listed: "
+                                "UPDATE product_asins SET status='active' "
+                                f"WHERE asin='{o.asin}' AND "
+                                f"marketplace='{o.site}'. Otherwise run "
+                                f"discover_asin('{brand}', '{o.model}', "
+                                f"'{o.site}') for the correct ASIN."
                             )
                         else:
                             # Unregistered ASIN — preserve the legacy
