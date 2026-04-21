@@ -1580,3 +1580,53 @@ class TestMigrationOrderingV8AfterV7:
         ).fetchone()["v"]
         assert max_v == 8
         c2.close()
+
+    def test_v8_persisted_across_connection_close(self, tmp_path):
+        """Copilot follow-up review on PR #20: the v8 block runs outside
+        any ``with conn:`` block, so its INSERT into ``schema_migrations``
+        is in an open implicit transaction when ``init_schema`` returns.
+        If the caller (e.g. ``get_connection``) closes the connection
+        without ``commit()``, Python sqlite3 rolls back the open tx and
+        the v8 record is silently lost — even though ``ALTER TABLE`` (a
+        DDL) was already auto-committed by SQLite. The next reopen would
+        then see ``MAX(version)=7`` with the column already present, and
+        re-run the v8 block on every open. v8 must commit on its own.
+        """
+        from amz_scout import db as db_mod
+
+        db_path = tmp_path / "persist.db"
+        c0 = sqlite3.connect(str(db_path))
+        c0.row_factory = sqlite3.Row
+        init_schema(c0)
+        # Force back to v6 so v7 + v8 both rerun on reopen.
+        c0.execute("DELETE FROM schema_migrations WHERE version >= 7")
+        c0.commit()
+        c0.close()
+        db_mod._schema_initialized.discard(str(db_path))
+
+        # Reopen and run init_schema, then close WITHOUT explicit commit
+        # — exactly what ``get_connection`` does in production.
+        c1 = sqlite3.connect(str(db_path))
+        c1.row_factory = sqlite3.Row
+        init_schema(c1)
+        c1.close()  # No commit() — caller pattern.
+
+        c2 = sqlite3.connect(str(db_path))
+        c2.row_factory = sqlite3.Row
+        versions = {
+            r[0] for r in c2.execute("SELECT version FROM schema_migrations")
+        }
+        cols = [
+            r[1] for r in c2.execute("PRAGMA table_info(product_asins)")
+        ]
+        assert 7 in versions, "v7 record must survive close without commit"
+        assert 8 in versions, (
+            "v8 record must survive close without commit. v8 INSERT runs "
+            "outside any ``with conn:`` and gets rolled back on close — "
+            "wrap the v8 block in its own ``with conn:`` to fix."
+        )
+        assert "not_listed_strikes" in cols, (
+            "ALTER TABLE (DDL) auto-commits in SQLite, so the column "
+            "should always survive — but assert it anyway as a sanity check."
+        )
+        c2.close()
