@@ -62,11 +62,11 @@ class TestSchema:
     def test_init_schema_idempotent(self, conn):
         init_schema(conn)  # Second call should not raise
         row = conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()
-        assert row[0] == 7  # v1 + v2 + v3 + v4 + v5 + v6 + v7
+        assert row[0] == 8  # v1..v8
 
     def test_schema_version(self, conn):
         row = conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()
-        assert row[0] == 7
+        assert row[0] == 8
 
 
 # ─── Keepa write tests ──────────────────────────────────────────────
@@ -427,10 +427,10 @@ class TestStatusMigrationV6:
         c0 = sqlite3.connect(str(db_path))
         c0.row_factory = sqlite3.Row
         init_schema(c0)
-        # Drop v6 *and* v7 records so MAX(version)=5 and the v6
-        # migration path actually runs on reopen. (v7 records are
+        # Drop v6, v7, *and* v8 records so MAX(version)=5 and the v6
+        # migration path actually runs on reopen. (v7/v8 records are
         # seeded by _SCHEMA_SQL even for a "fresh v5 downgrade".)
-        c0.execute("DELETE FROM schema_migrations WHERE version IN (6, 7)")
+        c0.execute("DELETE FROM schema_migrations WHERE version IN (6, 7, 8)")
         c0.execute("ALTER TABLE product_asins RENAME TO _pa_tmp")
         c0.execute("""
             CREATE TABLE product_asins (
@@ -500,12 +500,13 @@ class TestStatusMigrationV6:
         ).fetchone()
         assert idx is not None, "v6 migration must recreate idx_pa_asin"
 
-        # Migration records inserted. Reopen runs v6 AND v7 since both
-        # records were cleared in Step 1, so MAX(version) advances to 7.
+        # Migration records inserted. Reopen runs v6, v7, and v8 since
+        # all three records were cleared in Step 1, so MAX(version)
+        # advances to 8.
         ver = c2.execute(
             "SELECT MAX(version) AS v FROM schema_migrations"
         ).fetchone()
-        assert ver["v"] == 7
+        assert ver["v"] == 8
 
         # Tightened CHECK is in force: legacy values now rejected.
         with pytest.raises(sqlite3.IntegrityError):
@@ -609,7 +610,7 @@ class TestBrandModelKeyMigrationV7:
         init_schema(c0)
 
         c0.execute("PRAGMA foreign_keys = OFF")
-        c0.execute("DELETE FROM schema_migrations WHERE version = 7")
+        c0.execute("DELETE FROM schema_migrations WHERE version IN (7, 8)")
         c0.execute("DROP TABLE products")
         c0.execute("""
             CREATE TABLE products (
@@ -725,7 +726,7 @@ class TestBrandModelKeyMigrationV7:
         ver = c2.execute(
             "SELECT MAX(version) AS v FROM schema_migrations"
         ).fetchone()["v"]
-        assert ver == 7
+        assert ver == 8
 
         with pytest.raises(sqlite3.IntegrityError):
             c2.execute(
@@ -753,7 +754,7 @@ class TestBrandModelKeyMigrationV7:
         init_schema(c0)
 
         c0.execute("PRAGMA foreign_keys = OFF")
-        c0.execute("DELETE FROM schema_migrations WHERE version = 7")
+        c0.execute("DELETE FROM schema_migrations WHERE version IN (7, 8)")
         c0.execute("DROP TABLE products")
         c0.execute("""
             CREATE TABLE products (
@@ -946,6 +947,414 @@ class TestFindProductByEanBrandGuardV7:
 
         raw = {"eanList": ["1234567890123"], "brand": ""}
         assert _find_product_by_ean(conn, "B0NEW000001", raw) == pid
+
+
+# ─── GTIN normalization (issue #12) ──────────────────────────────────
+
+
+class TestNormalizeGtin:
+    """Contract: every EAN/UPC/GTIN value lands as a 13-digit
+    zero-padded string, or ``""`` for unusable input. Ensures UPC-12
+    and EAN-13 of the same GTIN collide.
+    """
+
+    def test_upc12_and_ean13_same_gtin_collide(self):
+        from amz_scout.db import _normalize_gtin
+
+        assert (
+            _normalize_gtin("850018166010")
+            == _normalize_gtin("0850018166010")
+            == "0850018166010"
+        )
+
+    def test_none_empty_and_garbage_return_empty(self):
+        from amz_scout.db import _normalize_gtin
+
+        assert _normalize_gtin(None) == ""
+        assert _normalize_gtin("") == ""
+        assert _normalize_gtin("   ") == ""
+        assert _normalize_gtin("abc") == ""
+
+    def test_whitespace_and_hyphens_stripped(self):
+        from amz_scout.db import _normalize_gtin
+
+        assert _normalize_gtin("  850-018-166-010  ") == "0850018166010"
+
+    def test_over_13_digits_dropped(self):
+        from amz_scout.db import _normalize_gtin
+
+        assert _normalize_gtin("00850018166010") == ""  # 14 digits
+        assert _normalize_gtin("9999999999999999") == ""
+
+    def test_short_codes_zero_padded(self):
+        from amz_scout.db import _normalize_gtin
+
+        assert _normalize_gtin("1") == "0000000000001"
+        assert _normalize_gtin("123456789012") == "0123456789012"
+
+    def test_list_helper_preserves_order_and_drops_empties(self):
+        from amz_scout.db import _normalize_gtin_list
+
+        out = _normalize_gtin_list(
+            ["850018166010", None, "", "0850018166010", "abc"]
+        )
+        assert out == ["0850018166010", "0850018166010"]
+
+    def test_list_helper_accepts_none(self):
+        from amz_scout.db import _normalize_gtin_list
+
+        assert _normalize_gtin_list(None) == []
+        assert _normalize_gtin_list([]) == []
+
+
+class TestFindProductByEanGtinNormalization:
+    """Issue #12 regression: US ASIN with UPC-12 in upcList and
+    EU ASIN with EAN-13 (same digits + leading 0) in eanList must
+    bind to the same product_id. Before the fix the raw-string set
+    union dropped the cross-format match and created duplicates.
+    """
+
+    def _seed(
+        self,
+        conn,
+        asin,
+        site,
+        brand,
+        ean_json="[]",
+        upc_json="[]",
+    ):
+        conn.execute(
+            "INSERT INTO keepa_products "
+            "(asin, site, brand, ean_list, upc_list, "
+            " fetch_mode, fetched_at) "
+            "VALUES (?, ?, ?, ?, ?, 'full', "
+            "'2026-04-20T00:00:00Z')",
+            (asin, site, brand, ean_json, upc_json),
+        )
+
+    def test_us_upc12_binds_to_eu_ean13_product(self, conn):
+        from amz_scout.db import _find_product_by_ean, store_keepa_product
+
+        # EU row is stored via the canonical write path (auto-registers
+        # the product). upc_list / ean_list lands as GTIN-13.
+        store_keepa_product(
+            conn,
+            "B0EU000001",
+            "DE",
+            {
+                "title": "Acme Model X",
+                "brand": "Acme",
+                "model": "Model X",
+                "eanList": ["0850018166010"],
+                "upcList": None,
+            },
+            fetched_at="2026-04-20T00:00:00Z",
+        )
+        pid = conn.execute(
+            "SELECT product_id FROM product_asins "
+            "WHERE asin = 'B0EU000001' AND marketplace = 'DE'"
+        ).fetchone()["product_id"]
+
+        # New US row carries UPC-12 of the same GTIN — must match.
+        raw_us = {
+            "brand": "Acme",
+            "eanList": None,
+            "upcList": ["850018166010"],
+        }
+        assert _find_product_by_ean(conn, "B0US000001", raw_us) == pid
+
+    def test_legacy_stored_upc12_matches_new_ean13(self, conn):
+        """Defence-in-depth: direct INSERT (simulating a pre-v8 row that
+        bypassed the normalized write path) plus an explicit backfill
+        call should still produce the cross-format match, proving the
+        migration's logic is correct.
+        """
+        from amz_scout.db import (
+            _find_product_by_ean,
+            _json_or_none,
+            _normalize_gtin_list,
+            _safe_json_list,
+            register_asin,
+            register_product,
+        )
+
+        pid, _ = register_product(conn, "Router", "Acme", "Model X")
+        self._seed(
+            conn,
+            "B0US000001",
+            "US",
+            "Acme",
+            upc_json='["850018166010"]',
+        )
+        register_asin(conn, pid, "US", "B0US000001")
+
+        # Simulate v8 backfill inline (the migration itself is already
+        # applied on the fixture, so we emulate its rewrite on our
+        # direct-INSERT row).
+        row = conn.execute(
+            "SELECT rowid, ean_list, upc_list FROM keepa_products "
+            "WHERE asin = 'B0US000001'"
+        ).fetchone()
+        ean_new = _normalize_gtin_list(_safe_json_list(row["ean_list"]))
+        upc_new = _normalize_gtin_list(_safe_json_list(row["upc_list"]))
+        conn.execute(
+            "UPDATE keepa_products SET ean_list = ?, upc_list = ? "
+            "WHERE rowid = ?",
+            (
+                _json_or_none(ean_new),
+                _json_or_none(upc_new),
+                row["rowid"],
+            ),
+        )
+
+        raw_eu = {"brand": "Acme", "eanList": ["0850018166010"]}
+        assert _find_product_by_ean(conn, "B0EU000001", raw_eu) == pid
+
+    def test_different_gtin_still_rejected(self, conn):
+        """Normalization must not collapse genuinely different barcodes.
+        Two products with different GTINs must remain separate.
+        """
+        from amz_scout.db import _find_product_by_ean, store_keepa_product
+
+        store_keepa_product(
+            conn,
+            "B0EU000001",
+            "DE",
+            {
+                "title": "Acme Model X",
+                "brand": "Acme",
+                "model": "Model X",
+                "eanList": ["0850018166010"],
+            },
+            fetched_at="2026-04-20T00:00:00Z",
+        )
+
+        raw_different = {
+            "brand": "Acme",
+            "upcList": ["850018166099"],  # different GTIN
+        }
+        assert _find_product_by_ean(conn, "B0US000001", raw_different) is None
+
+    def test_store_keepa_product_normalizes_write_path(self, conn):
+        import json
+
+        from amz_scout.db import store_keepa_product
+
+        store_keepa_product(
+            conn,
+            "B0US000002",
+            "US",
+            {
+                "title": "Acme Model Y",
+                "brand": "Acme",
+                "upcList": ["850018166010"],  # UPC-12
+                "eanList": None,
+            },
+            fetched_at="2026-04-20T00:00:00Z",
+        )
+        row = conn.execute(
+            "SELECT ean_list, upc_list FROM keepa_products "
+            "WHERE asin = 'B0US000002'"
+        ).fetchone()
+        assert row["ean_list"] is None
+        assert json.loads(row["upc_list"]) == ["0850018166010"]
+
+
+class TestGtinBackfillMigrationV8:
+    """v7 → v8 upgrade: canonicalize existing ean_list / upc_list JSON
+    to GTIN-13 so pre-fix rows match the post-fix query path.
+    """
+
+    def test_v8_backfills_existing_rows(self, tmp_path, caplog):
+        import json
+        import logging
+
+        import amz_scout.db as db_mod
+        from amz_scout.db import init_schema, open_db
+
+        db_path = tmp_path / "v7tov8.db"
+
+        # Create v8 schema first, then simulate a "pre-v8" state by
+        # removing the v8 migration record AND directly writing raw
+        # UPC-12 / EAN-13 into keepa_products (i.e., bypassing the
+        # normalized write path).
+        c0 = sqlite3.connect(str(db_path))
+        c0.row_factory = sqlite3.Row
+        init_schema(c0)
+        c0.execute("DELETE FROM schema_migrations WHERE version = 8")
+        c0.execute(
+            "INSERT INTO keepa_products "
+            "(asin, site, brand, ean_list, upc_list, "
+            " fetch_mode, fetched_at) VALUES "
+            "('B0US000001', 'US', 'Acme', NULL, "
+            "'[\"850018166010\"]', 'full', "
+            "'2026-04-20T00:00:00Z')"
+        )
+        c0.execute(
+            "INSERT INTO keepa_products "
+            "(asin, site, brand, ean_list, upc_list, "
+            " fetch_mode, fetched_at) VALUES "
+            "('B0EU000001', 'DE', 'Acme', "
+            "'[\"0850018166010\"]', NULL, 'full', "
+            "'2026-04-20T00:00:00Z')"
+        )
+        c0.commit()
+        c0.close()
+
+        # Clear the cached migration marker so re-opening triggers the
+        # v8 migration path.
+        db_mod._schema_initialized.discard(str(db_path))
+
+        with caplog.at_level(logging.INFO, logger="amz_scout.db"):
+            with open_db(db_path) as c1:
+                us = c1.execute(
+                    "SELECT ean_list, upc_list FROM keepa_products "
+                    "WHERE asin = 'B0US000001'"
+                ).fetchone()
+                eu = c1.execute(
+                    "SELECT ean_list, upc_list FROM keepa_products "
+                    "WHERE asin = 'B0EU000001'"
+                ).fetchone()
+                version = c1.execute(
+                    "SELECT MAX(version) AS v FROM schema_migrations"
+                ).fetchone()["v"]
+
+        assert version == 8
+        assert json.loads(us["upc_list"]) == ["0850018166010"]
+        assert us["ean_list"] is None
+        assert json.loads(eu["ean_list"]) == ["0850018166010"]
+        assert eu["upc_list"] is None
+        assert any(
+            "version 8" in rec.message for rec in caplog.records
+        )
+
+    def test_v8_is_idempotent(self, conn):
+        from amz_scout.db import init_schema
+
+        init_schema(conn)  # second call
+        row = conn.execute(
+            "SELECT COUNT(*) AS c FROM schema_migrations "
+            "WHERE version = 8"
+        ).fetchone()
+        assert row["c"] == 1
+
+    def test_v8_leaves_already_canonical_rows_untouched(self, tmp_path):
+        """Write amplification guard: rows whose ean_list / upc_list are
+        already canonical must not be rewritten.
+        """
+        import json
+
+        import amz_scout.db as db_mod
+        from amz_scout.db import init_schema, open_db
+
+        db_path = tmp_path / "noop.db"
+        c0 = sqlite3.connect(str(db_path))
+        c0.row_factory = sqlite3.Row
+        init_schema(c0)
+        c0.execute("DELETE FROM schema_migrations WHERE version = 8")
+        c0.execute(
+            "INSERT INTO keepa_products "
+            "(asin, site, brand, ean_list, upc_list, "
+            " fetch_mode, fetched_at) VALUES "
+            "('B0XX000001', 'US', 'Acme', "
+            "'[\"0850018166010\"]', NULL, 'full', "
+            "'2026-04-20T00:00:00Z')"
+        )
+        c0.commit()
+        c0.close()
+
+        db_mod._schema_initialized.discard(str(db_path))
+
+        with open_db(db_path) as c1:
+            row = c1.execute(
+                "SELECT ean_list FROM keepa_products "
+                "WHERE asin = 'B0XX000001'"
+            ).fetchone()
+
+        assert json.loads(row["ean_list"]) == ["0850018166010"]
+        # The migration loop's `if ean_new == ean_raw` no-op guard
+        # ensures no UPDATE ran; this test fails loudly if that guard
+        # is removed in the future.
+
+
+class TestV7RetryAfterV8Commit:
+    """Regression for the v7/v8 partial-failure trap.
+
+    ``_migrate`` captures ``current = MAX(version)`` once at entry and
+    runs v8 inside an inner txn, then v7 outside. If v8 commits but v7
+    raises, a retry would see ``current = 8`` and — under the old
+    ``current < 7`` gate — silently skip v7 forever, leaving the
+    ``products`` table on pre-v7 schema while ``schema_migrations``
+    claims v8. The fix gates v7 by actual record existence.
+    """
+
+    def test_v7_reruns_when_only_v8_committed(self, tmp_path):
+        import amz_scout.db as db_mod
+        from amz_scout.db import init_schema, open_db
+
+        db_path = tmp_path / "v7_skipped.db"
+
+        c0 = sqlite3.connect(str(db_path))
+        c0.row_factory = sqlite3.Row
+        c0.execute("PRAGMA foreign_keys = ON")
+        init_schema(c0)
+
+        # Simulate the partial-failure state: v8 record is present,
+        # v7 record is gone, and ``products`` is back on its pre-v7
+        # shape (no brand_key / model_key). v6 and v8 records remain
+        # intact so MAX(version) = 8.
+        c0.execute("PRAGMA foreign_keys = OFF")
+        c0.execute("DELETE FROM schema_migrations WHERE version = 7")
+        c0.execute("DROP TABLE products")
+        c0.execute("""
+            CREATE TABLE products (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                category        TEXT NOT NULL,
+                brand           TEXT NOT NULL,
+                model           TEXT NOT NULL,
+                search_keywords TEXT NOT NULL DEFAULT '',
+                created_at      TEXT NOT NULL
+                    DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                updated_at      TEXT NOT NULL
+                    DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                UNIQUE(brand, model)
+            )
+        """)
+        c0.execute(
+            "INSERT INTO products (id, category, brand, model) "
+            "VALUES (10, 'Router', 'TP-Link', 'Archer BE400')"
+        )
+        c0.execute("PRAGMA foreign_keys = ON")
+        c0.commit()
+
+        # Sanity: without the fix, current = MAX(version) = 8 would
+        # bypass v7 on reopen.
+        max_ver = c0.execute(
+            "SELECT MAX(version) AS v FROM schema_migrations"
+        ).fetchone()["v"]
+        assert max_ver == 8
+        c0.close()
+
+        db_mod._schema_initialized.discard(str(db_path))
+
+        with open_db(db_path) as c1:
+            cols = {
+                r["name"]
+                for r in c1.execute("PRAGMA table_info(products)")
+            }
+            v7_rec = c1.execute(
+                "SELECT 1 FROM schema_migrations WHERE version = 7"
+            ).fetchone()
+            kept = c1.execute(
+                "SELECT id, brand, model, brand_key, model_key "
+                "FROM products WHERE id = 10"
+            ).fetchone()
+
+        assert "brand_key" in cols, "v7 migration must rerun"
+        assert "model_key" in cols, "v7 migration must rerun"
+        assert v7_rec is not None, "v7 record must be inserted on retry"
+        assert kept["brand_key"] == "tp-link"
+        assert kept["model_key"] == "archer be400"
 
 
 # ─── register_product concurrency ────────────────────────────────
