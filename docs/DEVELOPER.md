@@ -110,6 +110,14 @@ cli.py  ────────────────────────
 | 5 | Tighten `product_asins.status` CHECK | Drop zombie `'unavailable'` value |
 | 6 | Remove intent validation | Collapse status to `active` / `not_listed` |
 | 7 | Normalize brand/model matching | Add `brand_key`/`model_key` + `UNIQUE(brand_key, model_key)` on `products`; merges literal-variant duplicates on upgrade |
+| 8 | Canonicalize `ean_list`/`upc_list` to GTIN-13 | Rewrite `keepa_products.ean_list` / `upc_list` JSON in place so UPC-12 and EAN-13 of the same physical product collide; no DDL |
+
+**Partial-failure note (v7 ↔ v8 ordering)**: v7 runs outside the
+inner migration txn because it toggles `PRAGMA foreign_keys`; v8 runs
+inside. `_migrate` gates v7 by checking the actual `schema_migrations`
+record (not `MAX(version)`) so a pre-v7 DB whose v8 record commits
+before v7 fails will still retry v7 on reopen instead of treating
+`current = 8` as "all migrations applied".
 
 ### Brand/Model Normalization (v7+)
 
@@ -129,6 +137,35 @@ marketplace are logged at `WARNING` level for manual reconciliation.
 The rebuild toggles `PRAGMA foreign_keys` off/on around the
 `DROP TABLE products` + `RENAME products_v7 → products` sequence, per
 SQLite's recommended 12-step migration pattern.
+
+### GTIN Canonicalization (v8+)
+
+`keepa_products.ean_list` and `keepa_products.upc_list` store canonical
+GTIN-13 JSON arrays since schema v8. Both columns are passed through
+`_normalize_gtin_list` on write (`_upsert_keepa_product`) and on read
+(`_find_product_by_ean` re-normalizes lookup inputs for defence in
+depth). `_normalize_gtin(code)` strips non-digit characters and
+left-zero-pads to 13 digits; codes >13 digits or with no digits at all
+collapse to `""` and are dropped so `codes.discard("")` removes them.
+
+Rationale: Keepa dual-writes UPC-12 (`"850018166010"`) to `upc_list`
+and EAN-13 (`"0850018166010"`, same GTIN with leading zero) to
+`ean_list` for US GS1-registered products; European listings carry
+only EAN-13. A raw string comparison misses these cross-format matches
+and creates duplicate `product_id` rows for the same physical product.
+Normalizing both sides to GTIN-13 closes the gap without adding new
+indexes.
+
+The v8 migration rewrites existing rows in place (JSON content only,
+no DDL) and skips rows whose canonical form already equals the stored
+form, so it is cheap and idempotent. Fresh databases seed the v8
+`schema_migrations` record from `_SCHEMA_SQL` and skip the backfill
+loop entirely.
+
+Operator note: ad-hoc SQL that filters `upc_list`/`ean_list` with
+`LIKE '%<digits>%'` still matches canonical GTIN-13 values (a 12-digit
+UPC is a substring of its "0"+UPC GTIN-13 form). Strict equality
+queries should use the canonical GTIN-13 form.
 
 ## ASIN Status Semantics
 

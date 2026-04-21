@@ -11,6 +11,7 @@ import json as json_mod
 import logging
 import re
 import sqlite3
+from collections.abc import Iterable
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -102,7 +103,7 @@ SERIES_NAMES = {
     100: "MONTHLY_SOLD",
 }
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 # ─── Connection management ────────────────────────────────────────────
 
@@ -173,7 +174,15 @@ def _migrate(conn: sqlite3.Connection) -> None:
     row = conn.execute("SELECT MAX(version) AS v FROM schema_migrations").fetchone()
     current = row["v"] if row and row["v"] is not None else 0
 
-    if current >= SCHEMA_VERSION:
+    # v7 runs outside the inner migration txn, so a pre-v7 DB whose v8
+    # record commits before v7 fails can end up with MAX(version) >= 7
+    # while v7 itself was never applied. Check the actual record so
+    # the early-return below does not short-circuit the v7 retry path.
+    v7_applied = conn.execute(
+        "SELECT 1 FROM schema_migrations WHERE version = 7"
+    ).fetchone() is not None
+
+    if current >= SCHEMA_VERSION and v7_applied:
         return
 
     try:
@@ -405,11 +414,54 @@ def _migrate(conn: sqlite3.Connection) -> None:
                 )
                 logger.info("Migrated schema to version 6")
 
+            if current < 8:
+                # v8: canonicalize existing ean_list / upc_list JSON to
+                # GTIN-13 so cross-format (UPC-12 ↔ EAN-13) matches work.
+                # No DDL; rewrite JSON content row-by-row only when it
+                # would actually change, to keep the migration cheap.
+                rows = conn.execute(
+                    "SELECT rowid, ean_list, upc_list FROM keepa_products "
+                    "WHERE ean_list IS NOT NULL OR upc_list IS NOT NULL"
+                ).fetchall()
+                rewritten = 0
+                for row in rows:
+                    ean_raw = _safe_json_list(row["ean_list"])
+                    upc_raw = _safe_json_list(row["upc_list"])
+                    ean_new = _normalize_gtin_list(ean_raw)
+                    upc_new = _normalize_gtin_list(upc_raw)
+                    if ean_new == ean_raw and upc_new == upc_raw:
+                        continue
+                    conn.execute(
+                        "UPDATE keepa_products SET ean_list = ?, upc_list = ? "
+                        "WHERE rowid = ?",
+                        (
+                            _json_or_none(ean_new),
+                            _json_or_none(upc_new),
+                            row["rowid"],
+                        ),
+                    )
+                    rewritten += 1
+                conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations (version, description) "
+                    "VALUES (8, 'canonicalize ean_list/upc_list to GTIN-13')"
+                )
+                logger.info(
+                    "Migrated schema to version 8 (rewrote %d keepa_products rows)",
+                    rewritten,
+                )
+
         # v7 lives OUTSIDE the ``with conn`` above because it toggles
         # ``PRAGMA foreign_keys``, which is a silent no-op inside an
-        # active transaction. We keep v2-v6 inside the original txn so
-        # their atomicity is unchanged, then run v7 as its own unit.
-        if current < 7:
+        # active transaction. We keep v2-v6 (and v8, which only rewrites
+        # JSON content) inside the original txn so their atomicity is
+        # unchanged, then run v7 as its own unit.
+        #
+        # Gate by the ``v7_applied`` flag computed at entry rather than
+        # ``current < 7``: v8 commits inside the inner txn above and
+        # bumps MAX(version) to 8, so a pre-v7 DB upgrading to v8+
+        # would otherwise see ``current >= 7`` on retry after a v7
+        # failure and silently skip the v7 migration forever.
+        if not v7_applied:
             _migrate_to_v7(conn)
     except Exception:
         logger.exception(
@@ -569,6 +621,8 @@ INSERT INTO schema_migrations (version, description)
     VALUES (6, 'remove intent validation: status -> active/not_listed');
 INSERT INTO schema_migrations (version, description)
     VALUES (7, 'normalize brand/model matching via brand_key/model_key');
+INSERT INTO schema_migrations (version, description)
+    VALUES (8, 'canonicalize ean_list/upc_list to GTIN-13');
 
 CREATE TABLE competitive_snapshots (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -847,6 +901,42 @@ def _normalize_key(s: str | None) -> str:
     return " ".join((s or "").lower().split())
 
 
+def _normalize_gtin(code: str | None) -> str:
+    """Normalize a GTIN/UPC/EAN code to canonical GTIN-13.
+
+    Strips non-digit characters, then left-zero-pads to 13 digits so
+    that UPC-12 (``"850018166010"``) and EAN-13 (``"0850018166010"``)
+    of the same physical product collide to the same string. Codes
+    longer than 13 digits are dropped (GTIN-14 outer-case barcodes are
+    not ASIN-carried and silently padding them would corrupt identity).
+    ``None`` / empty / all-garbage inputs return ``""`` so the caller
+    can drop them via ``codes.discard("")``.
+    """
+    digits = "".join(c for c in (code or "") if c.isdigit())
+    if not digits or len(digits) > 13:
+        if digits:
+            logger.debug("Dropping out-of-range GTIN: %r", code)
+        return ""
+    return digits.zfill(13)
+
+
+def _normalize_gtin_list(codes: Iterable[str | None] | None) -> list[str]:
+    """Normalize a list of GTIN/UPC/EAN codes, dropping empties.
+
+    Preserves order and duplicates (by normalized form) so ``_json_or_none``
+    emits the same shape Keepa returned minus the format drift. Accepts
+    ``None`` or any iterable of ``str | None``.
+    """
+    if not codes:
+        return []
+    out: list[str] = []
+    for c in codes:
+        n = _normalize_gtin(c)
+        if n:
+            out.append(n)
+    return out
+
+
 def _find_product_by_ean(
     conn: sqlite3.Connection,
     asin: str,
@@ -861,7 +951,8 @@ def _find_product_by_ean(
     """
     ean_list = raw.get("eanList") or []
     upc_list = raw.get("upcList") or []
-    codes = set(ean_list + upc_list)
+    codes = {_normalize_gtin(c) for c in (ean_list + upc_list)}
+    codes.discard("")
     if not codes:
         return None
 
@@ -996,6 +1087,10 @@ def _upsert_keepa_product(
 ) -> None:
     fba = raw.get("fbaFees") or {}
     images = raw.get("images") or []
+    # Normalize EAN/UPC to canonical GTIN-13 so cross-format matches
+    # (UPC-12 on US vs EAN-13 on EU for the same physical product) hit.
+    normalized_ean = _normalize_gtin_list(raw.get("eanList"))
+    normalized_upc = _normalize_gtin_list(raw.get("upcList"))
     conn.execute(
         """INSERT OR REPLACE INTO keepa_products (
             asin, site, title, brand, manufacturer, model, part_number,
@@ -1057,8 +1152,8 @@ def _upsert_keepa_product(
             _json_or_none(raw.get("categoryTree")),
             _json_or_none(raw.get("categories")),
             raw.get("salesRankReference"),
-            _json_or_none(raw.get("eanList")),
-            _json_or_none(raw.get("upcList")),
+            _json_or_none(normalized_ean),
+            _json_or_none(normalized_upc),
             raw.get("listedSince"),
             raw.get("trackingSince"),
             fba.get("pickAndPackFee"),
