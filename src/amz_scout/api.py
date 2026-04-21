@@ -395,29 +395,83 @@ def _auto_fetch_stale_warning(fetch_meta: dict[str, Any]) -> str | None:
     return f"Keepa auto-fetch failed ({detail}); results may be stale."
 
 
-def _try_mark_not_listed(
+def _record_empty_observation(
     conn: sqlite3.Connection,
     asin: str,
     site: str,
-) -> None:
-    """If this ASIN is in the product registry, mark it as not_listed."""
+) -> tuple[int, bool, bool]:
+    """Record a Keepa "no data" observation for a registered ASIN.
+
+    Returns ``(new_strike_count, flipped_to_not_listed,
+    was_active_on_entry)``. Unregistered ASINs are a silent no-op —
+    we only gate rows the user has added to the product registry;
+    they return ``(0, False, False)``.
+
+    The flip to ``not_listed`` only fires when the row is currently
+    ``active`` *and* strikes have reached
+    :data:`amz_scout.db.NOT_LISTED_STRIKE_THRESHOLD`; already-``not_listed``
+    rows still increment their counter but don't rewrite ``notes``.
+    ``was_active_on_entry`` lets callers pick user-facing copy so an
+    already-``not_listed`` row gets an observational-log message
+    instead of the misleading "strike N/THRESHOLD" progression text
+    whose threshold has already been crossed.
+    """
     try:
-        from amz_scout.db import update_asin_status
+        from amz_scout.db import (
+            NOT_LISTED_STRIKE_THRESHOLD,
+            increment_not_listed_strikes,
+            update_asin_status,
+        )
 
         row = conn.execute(
-            "SELECT product_id FROM product_asins WHERE asin = ? AND marketplace = ?",
+            "SELECT product_id, status FROM product_asins "
+            "WHERE asin = ? AND marketplace = ?",
             (asin, site),
         ).fetchone()
-        if row:
+        if not row:
+            return (0, False, False)
+        was_active = row["status"] == "active"
+        strikes = increment_not_listed_strikes(conn, row["product_id"], site)
+        if was_active and strikes >= NOT_LISTED_STRIKE_THRESHOLD:
             update_asin_status(
                 conn,
                 row["product_id"],
                 site,
                 "not_listed",
-                notes="Keepa returned no title or price data",
+                notes=(
+                    f"Keepa returned empty data {strikes}x in a row "
+                    "(transient-failure guard threshold reached)"
+                ),
             )
+            return (strikes, True, was_active)
+        return (strikes, False, was_active)
     except Exception:
-        logger.exception("Failed to mark ASIN %s/%s as not_listed", asin, site)
+        logger.exception(
+            "Failed to record empty observation for ASIN %s/%s", asin, site
+        )
+        return (0, False, False)
+
+
+def _record_successful_observation(
+    conn: sqlite3.Connection,
+    asin: str,
+    site: str,
+) -> None:
+    """Reset the strike counter after a Keepa fetch returned data."""
+    try:
+        from amz_scout.db import clear_not_listed_strikes
+
+        row = conn.execute(
+            "SELECT product_id FROM product_asins "
+            "WHERE asin = ? AND marketplace = ?",
+            (asin, site),
+        ).fetchone()
+        if row:
+            clear_not_listed_strikes(conn, row["product_id"], site)
+    except Exception:
+        logger.exception(
+            "Failed to clear empty-observation strikes for %s/%s", asin, site
+        )
 
 
 def _add_dates(rows: list[dict]) -> list[dict]:
@@ -901,10 +955,14 @@ def ensure_keepa_data(
                 for o in result.outcomes
             ]
 
-            # Post-fetch validation: check for empty/invalid data
+            # Post-fetch validation: branch on transient vs genuine empty.
             warnings: list[str] = []
             fetched_outcomes = [o for o in result.outcomes if o.source == "fetched"]
             if fetched_outcomes:
+                from amz_scout.db import (
+                    NOT_LISTED_STRIKE_THRESHOLD as _STRIKE_THRESHOLD,
+                )
+
                 conds = " OR ".join(["(asin = ? AND site = ?)"] * len(fetched_outcomes))
                 title_params: list = [v for o in fetched_outcomes for v in (o.asin, o.site)]
                 title_rows = conn.execute(
@@ -914,20 +972,103 @@ def ensure_keepa_data(
                 title_map = {(r["asin"], r["site"]): r["title"] or "" for r in title_rows}
 
                 for o in fetched_outcomes:
+                    ph = o.price_history
                     title = title_map.get((o.asin, o.site), "")
-                    has_csv = o.price_history and (
-                        o.price_history.buybox_current is not None
-                        or o.price_history.new_current is not None
+                    has_csv = ph and (
+                        ph.buybox_current is not None
+                        or ph.new_current is not None
                     )
-                    if not title and not has_csv:
-                        brand = o.freshness.brand
+
+                    # Defensive: scraper.keepa always returns
+                    # ``_empty_history(..., fetch_error=...)`` for every
+                    # fetched ASIN, but ``keepa_service`` builds outcomes
+                    # via ``history_map.get(pf.asin)`` — a future scraper
+                    # refactor that drops a record would feed ``None``
+                    # here. Treat the missing record as transient (no
+                    # strike, no flip) instead of a "Keepa says ASIN is
+                    # dead" signal.
+                    if ph is None:
                         warnings.append(
                             f"{o.model} / {o.site} ({o.asin}): "
-                            "ASIN has no data — likely wrong or not listed. "
-                            f"Call discover_asin('{brand}', '{o.model}', "
-                            f"'{o.site}') to search for the correct ASIN."
+                            "Internal fetch miss (no price_history "
+                            "record); status unchanged, treating as "
+                            "transient."
                         )
-                        _try_mark_not_listed(conn, o.asin, o.site)
+                        continue
+
+                    fetch_error = ph.fetch_error
+                    if fetch_error:
+                        # Transient Keepa failure (rate_limited, network,
+                        # partial JSON, …). Do NOT touch status or strikes —
+                        # a blip must not blacklist a live ASIN.
+                        warnings.append(
+                            f"{o.model} / {o.site} ({o.asin}): "
+                            f"Transient Keepa failure ({fetch_error}); "
+                            "status unchanged, cached data (if any) "
+                            "still valid."
+                        )
+                        continue
+
+                    if not title and not has_csv:
+                        strikes, flipped, was_active = _record_empty_observation(
+                            conn, o.asin, o.site
+                        )
+                        brand = o.freshness.brand
+                        if flipped:
+                            warnings.append(
+                                f"{o.model} / {o.site} ({o.asin}): "
+                                f"Marked not_listed after {strikes} "
+                                "consecutive empty responses. "
+                                f"Run discover_asin(brand={brand!r}, "
+                                f"model={o.model!r}, marketplace={o.site!r}) "
+                                "for a valid ASIN, or "
+                                f"update_product_asin(brand={brand!r}, "
+                                f"model={o.model!r}, marketplace={o.site!r}, "
+                                f"asin={o.asin!r}, status='active') "
+                                "if re-listed."
+                            )
+                        elif was_active and strikes > 0:
+                            warnings.append(
+                                f"{o.model} / {o.site} ({o.asin}): "
+                                f"Empty Keepa response (strike {strikes}/"
+                                f"{_STRIKE_THRESHOLD}); status unchanged. "
+                                f"Will mark not_listed after "
+                                f"{_STRIKE_THRESHOLD} consecutive genuine "
+                                "empty responses."
+                            )
+                        elif strikes > 0:
+                            # Already not_listed: observational log only —
+                            # no "strike N/threshold" progression copy
+                            # whose threshold has already been crossed.
+                            warnings.append(
+                                f"{o.model} / {o.site} ({o.asin}): "
+                                "Still observed as not_listed "
+                                f"(empty observations: {strikes}). "
+                                f"Restore via update_product_asin("
+                                f"brand={brand!r}, model={o.model!r}, "
+                                f"marketplace={o.site!r}, asin={o.asin!r}, "
+                                "status='active') if re-listed. Otherwise "
+                                f"run discover_asin(brand={brand!r}, "
+                                f"model={o.model!r}, marketplace={o.site!r}) "
+                                "for the correct ASIN."
+                            )
+                        else:
+                            # Unregistered ASIN — preserve the legacy
+                            # actionable warning for operators pasting
+                            # bad ASINs directly.
+                            warnings.append(
+                                f"{o.model} / {o.site} ({o.asin}): "
+                                "ASIN has no data — likely wrong or not "
+                                f"listed. Call discover_asin("
+                                f"brand={brand!r}, model={o.model!r}, "
+                                f"marketplace={o.site!r}) to search for "
+                                "the correct ASIN."
+                            )
+                        continue
+
+                    # Fetch returned data — reset any in-flight strike
+                    # streak so one healthy response fully clears history.
+                    _record_successful_observation(conn, o.asin, o.site)
 
     except ValueError as e:
         logger.warning("ensure_keepa_data: %s", e)

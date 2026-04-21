@@ -103,7 +103,13 @@ SERIES_NAMES = {
     100: "MONTHLY_SOLD",
 }
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
+
+# Consecutive-empty counter threshold before flipping product_asins.status
+# to 'not_listed'. A single transient Keepa failure (rate_limited, network
+# blip, partial JSON) must not blacklist a live ASIN, so genuine "Keepa
+# knows nothing" observations are required in a row before the flip.
+NOT_LISTED_STRIKE_THRESHOLD = 3
 
 # ─── Connection management ────────────────────────────────────────────
 
@@ -463,6 +469,35 @@ def _migrate(conn: sqlite3.Connection) -> None:
         # failure and silently skip the v7 migration forever.
         if not v7_applied:
             _migrate_to_v7(conn)
+
+        # v9 must run AFTER v7 commits, in its own ``with conn:`` so the
+        # INSERT into schema_migrations is committed before init_schema
+        # returns. Without the wrap, Python sqlite3 would leave an
+        # implicit transaction open and ``conn.close()`` callers (e.g.
+        # ``get_connection``) would silently roll it back. ALTER TABLE
+        # (DDL) auto-commits in SQLite regardless, but the
+        # schema_migrations row needs the wrap. (PR #20 review feedback.)
+        if current < 9:
+            with conn:
+                # v9: transient-failure guard — add a consecutive-empty
+                # counter so a single Keepa blip can't permanently
+                # blacklist a live ASIN (issue #11).
+                cols = [
+                    r["name"]
+                    for r in conn.execute("PRAGMA table_info(product_asins)")
+                ]
+                if "not_listed_strikes" not in cols:
+                    conn.execute(
+                        "ALTER TABLE product_asins "
+                        "ADD COLUMN not_listed_strikes "
+                        "INTEGER NOT NULL DEFAULT 0"
+                    )
+                conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations "
+                    "(version, description) VALUES "
+                    "(9, 'add not_listed_strikes counter to product_asins')"
+                )
+                logger.info("Migrated schema to version 9")
     except Exception:
         logger.exception(
             "Schema migration failed at version %d. Database may need manual repair.",
@@ -623,6 +658,8 @@ INSERT INTO schema_migrations (version, description)
     VALUES (7, 'normalize brand/model matching via brand_key/model_key');
 INSERT INTO schema_migrations (version, description)
     VALUES (8, 'canonicalize ean_list/upc_list to GTIN-13');
+INSERT INTO schema_migrations (version, description)
+    VALUES (9, 'add not_listed_strikes counter to product_asins');
 
 CREATE TABLE competitive_snapshots (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -792,6 +829,9 @@ CREATE TABLE product_asins (
                     CHECK(status IN ('active', 'not_listed')),
     notes           TEXT NOT NULL DEFAULT '',
     last_checked    TEXT,
+    -- Consecutive-empty counter (transient-failure guard; since v8).
+    -- Flip to not_listed only at NOT_LISTED_STRIKE_THRESHOLD.
+    not_listed_strikes INTEGER NOT NULL DEFAULT 0,
     created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
     updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
     PRIMARY KEY (product_id, marketplace)
@@ -1963,6 +2003,56 @@ def update_asin_status(
             "updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') "
             "WHERE product_id = ? AND marketplace = ?",
             (status, notes, product_id, marketplace),
+        )
+
+
+def increment_not_listed_strikes(
+    conn: sqlite3.Connection,
+    product_id: int,
+    marketplace: str,
+) -> int:
+    """Increment the consecutive-empty strike counter. Returns the new value.
+
+    Does NOT flip ``status``. Callers that cross
+    :data:`NOT_LISTED_STRIKE_THRESHOLD` should follow up with
+    :func:`update_asin_status` so ``last_checked`` bookkeeping stays
+    consistent with other status transitions.
+    """
+    with conn:
+        conn.execute(
+            "UPDATE product_asins SET "
+            "not_listed_strikes = not_listed_strikes + 1, "
+            "updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') "
+            "WHERE product_id = ? AND marketplace = ?",
+            (product_id, marketplace),
+        )
+        row = conn.execute(
+            "SELECT not_listed_strikes FROM product_asins "
+            "WHERE product_id = ? AND marketplace = ?",
+            (product_id, marketplace),
+        ).fetchone()
+    return int(row["not_listed_strikes"]) if row else 0
+
+
+def clear_not_listed_strikes(
+    conn: sqlite3.Connection,
+    product_id: int,
+    marketplace: str,
+) -> None:
+    """Reset the consecutive-empty strike counter to 0.
+
+    Called on any fetch that returns a non-empty title or csv. The
+    ``not_listed_strikes != 0`` guard avoids ``updated_at`` churn on
+    the hot "still 0" path.
+    """
+    with conn:
+        conn.execute(
+            "UPDATE product_asins SET "
+            "not_listed_strikes = 0, "
+            "updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') "
+            "WHERE product_id = ? AND marketplace = ? "
+            "AND not_listed_strikes != 0",
+            (product_id, marketplace),
         )
 
 

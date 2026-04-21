@@ -62,11 +62,11 @@ class TestSchema:
     def test_init_schema_idempotent(self, conn):
         init_schema(conn)  # Second call should not raise
         row = conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()
-        assert row[0] == 8  # v1..v8
+        assert row[0] == 9  # v1..v9 inclusive
 
     def test_schema_version(self, conn):
         row = conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()
-        assert row[0] == 8
+        assert row[0] == 9
 
 
 # ─── Keepa write tests ──────────────────────────────────────────────
@@ -427,10 +427,13 @@ class TestStatusMigrationV6:
         c0 = sqlite3.connect(str(db_path))
         c0.row_factory = sqlite3.Row
         init_schema(c0)
-        # Drop v6, v7, *and* v8 records so MAX(version)=5 and the v6
-        # migration path actually runs on reopen. (v7/v8 records are
-        # seeded by _SCHEMA_SQL even for a "fresh v5 downgrade".)
-        c0.execute("DELETE FROM schema_migrations WHERE version IN (6, 7, 8)")
+        # Drop v6+ records so MAX(version)=5 and the v6 migration path
+        # actually runs on reopen. (Every version record is seeded by
+        # _SCHEMA_SQL even for a "fresh v5 downgrade" — so later
+        # migrations like v7/v8/v9 must be dropped too, otherwise
+        # _migrate short-circuits on its `current >= SCHEMA_VERSION`
+        # check.)
+        c0.execute("DELETE FROM schema_migrations WHERE version >= 6")
         c0.execute("ALTER TABLE product_asins RENAME TO _pa_tmp")
         c0.execute("""
             CREATE TABLE product_asins (
@@ -452,7 +455,17 @@ class TestStatusMigrationV6:
                 PRIMARY KEY (product_id, marketplace)
             )
         """)
-        c0.execute("INSERT INTO product_asins SELECT * FROM _pa_tmp")
+        # List columns explicitly so future schema additions (like v8's
+        # not_listed_strikes) don't break this "force to v5 shape"
+        # scaffolding — _pa_tmp carries the live baseline's extra
+        # columns and `SELECT *` would produce a column-count mismatch.
+        c0.execute(
+            "INSERT INTO product_asins "
+            "(product_id, marketplace, asin, status, notes, "
+            " last_checked, created_at, updated_at) "
+            "SELECT product_id, marketplace, asin, status, notes, "
+            "       last_checked, created_at, updated_at FROM _pa_tmp"
+        )
         c0.execute("DROP TABLE _pa_tmp")
         c0.execute("DROP INDEX IF EXISTS idx_pa_asin")
         c0.commit()
@@ -500,13 +513,13 @@ class TestStatusMigrationV6:
         ).fetchone()
         assert idx is not None, "v6 migration must recreate idx_pa_asin"
 
-        # Migration records inserted. Reopen runs v6, v7, and v8 since
-        # all three records were cleared in Step 1, so MAX(version)
-        # advances to 8.
+        # Migration records inserted. Reopen runs v6, v7, v8 and v9
+        # since all four records were cleared in Step 1, so MAX(version)
+        # advances to the current SCHEMA_VERSION.
         ver = c2.execute(
             "SELECT MAX(version) AS v FROM schema_migrations"
         ).fetchone()
-        assert ver["v"] == 8
+        assert ver["v"] == 9
 
         # Tightened CHECK is in force: legacy values now rejected.
         with pytest.raises(sqlite3.IntegrityError):
@@ -610,7 +623,7 @@ class TestBrandModelKeyMigrationV7:
         init_schema(c0)
 
         c0.execute("PRAGMA foreign_keys = OFF")
-        c0.execute("DELETE FROM schema_migrations WHERE version IN (7, 8)")
+        c0.execute("DELETE FROM schema_migrations WHERE version >= 7")
         c0.execute("DROP TABLE products")
         c0.execute("""
             CREATE TABLE products (
@@ -726,7 +739,7 @@ class TestBrandModelKeyMigrationV7:
         ver = c2.execute(
             "SELECT MAX(version) AS v FROM schema_migrations"
         ).fetchone()["v"]
-        assert ver == 8
+        assert ver == 9
 
         with pytest.raises(sqlite3.IntegrityError):
             c2.execute(
@@ -754,7 +767,7 @@ class TestBrandModelKeyMigrationV7:
         init_schema(c0)
 
         c0.execute("PRAGMA foreign_keys = OFF")
-        c0.execute("DELETE FROM schema_migrations WHERE version IN (7, 8)")
+        c0.execute("DELETE FROM schema_migrations WHERE version >= 7")
         c0.execute("DROP TABLE products")
         c0.execute("""
             CREATE TABLE products (
@@ -1181,7 +1194,10 @@ class TestGtinBackfillMigrationV8:
         c0 = sqlite3.connect(str(db_path))
         c0.row_factory = sqlite3.Row
         init_schema(c0)
-        c0.execute("DELETE FROM schema_migrations WHERE version = 8")
+        # Drop v8+ records so MAX(version)=7 and the v8 backfill actually
+        # reruns on reopen. (Just deleting v8 leaves MAX=9 from the v9
+        # not_listed_strikes record, which short-circuits _migrate.)
+        c0.execute("DELETE FROM schema_migrations WHERE version >= 8")
         c0.execute(
             "INSERT INTO keepa_products "
             "(asin, site, brand, ean_list, upc_list, "
@@ -1219,7 +1235,7 @@ class TestGtinBackfillMigrationV8:
                     "SELECT MAX(version) AS v FROM schema_migrations"
                 ).fetchone()["v"]
 
-        assert version == 8
+        assert version == 9
         assert json.loads(us["upc_list"]) == ["0850018166010"]
         assert us["ean_list"] is None
         assert json.loads(eu["ean_list"]) == ["0850018166010"]
@@ -1251,7 +1267,10 @@ class TestGtinBackfillMigrationV8:
         c0 = sqlite3.connect(str(db_path))
         c0.row_factory = sqlite3.Row
         init_schema(c0)
-        c0.execute("DELETE FROM schema_migrations WHERE version = 8")
+        # Drop v8+ records so MAX(version)=7 and the v8 backfill actually
+        # reruns on reopen. (Just deleting v8 leaves MAX=9 from the v9
+        # not_listed_strikes record, which short-circuits _migrate.)
+        c0.execute("DELETE FROM schema_migrations WHERE version >= 8")
         c0.execute(
             "INSERT INTO keepa_products "
             "(asin, site, brand, ean_list, upc_list, "
@@ -1327,12 +1346,12 @@ class TestV7RetryAfterV8Commit:
         c0.execute("PRAGMA foreign_keys = ON")
         c0.commit()
 
-        # Sanity: without the fix, current = MAX(version) = 8 would
+        # Sanity: without the fix, current = MAX(version) >= 8 would
         # bypass v7 on reopen.
         max_ver = c0.execute(
             "SELECT MAX(version) AS v FROM schema_migrations"
         ).fetchone()["v"]
-        assert max_ver == 8
+        assert max_ver == 9
         c0.close()
 
         db_mod._schema_initialized.discard(str(db_path))
@@ -1467,3 +1486,157 @@ class TestRegisterProductConcurrency:
         assert (row["brand"], row["model"]) in variants
         assert row["brand_key"] == "tp-link"
         assert row["model_key"] == "archer be400"
+
+
+# ─── Migration ordering: v8 must wait for v7 (Copilot PR #20) ────────
+
+
+class TestMigrationOrderingV9AfterV7:
+    """Regression guard for the schema_migrations stranding bug.
+
+    If v9 is recorded *before* v7 commits, a v7 failure leaves the DB
+    at MAX(version)=9 with v7 un-applied. The next ``init_schema()``
+    short-circuits on ``current >= SCHEMA_VERSION`` and never retries
+    v7 — silent permanent corruption. (Note: main has its own v8 ↔ v7
+    safety via the ``v7_applied`` flag in ``_migrate``; v9 sits after
+    v7 in the migration sequence and is gated by ``current < 9``.)
+    """
+
+    def test_v7_failure_does_not_strand_v9_record(self, tmp_path, monkeypatch):
+        from amz_scout import db as db_mod
+
+        db_path = tmp_path / "ordering.db"
+        c0 = sqlite3.connect(str(db_path))
+        c0.row_factory = sqlite3.Row
+        init_schema(c0)
+        # Force schema_migrations back to MAX(version)=6 so the v7 + v8
+        # paths both rerun on next open. (Underlying tables are already
+        # at v8 shape — that's fine; v8's ALTER is column-existence
+        # guarded and v7 is monkey-patched out.)
+        c0.execute("DELETE FROM schema_migrations WHERE version >= 7")
+        c0.commit()
+        c0.close()
+        # init_schema caches db_paths it has fully migrated and short-
+        # circuits on cache hit. Clear that one entry so the next open
+        # actually re-runs _migrate (where the patched v7 lives).
+        db_mod._schema_initialized.discard(str(db_path))
+
+        def fake_migrate_v7(_conn):
+            raise RuntimeError("simulated v7 failure")
+
+        monkeypatch.setattr(db_mod, "_migrate_to_v7", fake_migrate_v7)
+
+        c1 = sqlite3.connect(str(db_path))
+        c1.row_factory = sqlite3.Row
+        with pytest.raises(RuntimeError, match="simulated v7"):
+            init_schema(c1)
+
+        versions = {
+            r["version"]
+            for r in c1.execute("SELECT version FROM schema_migrations")
+        }
+        assert 7 not in versions, "v7 record must not appear after raise"
+        assert 9 not in versions, (
+            "v9 record must not appear if v7 hasn't completed — "
+            "v9 runs after v7 and must not be stranded by a v7 failure. "
+            "(v8 is in the main txn and may already be present — that "
+            "is main's existing GTIN migration, unrelated to v7 ordering.)"
+        )
+        c1.close()
+
+    def test_v7_recovery_after_failure_completes_to_v9(
+        self, tmp_path, monkeypatch
+    ):
+        """After a v7 failure, removing the patch must let init_schema
+        complete v7 AND v9 cleanly on the next call.
+        """
+        from amz_scout import db as db_mod
+
+        db_path = tmp_path / "recovery.db"
+        c0 = sqlite3.connect(str(db_path))
+        c0.row_factory = sqlite3.Row
+        init_schema(c0)
+        c0.execute("DELETE FROM schema_migrations WHERE version >= 7")
+        c0.commit()
+        c0.close()
+        db_mod._schema_initialized.discard(str(db_path))
+
+        original_v7 = db_mod._migrate_to_v7
+
+        def fake_migrate_v7(_conn):
+            raise RuntimeError("simulated v7 failure")
+
+        monkeypatch.setattr(db_mod, "_migrate_to_v7", fake_migrate_v7)
+
+        c1 = sqlite3.connect(str(db_path))
+        c1.row_factory = sqlite3.Row
+        with pytest.raises(RuntimeError):
+            init_schema(c1)
+        c1.close()
+
+        # init_schema doesn't add to the cache when _migrate raises (the
+        # ``_schema_initialized.add(...)`` is unreachable past the
+        # exception), so we don't strictly need a discard before c2 — but
+        # clear it anyway in case future refactors flip the order.
+        db_mod._schema_initialized.discard(str(db_path))
+
+        # Restore real v7 and reopen — both v7 and v8 should now apply.
+        monkeypatch.setattr(db_mod, "_migrate_to_v7", original_v7)
+        c2 = sqlite3.connect(str(db_path))
+        c2.row_factory = sqlite3.Row
+        init_schema(c2)
+        max_v = c2.execute(
+            "SELECT MAX(version) AS v FROM schema_migrations"
+        ).fetchone()["v"]
+        assert max_v == 9
+        c2.close()
+
+    def test_v9_persisted_across_connection_close(self, tmp_path):
+        """Copilot follow-up review on PR #20: the v8 block runs outside
+        any ``with conn:`` block, so its INSERT into ``schema_migrations``
+        is in an open implicit transaction when ``init_schema`` returns.
+        If the caller (e.g. ``get_connection``) closes the connection
+        without ``commit()``, Python sqlite3 rolls back the open tx and
+        the v8 record is silently lost — even though ``ALTER TABLE`` (a
+        DDL) was already auto-committed by SQLite. The next reopen would
+        then see ``MAX(version)=7`` with the column already present, and
+        re-run the v8 block on every open. v8 must commit on its own.
+        """
+        from amz_scout import db as db_mod
+
+        db_path = tmp_path / "persist.db"
+        c0 = sqlite3.connect(str(db_path))
+        c0.row_factory = sqlite3.Row
+        init_schema(c0)
+        # Force back to v6 so v7 + v8 both rerun on reopen.
+        c0.execute("DELETE FROM schema_migrations WHERE version >= 7")
+        c0.commit()
+        c0.close()
+        db_mod._schema_initialized.discard(str(db_path))
+
+        # Reopen and run init_schema, then close WITHOUT explicit commit
+        # — exactly what ``get_connection`` does in production.
+        c1 = sqlite3.connect(str(db_path))
+        c1.row_factory = sqlite3.Row
+        init_schema(c1)
+        c1.close()  # No commit() — caller pattern.
+
+        c2 = sqlite3.connect(str(db_path))
+        c2.row_factory = sqlite3.Row
+        versions = {
+            r[0] for r in c2.execute("SELECT version FROM schema_migrations")
+        }
+        cols = [
+            r[1] for r in c2.execute("PRAGMA table_info(product_asins)")
+        ]
+        assert 7 in versions, "v7 record must survive close without commit"
+        assert 9 in versions, (
+            "v9 record must survive close without commit. v9 INSERT runs "
+            "outside the main txn and gets rolled back on close unless "
+            "wrapped in its own ``with conn:`` — that wrap is the fix."
+        )
+        assert "not_listed_strikes" in cols, (
+            "ALTER TABLE (DDL) auto-commits in SQLite, so the column "
+            "should always survive — but assert it anyway as a sanity check."
+        )
+        c2.close()
