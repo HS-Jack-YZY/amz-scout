@@ -158,9 +158,10 @@ async def run_chat_turn(history: list[dict]) -> tuple[str, list[dict]]:
         if resp.stop_reason != "tool_use":
             # Final response — extract text and return
             final_text = "".join(block.text for block in resp.content if block.type == "text")
-            # DIAG: log block shape + text length so we can tell whether an
-            # "empty UI message" is caused by LLM returning zero text blocks
-            # (e.g. after web_search) vs a downstream send() issue.
+            # Log the response shape so an "empty UI message" downstream can
+            # be triaged at a glance: zero text blocks (LLM genuinely returned
+            # no prose, e.g. after server-tool only) vs non-zero text_len
+            # (problem is in the send/render path, not in generation).
             logger.info(
                 "Chat turn complete (iter=%d stop=%s blocks=%s text_len=%d)",
                 i + 1,
