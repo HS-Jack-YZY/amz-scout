@@ -45,27 +45,27 @@ def _strip_cache_control_from_prior_tool_results(history: list[dict]) -> None:
 def _log_server_tool_errors(resp_content: list) -> None:
     """Surface ``web_search_tool_result`` error payloads to operator logs.
 
-    Anthropic's server-side web_search returns structured error blocks
-    (``error_code`` ∈ {``max_uses_exceeded``, ``too_many_requests``,
-    ``unavailable``, ``invalid_input``}) alongside normal content. The
-    tool-use loop forwards these to the model verbatim so it can recover,
-    but without this scan the operator sees only ``pause_turn received``
-    in logs and has no signal that web_search itself is failing.
+    Anthropic's server-side web_search returns a ``WebSearchToolResultError``
+    block (``content.type == "web_search_tool_result_error"``) with an
+    ``error_code`` ∈ {``max_uses_exceeded``, ``too_many_requests``,
+    ``unavailable``, ``invalid_input``} when the tool fails. The tool-use
+    loop forwards these to the model so it can recover, but without this
+    scan the operator sees only ``pause_turn received`` in logs and has
+    no signal that web_search itself is failing.
+
+    ``resp.content`` holds SDK Pydantic objects at the point this runs
+    (``model_dump`` happens later when building history), so we must use
+    attribute access — ``isinstance(content, dict)`` would never match.
     """
     for block in resp_content:
         if getattr(block, "type", None) != "web_search_tool_result":
             continue
         content = getattr(block, "content", None)
         tool_use_id = getattr(block, "tool_use_id", None)
-        if isinstance(content, dict) and content.get("type") == "web_search_tool_result_error":
+        if getattr(content, "type", None) == "web_search_tool_result_error":
             logger.error(
                 "web_search error: code=%s (tool_use_id=%s)",
-                content.get("error_code"),
-                tool_use_id,
-            )
-        elif getattr(block, "is_error", False):
-            logger.error(
-                "web_search returned is_error=True (tool_use_id=%s)",
+                getattr(content, "error_code", "<missing>"),
                 tool_use_id,
             )
 

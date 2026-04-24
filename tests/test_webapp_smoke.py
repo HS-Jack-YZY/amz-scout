@@ -1258,6 +1258,93 @@ class TestPauseTurnHandling:
         )
         assert user_msgs[0]["content"] == "find slate 7 in DE"
 
+    def test_web_search_error_block_is_logged(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """``web_search_tool_result`` error blocks must surface to logs.
+
+        Anthropic returns error payloads as Pydantic objects (not dicts) at
+        the point ``_log_server_tool_errors`` runs — ``model_dump`` happens
+        later when building history. An earlier implementation used
+        ``isinstance(content, dict)`` which silently never matched, turning
+        the entire log path into dead code. This test pins the real-world
+        Pydantic shape so that regression cannot reoccur without failing.
+        """
+        _set_fake_env(monkeypatch)
+        _reset_webapp_modules()
+        from webapp import llm as webapp_llm
+
+        class _Block:
+            def __init__(self, **kw):
+                self.__dict__.update(kw)
+
+            def model_dump(self) -> dict:
+                # The error content is a Pydantic-like object in reality; the
+                # dump shape here just needs to be something json-serializable
+                # for the assistant-turn history append later in run_chat_turn.
+                out = dict(self.__dict__)
+                content = out.get("content")
+                if content is not None and hasattr(content, "__dict__"):
+                    out["content"] = dict(content.__dict__)
+                return out
+
+        class _Usage:
+            def model_dump(self) -> dict:
+                return {}
+
+        class _Resp:
+            def __init__(self, content: list, stop_reason: str):
+                self.content = content
+                self.stop_reason = stop_reason
+                self.usage = _Usage()
+
+        # Mirror the real WebSearchToolResultBlock / WebSearchToolResultError
+        # shape: a block with type="web_search_tool_result" whose `.content`
+        # is a Pydantic-like object (NOT a dict) with attribute-accessible
+        # `.type` and `.error_code`.
+        error_content = _Block(
+            type="web_search_tool_result_error",
+            error_code="max_uses_exceeded",
+        )
+        error_block = _Block(
+            type="web_search_tool_result",
+            tool_use_id="srv_err_42",
+            content=error_content,
+        )
+        final_text_block = _Block(type="text", text="done")
+
+        responses = iter(
+            [
+                _Resp([error_block, final_text_block], "end_turn"),
+            ]
+        )
+        monkeypatch.setattr(
+            webapp_llm._client.messages, "create", lambda **_k: next(responses)
+        )
+
+        async def _fake_dispatch(_name: str, _args: dict) -> dict:
+            return {"ok": True, "data": [], "error": None, "meta": {}}
+
+        monkeypatch.setattr(webapp_llm, "dispatch_tool", _fake_dispatch)
+
+        with caplog.at_level("ERROR", logger=webapp_llm.logger.name):
+            asyncio.run(
+                webapp_llm.run_chat_turn([{"role": "user", "content": "go"}])
+            )
+
+        errors = [r for r in caplog.records if "web_search error" in r.getMessage()]
+        assert errors, (
+            "Expected an ERROR log for web_search_tool_result_error. If this "
+            "fails, _log_server_tool_errors has regressed to dead-code (e.g. "
+            "checking isinstance(content, dict) against a Pydantic object)."
+        )
+        assert "max_uses_exceeded" in errors[0].getMessage(), (
+            "Log must include error_code for operator triage"
+        )
+        assert "srv_err_42" in errors[0].getMessage(), (
+            "Log must include tool_use_id to correlate with request traces"
+        )
+
 
 @pytest.mark.unit
 class TestBlockCountMonitor:
