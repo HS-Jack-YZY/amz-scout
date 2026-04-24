@@ -65,6 +65,13 @@ async def on_message(msg: cl.Message) -> None:
         final_text, updated_history = await run_chat_turn(history)
         cl.user_session.set("history", updated_history)
         success = True
+        # DIAG: log what we're about to send so we can distinguish
+        # "LLM returned empty" from "cl.Message.send() dropped the content"
+        logger.info(
+            "on_message → cl.Message.send (len=%d, preview=%r)",
+            len(final_text or ""),
+            (final_text or "")[:300],
+        )
     except Exception:
         # Keep stack + exception detail in server logs only — never echo the
         # raw exception to authenticated users since it can leak file paths,
