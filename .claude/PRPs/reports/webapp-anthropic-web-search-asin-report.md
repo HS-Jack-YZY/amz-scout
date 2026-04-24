@@ -1,6 +1,6 @@
 # Implementation Report: Webapp Anthropic Web Search ASIN Discovery
 
-**Plan**: `.claude/PRPs/plans/webapp-anthropic-web-search-asin.plan.md`
+**Plan**: `.claude/PRPs/plans/completed/webapp-anthropic-web-search-asin.plan.md`
 **Branch**: `feat/webapp-anthropic-web-search-asin`
 **Implemented**: 2026-04-24
 
@@ -55,7 +55,7 @@ rather than as a new module — same scope, fewer files.
 
 | File | Action | Notes |
 |---|---|---|
-| `src/amz_scout/api.py` | UPDATED | Added `_DP_ASIN_RE` const + `register_asin_from_url()` function (~106 lines) |
+| `src/amz_scout/api.py` | UPDATED | Added `_ASIN_URL_RE` const + `register_asin_from_url()` function (~106 lines) |
 | `webapp/tools.py` | UPDATED | New `_AMAZON_DOMAINS` const, web_search server-side schema, register_asin_from_url client schema + step wrapper + dispatcher branch; cache_control migration |
 | `webapp/llm.py` | UPDATED | `pause_turn` continue branch + total_blocks > 15 warning |
 | `webapp/config.py` | UPDATED | SYSTEM_PROMPT extended with ASIN Discovery Flow |

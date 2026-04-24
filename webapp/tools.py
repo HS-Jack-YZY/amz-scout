@@ -315,12 +315,14 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "name": "register_asin_from_url",
         "description": (
             "Register a product's ASIN into the registry by parsing an Amazon "
-            "product URL (of form '.../dp/<ASIN>/...'). Use after web_search "
-            "returns an Amazon search result URL. Creates the product if the "
-            "(brand, model) pair is new; otherwise appends the marketplace "
-            "mapping. Validates that the URL host matches the target marketplace "
-            "(e.g. amazon.de for DE) — rejects mismatches to prevent wrong-market "
-            "writes. Does NOT consume Keepa tokens."
+            "product URL. Accepts both '.../dp/<ASIN>/...' and the older "
+            "'.../gp/product/<ASIN>/...' forms (both still surfaced by "
+            "web_search). Use after web_search returns an Amazon product "
+            "URL. Creates the product if the (brand, model) pair is new; "
+            "otherwise appends the marketplace mapping. Validates that the "
+            "URL host matches the target marketplace (e.g. amazon.de for "
+            "DE) — rejects mismatches to prevent wrong-market writes. "
+            "Does NOT consume Keepa tokens."
         ),
         "input_schema": {
             "type": "object",
@@ -340,7 +342,8 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "amazon_url": {
                     "type": "string",
                     "description": (
-                        "Full Amazon product page URL containing '/dp/<10-char-ASIN>'. "
+                        "Full Amazon product page URL containing "
+                        "'/dp/<10-char-ASIN>' OR '/gp/product/<10-char-ASIN>'. "
                         "Obtained from web_search results."
                     ),
                 },
