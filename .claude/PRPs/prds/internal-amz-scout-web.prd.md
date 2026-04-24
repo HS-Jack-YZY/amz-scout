@@ -283,7 +283,7 @@ The other 4 colleagues (PMs + market analysts). Their specific use cases are for
 - **Scope**: `ensure_keepa_data`, `batch_discover`, `discover_asin`, `sync_registry` with `cl.Step` + confirmation dialogs
 - **Success signal**: Triggering `ensure_keepa_data(fresh)` for 10 products shows step-by-step progress; `batch_discover` for 3 candidates shows per-candidate status
 - **Hard constraint**: `headed=True` is hard-wired OFF in the web layer — not exposed as a user toggle
-- **Sub-scope delivered (2026-04-24)**: Anthropic server-side `web_search_20260209` + client tool `register_asin_from_url` provide a non-browser ASIN-discovery path for webapp users without a Claude Code client. Lives alongside (not replacing) the still-pending browser-based `discover_asin` wrap. See [webapp-anthropic-web-search-asin.plan.md](../plans/webapp-anthropic-web-search-asin.plan.md).
+- **Sub-scope delivered (2026-04-24)**: Anthropic server-side `web_search_20260209` + client tool `register_asin_from_url` provide a non-browser ASIN-discovery path for webapp users without a Claude Code client. Lives alongside (not replacing) the still-pending browser-based `discover_asin` wrap. See [webapp-anthropic-web-search-asin.plan.md](../plans/completed/webapp-anthropic-web-search-asin.plan.md).
 
 **Phase 5: Excel export** (~W2 D4, 3h) — **PARTIAL (底层管道已交付，2026-04-20)**
 - **Goal**: 小李's workflow terminator — queries return downloadable artifacts

@@ -151,11 +151,20 @@ async def run_chat_turn(history: list[dict]) -> tuple[str, list[dict]]:
         # at a time keeps us under Anthropic's 4-block-per-request limit.
         _strip_cache_control_from_prior_tool_results(history)
 
+        if tool_results:
+            tool_results[-1]["cache_control"] = {"type": "ephemeral"}
+        # IMPORTANT: all tool results in ONE user message (for parallel tool safety)
+        history.append({"role": "user", "content": tool_results})
+
         # Per-turn block-growth guard. Empirical signal — a single turn that
         # chains web_search → register_asin_from_url → re-query can produce
         # many blocks, and cache hits have been observed to degrade once a
-        # turn grows past ~15 new blocks. Compare against resp.usage's
-        # ``cache_read_input_tokens`` to confirm when this fires.
+        # turn grows past ~15 new blocks. Count AFTER appending tool_results
+        # so the metric reflects what the NEXT request will carry; counting
+        # before the append under-reports by this iteration's tool_result
+        # message and would silently miss turns that are genuinely at risk.
+        # Compare against resp.usage's ``cache_read_input_tokens`` to
+        # confirm when this fires.
         turn_blocks = _count_blocks(history) - base_blocks
         if turn_blocks > 15:
             logger.warning(
@@ -163,11 +172,6 @@ async def run_chat_turn(history: list[dict]) -> tuple[str, list[dict]]:
                 "rounds may cause prompt-cache miss next turn (check resp.usage)",
                 turn_blocks,
             )
-
-        if tool_results:
-            tool_results[-1]["cache_control"] = {"type": "ephemeral"}
-        # IMPORTANT: all tool results in ONE user message (for parallel tool safety)
-        history.append({"role": "user", "content": tool_results})
 
     logger.warning("Hit max_iterations=%d in run_chat_turn", max_iterations)
     return (
