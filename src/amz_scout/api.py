@@ -14,6 +14,7 @@ import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, NamedTuple, TypedDict
+from urllib.parse import urlparse
 
 from amz_scout.config import (
     MarketplaceConfig,
@@ -1654,5 +1655,122 @@ def discover_asin(
             "marketplace": site,
             "asin": found_asin,
             "status": "active",
+        },
+    )
+
+
+# ASIN pattern inside an Amazon `/dp/` path segment. Case-strict uppercase;
+# the alternatives tolerate trailing slash, query string, fragment, or
+# end-of-string (real Amazon URLs often end at `#customerReviews`).
+_DP_ASIN_RE = re.compile(r"/dp/([A-Z0-9]{10})(?:[/?#]|$)")
+
+
+def register_asin_from_url(
+    brand: str,
+    model: str,
+    marketplace: str,
+    amazon_url: str,
+    db_path: Path | str | None = None,
+) -> ApiResponse:
+    """Register an ASIN by parsing an Amazon product page URL.
+
+    Non-browser sibling of :func:`discover_asin`. Extracts the ASIN from a
+    ``.../dp/<10-char>/...`` URL, verifies that the URL host matches the
+    target marketplace's ``amazon_domain`` (guards against writing a ``.com``
+    URL to a UK registration), and then mirrors ``discover_asin``'s tail
+    dual-branch write: existing ``(brand, model)`` → append marketplace
+    mapping; new product → register + map. Notes are tagged
+    ``discovered via web_search`` so the source can be audited later.
+
+    Does NOT consume Keepa tokens. Does NOT launch a browser.
+
+    Atomicity caveat (shared with :func:`discover_asin`): the ``products``
+    row insert and the ``product_asins`` mapping insert are two separate
+    commits (each helper has its own ``with conn:``). If the second step
+    fails (e.g. disk I/O), an orphan product row can remain. This is
+    self-healing — the next call for the same ``(brand, model)`` takes
+    the ``existing`` branch and fills in the missing ASIN mapping.
+    """
+    try:
+        match = _DP_ASIN_RE.search(amazon_url)
+        if not match:
+            return _envelope(
+                False,
+                error="No ASIN found in URL (expected /dp/<10-char>)",
+            )
+        asin = match.group(1)
+
+        # urlparse treats bare "amazon.de/..." as a path, not a URL — prepend
+        # scheme so `.netloc` is populated for the host check below.
+        url_for_parse = amazon_url
+        if not url_for_parse.startswith(("http://", "https://")):
+            url_for_parse = "https://" + url_for_parse
+
+        mp_path = CONFIG_DIR / "marketplaces.yaml"
+        if not mp_path.exists():
+            return _envelope(False, error=f"Marketplace config not found: {mp_path}")
+        marketplaces = load_marketplace_config(mp_path)
+
+        aliases = _build_marketplace_aliases(marketplaces)
+        site = aliases.get(marketplace.lower()) or marketplace
+        mp_config = marketplaces.get(site)
+        if not mp_config:
+            return _envelope(False, error=f"Unknown marketplace: {marketplace}")
+
+        # Strict host match: accept bare domain or a real subdomain (host
+        # ends with ".{domain}"). Plain ``.endswith(domain)`` would let
+        # ``fakeamazon.co.uk`` pass when marketplace is UK — phishing
+        # lookalikes must be rejected even though Anthropic's web_search
+        # ``allowed_domains`` already filters upstream (defense in depth).
+        host = urlparse(url_for_parse).netloc.lower()
+        expected = mp_config.amazon_domain.lower()
+        if host != expected and not host.endswith("." + expected):
+            return _envelope(
+                False,
+                error=(
+                    f"URL host {host!r} does not match marketplace {site} "
+                    f"({mp_config.amazon_domain})"
+                ),
+            )
+
+        from amz_scout.db import find_product_exact, register_asin, register_product
+
+        path = _get_db(db_path)
+        with open_db(path) as conn:
+            existing = find_product_exact(conn, brand, model)
+            if existing:
+                pid = existing["id"]
+                register_asin(
+                    conn,
+                    pid,
+                    site,
+                    asin,
+                    notes="discovered via web_search",
+                )
+                is_new = False
+            else:
+                pid, _ = register_product(conn, "", brand, model, f"{brand} {model}")
+                register_asin(
+                    conn,
+                    pid,
+                    site,
+                    asin,
+                    notes="discovered via web_search",
+                )
+                is_new = True
+    except Exception as e:
+        logger.exception("register_asin_from_url failed")
+        return _envelope(False, error=str(e))
+
+    return _envelope(
+        True,
+        data={
+            "brand": brand,
+            "model": model,
+            "marketplace": site,
+            "asin": asin,
+            "product_id": pid,
+            "registered": True,
+            "new_product": is_new,
         },
     )

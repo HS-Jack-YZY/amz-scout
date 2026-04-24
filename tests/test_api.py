@@ -26,6 +26,7 @@ from amz_scout.api import (
     query_ranking,
     query_sellers,
     query_trends,
+    register_asin_from_url,
     remove_product_by_model,
     resolve_product,
     resolve_project,
@@ -1458,3 +1459,232 @@ class TestAsinStatusRecovery:
         asin, *_ = _resolve_asin([], "B0RECOV001", marketplace="UK", conn=c)
         assert asin == "B0RECOV001"
         c.close()
+
+
+@pytest.mark.unit
+class TestRegisterAsinFromUrl:
+    """URL-based ASIN registration — the non-browser counterpart of discover_asin.
+
+    Reads marketplace config from the real repo ``config/marketplaces.yaml``
+    (same behavior as ``discover_asin``); writes to the test_db fixture.
+    """
+
+    def test_happy_path_new_product(self, test_db):
+        r = register_asin_from_url(
+            "TP-Link",
+            "AX1500",
+            "DE",
+            "https://www.amazon.de/dp/B0TESTTEST",
+            db_path=test_db,
+        )
+        assert r["ok"] is True, r["error"]
+        assert r["data"]["asin"] == "B0TESTTEST"
+        assert r["data"]["marketplace"] == "DE"
+        assert r["data"]["new_product"] is True
+        # Verify DB state: registry + mapping + notes source tag.
+        conn = sqlite3.connect(str(test_db))
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT pa.asin, pa.marketplace, pa.status, pa.notes, p.brand, p.model "
+            "FROM product_asins pa JOIN products p ON p.id = pa.product_id "
+            "WHERE pa.asin = ?",
+            ("B0TESTTEST",),
+        ).fetchone()
+        conn.close()
+        assert row is not None
+        assert row["marketplace"] == "DE"
+        assert row["status"] == "active"
+        assert "web_search" in row["notes"], (
+            "notes must identify the discovery source for auditability"
+        )
+        assert row["brand"] == "TP-Link"
+        assert row["model"] == "AX1500"
+
+    def test_happy_path_existing_product(self, test_db):
+        # Seed the product with a UK mapping first.
+        r0 = add_product(
+            "Router",
+            "TP-Link",
+            "AX1500",
+            asins={"UK": "B0UKTEST01"},
+            db_path=test_db,
+        )
+        assert r0["ok"] is True
+        # Now register a DE mapping via URL — existing product, append only.
+        r = register_asin_from_url(
+            "TP-Link",
+            "AX1500",
+            "DE",
+            "https://www.amazon.de/dp/B0DETEST01",
+            db_path=test_db,
+        )
+        assert r["ok"] is True
+        assert r["data"]["new_product"] is False, (
+            "Existing (brand, model) must resolve to the same product_id, "
+            "not create a duplicate product row"
+        )
+        # Both UK and DE mappings should coexist under one product.
+        conn = sqlite3.connect(str(test_db))
+        conn.row_factory = sqlite3.Row
+        count = conn.execute(
+            "SELECT COUNT(*) AS n FROM product_asins pa "
+            "JOIN products p ON p.id = pa.product_id "
+            "WHERE p.brand_key = 'tp-link' AND p.model_key = 'ax1500'"
+        ).fetchone()["n"]
+        conn.close()
+        assert count == 2
+
+    def test_invalid_url_no_dp_segment(self, test_db):
+        r = register_asin_from_url(
+            "X",
+            "Y",
+            "DE",
+            "https://www.amazon.de/gp/product/some-other-path",
+            db_path=test_db,
+        )
+        assert r["ok"] is False
+        assert r["error"] is not None
+        assert "ASIN" in r["error"]
+
+    def test_url_host_mismatch(self, test_db):
+        """DE target with a .co.uk URL must be rejected to prevent
+        writing a UK ASIN into the DE marketplace row."""
+        r = register_asin_from_url(
+            "X",
+            "Y",
+            "DE",
+            "https://www.amazon.co.uk/dp/B0TESTTEST",
+            db_path=test_db,
+        )
+        assert r["ok"] is False
+        assert r["error"] is not None
+        assert "host" in r["error"].lower()
+
+    def test_rejects_phishing_lookalike_host(self, test_db):
+        """``fakeamazon.co.uk`` must NOT pass as amazon.co.uk.
+
+        A naive ``host.endswith("amazon.co.uk")`` returns True here, which
+        would let an attacker-controlled lookalike inject arbitrary ASIN
+        rows. Strict match requires ``host == domain`` or
+        ``host.endswith("." + domain)``.
+        """
+        cases = [
+            ("fakeamazon.co.uk", "UK"),
+            ("www.fakeamazon.co.uk", "UK"),
+            ("notamazon.com", "US"),
+            ("www.notamazon.com", "US"),
+        ]
+        for bad_host, market in cases:
+            r = register_asin_from_url(
+                "X",
+                "Y",
+                market,
+                f"https://{bad_host}/dp/B0PHISHER0",
+                db_path=test_db,
+            )
+            assert r["ok"] is False, f"phishing host {bad_host!r} bypassed check"
+            assert r["error"] is not None
+            assert "host" in r["error"].lower(), (
+                f"phishing host {bad_host!r}: error should mention host, "
+                f"got {r['error']!r}"
+            )
+
+    def test_accepts_bare_domain_without_subdomain(self, test_db):
+        """``amazon.de`` (no ``www.`` prefix) must still register — the
+        strict check must not break on the bare domain form."""
+        r = register_asin_from_url(
+            "TP-Link",
+            "AX1500-bare",
+            "DE",
+            "https://amazon.de/dp/B0BARETEST",
+            db_path=test_db,
+        )
+        assert r["ok"] is True, r["error"]
+        assert r["data"]["asin"] == "B0BARETEST"
+
+    def test_marketplace_alias(self, test_db):
+        """Marketplace aliases (lowercase code, amazon domain, uppercase)
+        all canonicalize to the same site."""
+        for alias in ("de", "DE", "amazon.de"):
+            r = register_asin_from_url(
+                "TP-Link",
+                f"AX1500-alias-{alias}",  # unique model per call to avoid UNIQUE conflict
+                alias,
+                "https://www.amazon.de/dp/B0ALIAS001",
+                db_path=test_db,
+            )
+            assert r["ok"] is True, f"alias {alias!r} failed: {r['error']}"
+            assert r["data"]["marketplace"] == "DE", (
+                f"alias {alias!r} did not canonicalize to 'DE'"
+            )
+
+    def test_url_without_scheme(self, test_db):
+        """Bare 'amazon.de/dp/...' (no https://) must still parse."""
+        r = register_asin_from_url(
+            "TP-Link",
+            "AX1500-noscheme",
+            "DE",
+            "www.amazon.de/dp/B0NOSCHEM0",
+            db_path=test_db,
+        )
+        assert r["ok"] is True, r["error"]
+        assert r["data"]["asin"] == "B0NOSCHEM0"
+        assert r["data"]["marketplace"] == "DE"
+
+    def test_international_tld_jp(self, test_db):
+        r = register_asin_from_url(
+            "Sony",
+            "WH-1000",
+            "JP",
+            "https://www.amazon.co.jp/dp/B0JPTESTJP",
+            db_path=test_db,
+        )
+        assert r["ok"] is True, r["error"]
+        assert r["data"]["marketplace"] == "JP"
+
+    def test_international_tld_br(self, test_db):
+        r = register_asin_from_url(
+            "Samsung",
+            "Galaxy-A55",
+            "BR",
+            "https://www.amazon.com.br/dp/B0BRTESTBR",
+            db_path=test_db,
+        )
+        assert r["ok"] is True, r["error"]
+        assert r["data"]["marketplace"] == "BR"
+
+    def test_international_tld_mx(self, test_db):
+        r = register_asin_from_url(
+            "Apple",
+            "iPhone-15",
+            "MX",
+            "https://www.amazon.com.mx/dp/B0MXTESTMX",
+            db_path=test_db,
+        )
+        assert r["ok"] is True, r["error"]
+        assert r["data"]["marketplace"] == "MX"
+
+    def test_tracking_query_tolerated(self, test_db):
+        """Real Amazon URLs carry ref/tracking query strings; the regex must
+        only look at /dp/<ASIN> boundaries and ignore the rest."""
+        r = register_asin_from_url(
+            "TP-Link",
+            "AX1500-tracking",
+            "DE",
+            "https://www.amazon.de/GL-iNet/dp/B0TRACKING/ref=sr_1_3?keywords=foo",
+            db_path=test_db,
+        )
+        assert r["ok"] is True
+        assert r["data"]["asin"] == "B0TRACKING"
+
+    def test_unknown_marketplace_code(self, test_db):
+        r = register_asin_from_url(
+            "X",
+            "Y",
+            "ZZ",  # not a known market
+            "https://www.amazon.com/dp/B0ZZZZZZZZ",
+            db_path=test_db,
+        )
+        assert r["ok"] is False
+        assert r["error"] is not None
+        assert "marketplace" in r["error"].lower() or "unknown" in r["error"].lower()

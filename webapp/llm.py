@@ -72,6 +72,18 @@ async def run_chat_turn(history: list[dict]) -> tuple[str, list[dict]]:
             }
         )
 
+        if resp.stop_reason == "pause_turn":
+            # Server-side tool (web_search) hit Anthropic's 10-iteration
+            # server loop cap. Resume by re-sending the same messages — the
+            # trailing server_tool_use block we just appended IS the
+            # continuation signal. Do NOT inject a fake "Continue" user
+            # message (would corrupt the server's view of history).
+            logger.info(
+                "pause_turn received; re-sending to resume server loop (iter=%d)",
+                i + 1,
+            )
+            continue
+
         if resp.stop_reason != "tool_use":
             # Final response — extract text and return
             final_text = "".join(block.text for block in resp.content if block.type == "text")
@@ -97,6 +109,23 @@ async def run_chat_turn(history: list[dict]) -> tuple[str, list[dict]]:
         # tag THIS iteration's last tool_result as ephemeral. One marker
         # at a time keeps us under Anthropic's 4-block-per-request limit.
         _strip_cache_control_from_prior_tool_results(history)
+
+        # 20-block lookback guard: each cache_control breakpoint walks
+        # back at most 20 content blocks. Server tools (web_search)
+        # produce multiple blocks per call (server_tool_use +
+        # web_search_tool_result [+ filtered text]), so a turn that
+        # chains search → register_asin_from_url → re-query can approach
+        # the limit. >15 gives a 5-block buffer before cache misses.
+        total_blocks = sum(
+            len(m["content"]) if isinstance(m.get("content"), list) else 1 for m in history
+        )
+        if total_blocks > 15:
+            logger.warning(
+                "history total_blocks=%d approaching 20-block cache lookback limit "
+                "(web_search + register_asin_from_url chain may cause cache miss next turn)",
+                total_blocks,
+            )
+
         if tool_results:
             tool_results[-1]["cache_control"] = {"type": "ephemeral"}
         # IMPORTANT: all tool results in ONE user message (for parallel tool safety)

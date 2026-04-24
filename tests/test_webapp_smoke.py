@@ -151,7 +151,14 @@ class TestToolDispatch:
                 "Only the LAST tool should have cache_control; it caches all preceding tools"
             )
 
-    def test_all_phase2_tool_names_present(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_all_expected_tools_present(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Every shipped tool must appear in TOOL_SCHEMAS.
+
+        Server-side tools (Anthropic-executed, e.g. ``web_search``) carry both
+        ``type`` and ``name`` — they share the ``name`` namespace with
+        client-side tools but are dispatched by Anthropic, not our
+        ``dispatch_tool``. The expected set covers BOTH kinds.
+        """
         _set_fake_env(monkeypatch)
         _reset_webapp_modules()
         from webapp.tools import TOOL_SCHEMAS
@@ -167,6 +174,8 @@ class TestToolDispatch:
             "query_ranking",
             "query_sellers",
             "query_trends",
+            "web_search",
+            "register_asin_from_url",
         }
         assert names == expected, f"Missing or extra tools: {names ^ expected}"
 
@@ -212,6 +221,7 @@ class TestToolDispatch:
             "_api_query_ranking",
             "_api_query_sellers",
             "_api_query_trends",
+            "_api_register_asin_from_url",
         ):
             monkeypatch.setattr(webapp_tools, attr, _fake_envelope)
 
@@ -223,6 +233,11 @@ class TestToolDispatch:
             """
             out: list[tuple[str, dict]] = []
             for tool in TOOL_SCHEMAS:
+                # Server-side tools (e.g. web_search, type="web_search_20260209")
+                # don't declare an input_schema — Anthropic dispatches them on
+                # its side. Skip: our dispatch_tool never sees them.
+                if "input_schema" not in tool:
+                    continue
                 name = tool["name"]
                 # Build minimal args dict satisfying required fields with safe placeholders
                 args: dict = {}
@@ -258,6 +273,10 @@ class TestToolDispatch:
             ("query_ranking", "marketplace"),
             ("query_sellers", "product"),
             ("query_trends", "product"),
+            # register_asin_from_url validates brand first, so with empty args
+            # the dispatcher returns on "brand". The other 3 required fields
+            # (model/marketplace/amazon_url) share the same validation path.
+            ("register_asin_from_url", "brand"),
         ]
 
         async def _run_all() -> list[tuple[str, str, dict]]:
@@ -502,10 +521,11 @@ class TestQueryPassthrough:
     ) -> None:
         """Regression guard, not a compression-target test.
 
-        Phase 2 baseline was ~6,500 chars. Phase 3 target is ≤5,500. The
-        6,000-char bound here catches future bloat without enforcing the tight
-        Phase 3 compression outcome (validated in the token_audit harness).
-        If this fires, someone expanded a tool docstring.
+        Phase 2 baseline was ~6,500 chars. Phase 3 target is ≤5,500. Budget
+        was raised from 6,000 → 8,000 when the web_search server-side schema
+        and ``register_asin_from_url`` client schema landed (adds ~1,200
+        chars). If this fires past the 8,000 bound, someone expanded a tool
+        docstring — not the tool count.
         """
         import json
 
@@ -514,9 +534,10 @@ class TestQueryPassthrough:
         from webapp.tools import TOOL_SCHEMAS
 
         size = len(json.dumps(TOOL_SCHEMAS, ensure_ascii=False))
-        assert size <= 6000, (
-            f"TOOL_SCHEMAS size {size} chars exceeds 6,000 regression budget "
-            f"(Phase 2 baseline ~6,500, Phase 3 target ≤5,500)"
+        assert size <= 8000, (
+            f"TOOL_SCHEMAS size {size} chars exceeds 8,000 regression budget "
+            f"(bumped from 6,000 when web_search + register_asin_from_url "
+            f"were added; Phase 2 baseline ~6,500)"
         )
 
     def test_attach_failure_drops_file_attached_from_summary(
@@ -961,12 +982,16 @@ class TestAsyncThreadOffload:
             "_api_query_ranking",
             "_api_query_sellers",
             "_api_query_trends",
+            "_api_register_asin_from_url",
         ):
             monkeypatch.setattr(webapp_tools, attr, _record_thread)
 
         async def _run_all() -> list[tuple[str, dict]]:
             out: list[tuple[str, dict]] = []
             for tool in TOOL_SCHEMAS:
+                # Skip server-side tools (no input_schema → Anthropic-dispatched).
+                if "input_schema" not in tool:
+                    continue
                 name = tool["name"]
                 args: dict = {}
                 for prop in tool["input_schema"].get("required", []):
@@ -980,3 +1005,300 @@ class TestAsyncThreadOffload:
                 f"{name}: sync _api_* ran on {thread_name!r} — Bug A regression. "
                 f"Wrapper must await asyncio.to_thread(_api_*, ...)."
             )
+
+
+@pytest.mark.unit
+class TestWebSearchTool:
+    """Server-side web_search schema shape + anti-code-execution guard."""
+
+    def test_web_search_tool_declared(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _set_fake_env(monkeypatch)
+        _reset_webapp_modules()
+        from webapp.tools import TOOL_SCHEMAS
+
+        web_tools = [t for t in TOOL_SCHEMAS if t.get("type") == "web_search_20260209"]
+        assert len(web_tools) == 1, (
+            "Expected exactly one web_search_20260209 server-side tool declaration"
+        )
+        tool = web_tools[0]
+        assert tool["name"] == "web_search", (
+            "Anthropic requires the name literal 'web_search'"
+        )
+        allowed = set(tool.get("allowed_domains", []))
+        for required in ("amazon.com", "amazon.de", "amazon.co.uk", "amazon.co.jp"):
+            assert required in allowed, (
+                f"allowed_domains must cover {required} — missing means "
+                f"web_search can't reach that marketplace"
+            )
+
+    def test_no_code_execution_tool_declared(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Decision regression guard.
+
+        ``web_search_20260209`` has dynamic filtering built-in — Anthropic
+        provisions a code-execution sandbox internally. Declaring a
+        standalone ``code_execution_*`` tool alongside creates a second
+        environment and confuses the model. This test blocks that.
+        """
+        _set_fake_env(monkeypatch)
+        _reset_webapp_modules()
+        from webapp.tools import TOOL_SCHEMAS
+
+        code_tools = [
+            t for t in TOOL_SCHEMAS
+            if str(t.get("type") or "").startswith("code_execution")
+        ]
+        assert code_tools == [], (
+            f"Must NOT declare a standalone code_execution tool alongside "
+            f"web_search_20260209; found: {[t.get('type') for t in code_tools]}"
+        )
+
+
+@pytest.mark.unit
+class TestRegisterAsinFromUrlDispatch:
+    """register_asin_from_url routes through dispatch_tool correctly and
+    bypasses the summarize_for_llm decorator (returns a small dict, not rows).
+    """
+
+    def test_register_asin_from_url_skips_summarize_decorator(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Success response is a small dict envelope; no xlsx / pending_files.
+
+        The summarize decorator is wired to row-emitting query tools only.
+        register_asin_from_url's data is a compact dict with
+        asin/marketplace/product_id — summary would mis-handle it as 0 rows
+        and attach a useless empty xlsx. This test ensures the dispatch
+        path never reaches summarize for this tool.
+        """
+        _set_fake_env(monkeypatch)
+
+        from dataclasses import dataclass
+
+        import chainlit as cl
+
+        store: dict = {}
+
+        class _FakeSession:
+            def get(self, k, default=None):
+                return store.get(k, default)
+
+            def set(self, k, v):
+                store[k] = v
+
+        @dataclass
+        class _FakeFile:
+            name: str = ""
+            content: bytes | str | None = None
+            mime: str | None = None
+            display: str = "inline"
+
+        def _noop_step(**_kwargs):  # type: ignore[no-untyped-def]
+            def _decorator(fn):  # type: ignore[no-untyped-def]
+                return fn
+
+            return _decorator
+
+        monkeypatch.setattr(cl, "user_session", _FakeSession())
+        monkeypatch.setattr(cl, "step", _noop_step)
+        monkeypatch.setattr(cl, "File", _FakeFile)
+
+        _reset_webapp_modules()
+        from webapp import tools as webapp_tools
+        from webapp.tools import dispatch_tool
+
+        def _fake(**_kw) -> dict:  # type: ignore[no-untyped-def]
+            return {
+                "ok": True,
+                "data": {
+                    "asin": "B0TESTTEST1",
+                    "marketplace": "DE",
+                    "brand": "TP-Link",
+                    "model": "AX1500",
+                    "product_id": 42,
+                    "registered": True,
+                    "new_product": True,
+                },
+                "error": None,
+                "meta": {},
+            }
+
+        monkeypatch.setattr(webapp_tools, "_api_register_asin_from_url", _fake)
+
+        result = asyncio.run(
+            dispatch_tool(
+                "register_asin_from_url",
+                {
+                    "brand": "TP-Link",
+                    "model": "AX1500",
+                    "marketplace": "DE",
+                    "amazon_url": "https://www.amazon.de/dp/B0TESTTEST1",
+                },
+            )
+        )
+
+        assert result["ok"] is True
+        assert result["data"]["asin"] == "B0TESTTEST1"
+        assert store.get("pending_files", []) == [], (
+            "register_asin_from_url returns a compact dict; no xlsx "
+            "attachment should be created"
+        )
+
+
+@pytest.mark.unit
+class TestPauseTurnHandling:
+    """Server-side tools (web_search) can hit Anthropic's 10-iter server loop
+    cap, returning ``stop_reason='pause_turn'``. webapp/llm.py must resume
+    transparently by re-sending the same messages, WITHOUT injecting a fake
+    'Continue' user message.
+    """
+
+    def test_pause_turn_resume(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _set_fake_env(monkeypatch)
+        _reset_webapp_modules()
+        from webapp import llm as webapp_llm
+
+        class _Block:
+            def __init__(self, **kw):
+                self.__dict__.update(kw)
+
+            def model_dump(self) -> dict:
+                return dict(self.__dict__)
+
+        class _Usage:
+            def model_dump(self) -> dict:
+                return {}
+
+        class _Resp:
+            def __init__(self, content: list, stop_reason: str):
+                self.content = content
+                self.stop_reason = stop_reason
+                self.usage = _Usage()
+
+        # First response: server tool pause (no client tool_use; trailing
+        # server_tool_use is the resume signal Anthropic expects).
+        server_tool_use_block = _Block(
+            type="server_tool_use",
+            id="srv_abc",
+            name="web_search",
+            input={"query": "site:amazon.de slate 7"},
+        )
+        text_final = _Block(type="text", text="found it")
+
+        call_count = {"n": 0}
+        responses = [
+            _Resp([server_tool_use_block], "pause_turn"),
+            _Resp([text_final], "end_turn"),
+        ]
+
+        def _fake_create(**kwargs):
+            call_count["n"] += 1
+            idx = call_count["n"] - 1
+            assert idx < len(responses), "messages.create invoked too many times"
+            return responses[idx]
+
+        monkeypatch.setattr(webapp_llm._client.messages, "create", _fake_create)
+
+        history: list[dict] = [{"role": "user", "content": "find slate 7 in DE"}]
+        final_text, updated = asyncio.run(webapp_llm.run_chat_turn(history))
+
+        assert final_text == "found it"
+        assert call_count["n"] == 2, (
+            "Expected exactly 2 calls to messages.create: initial + resume. "
+            f"Got {call_count['n']}."
+        )
+
+        # Guard: no fake "Continue" user message was injected between the
+        # pause_turn assistant turn and the resumed call. The only user
+        # entries should be the original prompt.
+        user_msgs = [m for m in updated if m.get("role") == "user"]
+        assert len(user_msgs) == 1, (
+            f"Expected exactly 1 user message (the original prompt); "
+            f"got {len(user_msgs)} — suggests a fake 'Continue' was injected"
+        )
+        assert user_msgs[0]["content"] == "find slate 7 in DE"
+
+
+@pytest.mark.unit
+class TestBlockCountMonitor:
+    """The 20-block lookback limit on prompt-cache breakpoints means long
+    turns (web_search + register + re-query) can silently cache-miss.
+    webapp/llm.py emits a warning once history exceeds 15 blocks so ops
+    can catch drift.
+    """
+
+    def test_history_block_count_warning_logged(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        _set_fake_env(monkeypatch)
+        _reset_webapp_modules()
+        from webapp import llm as webapp_llm
+
+        class _Block:
+            def __init__(self, **kw):
+                self.__dict__.update(kw)
+
+            def model_dump(self) -> dict:
+                return dict(self.__dict__)
+
+        class _Usage:
+            def model_dump(self) -> dict:
+                return {}
+
+        class _Resp:
+            def __init__(self, content: list, stop_reason: str):
+                self.content = content
+                self.stop_reason = stop_reason
+                self.usage = _Usage()
+
+        tool_use = _Block(type="tool_use", id="toolu_X", name="keepa_budget", input={})
+        text = _Block(type="text", text="done")
+
+        responses = iter([_Resp([tool_use], "tool_use"), _Resp([text], "end_turn")])
+        monkeypatch.setattr(
+            webapp_llm._client.messages, "create", lambda **_k: next(responses)
+        )
+
+        async def _fake_dispatch(_name: str, _args: dict) -> dict:
+            return {"ok": True, "data": [], "error": None, "meta": {}}
+
+        monkeypatch.setattr(webapp_llm, "dispatch_tool", _fake_dispatch)
+
+        # Prime history with > 15 content blocks so the warning fires on the
+        # first tool_use round. A single user message with 16 text blocks
+        # gets us over the threshold.
+        primer_content = [
+            {"type": "text", "text": f"block {i}"} for i in range(16)
+        ]
+        history: list[dict] = [{"role": "user", "content": primer_content}]
+
+        with caplog.at_level("WARNING", logger=webapp_llm.logger.name):
+            asyncio.run(webapp_llm.run_chat_turn(history))
+
+        warnings = [r for r in caplog.records if "total_blocks=" in r.getMessage()]
+        assert warnings, (
+            "Expected a warning containing 'total_blocks=' when history "
+            "exceeds the 15-block threshold"
+        )
+        assert any(
+            "20-block cache lookback" in r.getMessage() for r in warnings
+        ), "Warning should name the 20-block lookback limit for ops clarity"
+
+
+@pytest.mark.unit
+class TestSystemPromptContent:
+    """SYSTEM_PROMPT must include the ASIN Discovery Flow so the LLM knows
+    when to call web_search and register_asin_from_url without being told
+    on every turn.
+    """
+
+    def test_system_prompt_contains_asin_flow(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _set_fake_env(monkeypatch)
+        _reset_webapp_modules()
+        from webapp.config import SYSTEM_PROMPT
+
+        assert "register_asin_from_url" in SYSTEM_PROMPT
+        assert "web_search" in SYSTEM_PROMPT
+        assert "ASIN Discovery Flow" in SYSTEM_PROMPT
+        # Prompt-injection defense lines must be present.
+        assert "do not fabricate Amazon URLs" in SYSTEM_PROMPT
+
