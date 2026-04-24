@@ -14,6 +14,7 @@ import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, NamedTuple, TypedDict
+from urllib.parse import urlparse
 
 from amz_scout.config import (
     MarketplaceConfig,
@@ -1654,5 +1655,141 @@ def discover_asin(
             "marketplace": site,
             "asin": found_asin,
             "status": "active",
+        },
+    )
+
+
+# ASIN pattern inside an Amazon product URL path. Accepts both canonical
+# forms: ``/dp/<ASIN>`` and the older ``/gp/product/<ASIN>`` (still surfaced
+# by web_search and Google). Case-insensitive — Amazon canonicalizes mixed-
+# case ASINs to upper, but user- or model-supplied URLs may leak lowercase.
+# Trailing boundary accepts ``/ ? # .`` or end-of-string, so suffixes like
+# ``.html`` / ``#customerReviews`` / ``?ref=...`` are all tolerated.
+_ASIN_URL_RE = re.compile(r"/(?:dp|gp/product)/([A-Za-z0-9]{10})(?:[/?#.]|$)")
+
+
+def register_asin_from_url(
+    brand: str,
+    model: str,
+    marketplace: str,
+    amazon_url: str,
+    db_path: Path | str | None = None,
+) -> ApiResponse:
+    """Register an ASIN by parsing an Amazon product page URL.
+
+    Non-browser sibling of :func:`discover_asin`. Extracts the ASIN from a
+    ``.../dp/<10-char>/...`` or ``.../gp/product/<10-char>/...`` URL,
+    verifies that the URL host matches the target marketplace's
+    ``amazon_domain`` (rejects wrong-TLD writes AND phishing lookalikes
+    like ``fakeamazon.co.uk``), and mirrors ``discover_asin``'s dual-branch
+    tail write: existing ``(brand, model)`` → append marketplace mapping;
+    new product → register + map. Notes are tagged
+    ``discovered via web_search`` so the source can be audited later.
+
+    Does NOT consume Keepa tokens. Does NOT launch a browser.
+
+    Atomicity caveat (shared with :func:`discover_asin`): the ``products``
+    row insert and the ``product_asins`` mapping insert are two separate
+    commits (each helper has its own ``with conn:``). If the second step
+    fails (e.g. disk I/O), an orphan product row can remain. This is
+    self-healing — the next call for the same ``(brand, model)`` takes
+    the ``existing`` branch and fills in the missing ASIN mapping.
+    """
+    try:
+        # urlparse treats bare "amazon.de/..." as a path, not a URL — prepend
+        # scheme so ``.hostname`` / ``.path`` populate correctly.
+        url_for_parse = amazon_url
+        if not url_for_parse.startswith(("http://", "https://")):
+            url_for_parse = "https://" + url_for_parse
+        parsed = urlparse(url_for_parse)
+
+        # Search ONLY the path — ``/dp/`` strings inside query or fragment
+        # (e.g. refinement filters, tracking params, redirect URLs from
+        # search-result pages) would otherwise poison the match.
+        match = _ASIN_URL_RE.search(parsed.path)
+        if not match:
+            return _envelope(
+                False,
+                error=(
+                    f"No ASIN found in URL path {parsed.path!r} "
+                    "(expected /dp/<ASIN> or /gp/product/<ASIN>, 10-char ASIN)"
+                ),
+            )
+        # Amazon ASINs are canonical-uppercase; normalize so the DB key is
+        # stable regardless of how the URL was captured.
+        asin = match.group(1).upper()
+
+        mp_path = CONFIG_DIR / "marketplaces.yaml"
+        if not mp_path.exists():
+            return _envelope(False, error=f"Marketplace config not found: {mp_path}")
+        marketplaces = load_marketplace_config(mp_path)
+
+        aliases = _build_marketplace_aliases(marketplaces)
+        site = aliases.get(marketplace.lower()) or marketplace
+        mp_config = marketplaces.get(site)
+        if not mp_config:
+            return _envelope(False, error=f"Unknown marketplace: {marketplace}")
+
+        # Strict host match: accept bare domain or a real subdomain (host
+        # ends with ".{domain}"). Plain ``.endswith(domain)`` would let
+        # ``fakeamazon.co.uk`` pass when marketplace is UK — phishing
+        # lookalikes must be rejected even though Anthropic's web_search
+        # ``allowed_domains`` already filters upstream (defense in depth).
+        # ``.hostname`` drops userinfo / port and lowercases; ``.rstrip(".")``
+        # normalizes the legitimate trailing-dot root-FQDN form.
+        host = (parsed.hostname or "").rstrip(".")
+        expected = mp_config.amazon_domain.lower()
+        if host != expected and not host.endswith("." + expected):
+            return _envelope(
+                False,
+                error=(
+                    f"URL host {host!r} does not match marketplace {site} "
+                    f"({mp_config.amazon_domain})"
+                ),
+            )
+
+        from amz_scout.db import find_product_exact, register_asin, register_product
+
+        path = _get_db(db_path)
+        with open_db(path) as conn:
+            existing = find_product_exact(conn, brand, model)
+            if existing:
+                pid = existing["id"]
+                register_asin(
+                    conn,
+                    pid,
+                    site,
+                    asin,
+                    notes="discovered via web_search",
+                )
+                is_new = False
+            else:
+                # Respect register_product's real ``is_new`` flag — the
+                # conflict-fallback branch returns False when a concurrent
+                # caller already inserted the same (brand_key, model_key),
+                # and lying about ``new_product`` would mislead the LLM / user.
+                pid, is_new = register_product(
+                    conn, "", brand, model, f"{brand} {model}"
+                )
+                register_asin(
+                    conn,
+                    pid,
+                    site,
+                    asin,
+                    notes="discovered via web_search",
+                )
+    except Exception as e:
+        logger.exception("register_asin_from_url failed")
+        return _envelope(False, error=str(e))
+
+    return _envelope(
+        True,
+        data={
+            "brand": brand,
+            "model": model,
+            "marketplace": site,
+            "asin": asin,
+            "registered": True,
+            "new_product": is_new,
         },
     )

@@ -44,6 +44,7 @@ from amz_scout.api import query_latest as _api_query_latest
 from amz_scout.api import query_ranking as _api_query_ranking
 from amz_scout.api import query_sellers as _api_query_sellers
 from amz_scout.api import query_trends as _api_query_trends
+from amz_scout.api import register_asin_from_url as _api_register_asin_from_url
 from webapp.summaries import summarize_for_llm
 
 logger = logging.getLogger(__name__)
@@ -102,6 +103,25 @@ _MARKETPLACE_DESC = (
     "('uk', 'amazon.co.uk', 'GB', 'GBP')."
 )
 _PRODUCT_DESC = "Product identifier — brand/model name (e.g. 'Slate 7') or ASIN. Required."
+
+# Allow-list for Anthropic server-side web_search. Kept as a static constant
+# (not derived at runtime from marketplaces.yaml) so the schema hash stays
+# stable across requests — dynamic values would invalidate prompt caching.
+_AMAZON_DOMAINS = [
+    "amazon.com",
+    "amazon.co.uk",
+    "amazon.de",
+    "amazon.fr",
+    "amazon.it",
+    "amazon.es",
+    "amazon.nl",
+    "amazon.ca",
+    "amazon.com.mx",
+    "amazon.in",
+    "amazon.com.br",
+    "amazon.co.jp",
+    "amazon.com.au",
+]
 
 TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
@@ -239,6 +259,19 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "required": ["product"],
         },
     },
+    # Anthropic server-side web_search (dynamic filtering built-in).
+    # No description / input_schema — Anthropic defines and executes it
+    # server-side; the client only declares the declaration. Do NOT
+    # co-declare a standalone `code_execution` tool: dynamic filtering
+    # already provisions one internally, and duplicating it creates a
+    # second execution environment that confuses the model (per
+    # Anthropic docs, 2026-02-09 release notes).
+    {
+        "type": "web_search_20260209",
+        "name": "web_search",
+        "max_uses": 5,
+        "allowed_domains": _AMAZON_DOMAINS,
+    },
     {
         "name": "query_trends",
         "description": (
@@ -277,7 +310,49 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             },
             "required": ["product"],
         },
-        # Cache_control on the LAST tool only — caches all 9 tool definitions together.
+    },
+    {
+        "name": "register_asin_from_url",
+        "description": (
+            "Register a product's ASIN into the registry by parsing an Amazon "
+            "product URL. Accepts both '.../dp/<ASIN>/...' and the older "
+            "'.../gp/product/<ASIN>/...' forms (both still surfaced by "
+            "web_search). Use after web_search returns an Amazon product "
+            "URL. Creates the product if the (brand, model) pair is new; "
+            "otherwise appends the marketplace mapping. Validates that the "
+            "URL host matches the target marketplace (e.g. amazon.de for "
+            "DE) — rejects mismatches to prevent wrong-market writes. "
+            "Does NOT consume Keepa tokens."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "brand": {
+                    "type": "string",
+                    "description": "Product brand (e.g. 'TP-Link').",
+                },
+                "model": {
+                    "type": "string",
+                    "description": "Product model (e.g. 'AX1500').",
+                },
+                "marketplace": {
+                    "type": "string",
+                    "description": _MARKETPLACE_DESC,
+                },
+                "amazon_url": {
+                    "type": "string",
+                    "description": (
+                        "Full Amazon product page URL containing "
+                        "'/dp/<10-char-ASIN>' OR '/gp/product/<10-char-ASIN>'. "
+                        "Obtained from web_search results."
+                    ),
+                },
+            },
+            "required": ["brand", "model", "marketplace", "amazon_url"],
+        },
+        # Cache_control on the LAST tool only — caches all preceding tool
+        # definitions together. If a new tool is appended after this one,
+        # move the marker to the new tail.
         "cache_control": {"type": "ephemeral"},
     },
 ]
@@ -422,6 +497,29 @@ async def _step_query_trends(
     )
 
 
+@cl.step(type="tool", name="register_asin_from_url")
+async def _step_register_asin_from_url(
+    brand: str,
+    model: str,
+    marketplace: str,
+    amazon_url: str,
+) -> ApiResponse:
+    logger.info(
+        "register_asin_from_url called: brand=%s model=%s marketplace=%s url=%s",
+        brand,
+        model,
+        marketplace,
+        amazon_url,
+    )
+    return await asyncio.to_thread(
+        _api_register_asin_from_url,
+        brand=brand,
+        model=model,
+        marketplace=marketplace,
+        amazon_url=amazon_url,
+    )
+
+
 async def dispatch_tool(name: str, args: dict) -> ApiResponse:
     """Route a tool call from the LLM to the right Python function.
 
@@ -482,6 +580,16 @@ async def dispatch_tool(name: str, args: dict) -> ApiResponse:
             marketplace=args.get("marketplace", "UK"),
             series=args.get("series", "new"),
             days=args.get("days", 90),
+        )
+    if name == "register_asin_from_url":
+        for field in ("brand", "model", "marketplace", "amazon_url"):
+            if not args.get(field):
+                return _missing_required("register_asin_from_url", field)
+        return await _step_register_asin_from_url(
+            brand=args["brand"],
+            model=args["model"],
+            marketplace=args["marketplace"],
+            amazon_url=args["amazon_url"],
         )
 
     # Unknown tool — return an envelope-shaped error so the LLM can recover
