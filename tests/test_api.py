@@ -1688,3 +1688,127 @@ class TestRegisterAsinFromUrl:
         assert r["ok"] is False
         assert r["error"] is not None
         assert "marketplace" in r["error"].lower() or "unknown" in r["error"].lower()
+
+    def test_rejects_suffix_tail_phishing(self, test_db):
+        """``amazon.co.uk.evil.com`` MUST be rejected.
+
+        Defends against the complementary attack class to
+        ``fakeamazon.co.uk``: a naive scan that treats ``"amazon.co.uk"``
+        as a substring anywhere in the URL/host would pass these, but the
+        real host (``.hostname``) is ``evil.com`` / ``phisher.net`` — so
+        the strict ``host == expected or host.endswith("." + expected)``
+        check must fail them. Also guards against a future refactor that
+        replaces ``urlparse`` with a string scan.
+        """
+        cases = [
+            ("amazon.co.uk.evil.com", "UK"),
+            ("www.amazon.co.uk.evil.com", "UK"),
+            ("amazon.com.phisher.net", "US"),
+            ("amazon.de.attacker.io", "DE"),
+        ]
+        for bad_host, market in cases:
+            r = register_asin_from_url(
+                "X",
+                f"Y-{bad_host}",
+                market,
+                f"https://{bad_host}/dp/B0PHISHER1",
+                db_path=test_db,
+            )
+            assert r["ok"] is False, f"suffix-tail {bad_host!r} bypassed host check"
+            assert "host" in (r["error"] or "").lower()
+
+    def test_accepts_gp_product_url_form(self, test_db):
+        """Amazon's older canonical form ``/gp/product/<ASIN>`` is still
+        surfaced by Google and by Anthropic's web_search. Rejecting it
+        would make the discovery flow retry needlessly and burn web_search
+        budget, so the regex must accept both ``/dp/`` and ``/gp/product/``.
+        """
+        r = register_asin_from_url(
+            "TP-Link",
+            "AX1500-gp",
+            "DE",
+            "https://www.amazon.de/gp/product/B0GPTESTGP/ref=sr_1_1",
+            db_path=test_db,
+        )
+        assert r["ok"] is True, r["error"]
+        assert r["data"]["asin"] == "B0GPTESTGP"
+        assert r["data"]["marketplace"] == "DE"
+
+    def test_does_not_consume_keepa_tokens(self, test_db, monkeypatch):
+        """Non-browser discovery path must NEVER touch the Keepa API.
+
+        The PR contract is that ``register_asin_from_url`` only parses a
+        URL + writes to the registry; it does not call ``get_keepa_data``.
+        A future refactor that wires Keepa in — to, say, auto-populate
+        titles — would silently burn the 60-token daily budget. This test
+        makes any such call explode immediately.
+        """
+        import amz_scout.keepa_service as keepa_service
+
+        def _boom(*args, **kwargs):
+            raise AssertionError(
+                "Keepa API must not be called by register_asin_from_url"
+            )
+
+        monkeypatch.setattr(keepa_service, "get_keepa_data", _boom)
+        r = register_asin_from_url(
+            "TP-Link",
+            "AX1500-no-keepa",
+            "DE",
+            "https://www.amazon.de/dp/B0NOKEEPA1",
+            db_path=test_db,
+        )
+        assert r["ok"] is True, r["error"]
+
+    def test_existing_product_notes_audit(self, test_db):
+        """The ``existing-product`` branch must also tag new mappings with
+        the ``web_search`` notes so discovery-source auditing covers both
+        code paths (new product + append-to-existing). The new-product
+        branch is already covered by ``test_happy_path_new_product``.
+        """
+        r0 = add_product(
+            "Router",
+            "TP-Link",
+            "AX1500-notes",
+            asins={"UK": "B0UKNOTES0"},
+            db_path=test_db,
+        )
+        assert r0["ok"] is True
+        r = register_asin_from_url(
+            "TP-Link",
+            "AX1500-notes",
+            "DE",
+            "https://www.amazon.de/dp/B0DENOTES0",
+            db_path=test_db,
+        )
+        assert r["ok"] is True
+        conn = sqlite3.connect(str(test_db))
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT notes FROM product_asins WHERE asin = ?",
+            ("B0DENOTES0",),
+        ).fetchone()
+        conn.close()
+        assert row is not None
+        assert "web_search" in (row["notes"] or ""), (
+            "existing-product branch must tag new mappings with the "
+            "web_search audit marker, same as the new-product branch"
+        )
+
+    def test_lowercase_asin_is_normalized(self, test_db):
+        """Real Amazon URLs canonicalize to uppercase, but user-pasted or
+        model-generated URLs may leak lowercase. The registry key must
+        always be the upper form so cross-call lookups don't miss due to
+        casing drift.
+        """
+        r = register_asin_from_url(
+            "TP-Link",
+            "AX1500-lower",
+            "DE",
+            "https://www.amazon.de/dp/b0lowercs0",
+            db_path=test_db,
+        )
+        assert r["ok"] is True, r["error"]
+        assert r["data"]["asin"] == "B0LOWERCS0", (
+            "ASIN must be normalized to uppercase for DB key stability"
+        )

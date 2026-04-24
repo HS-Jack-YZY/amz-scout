@@ -1659,10 +1659,13 @@ def discover_asin(
     )
 
 
-# ASIN pattern inside an Amazon `/dp/` path segment. Case-strict uppercase;
-# the alternatives tolerate trailing slash, query string, fragment, or
-# end-of-string (real Amazon URLs often end at `#customerReviews`).
-_DP_ASIN_RE = re.compile(r"/dp/([A-Z0-9]{10})(?:[/?#]|$)")
+# ASIN pattern inside an Amazon product URL path. Accepts both canonical
+# forms: ``/dp/<ASIN>`` and the older ``/gp/product/<ASIN>`` (still surfaced
+# by web_search and Google). Case-insensitive — Amazon canonicalizes mixed-
+# case ASINs to upper, but user- or model-supplied URLs may leak lowercase.
+# Trailing boundary accepts ``/ ? # .`` or end-of-string, so suffixes like
+# ``.html`` / ``#customerReviews`` / ``?ref=...`` are all tolerated.
+_ASIN_URL_RE = re.compile(r"/(?:dp|gp/product)/([A-Za-z0-9]{10})(?:[/?#.]|$)")
 
 
 def register_asin_from_url(
@@ -1675,11 +1678,12 @@ def register_asin_from_url(
     """Register an ASIN by parsing an Amazon product page URL.
 
     Non-browser sibling of :func:`discover_asin`. Extracts the ASIN from a
-    ``.../dp/<10-char>/...`` URL, verifies that the URL host matches the
-    target marketplace's ``amazon_domain`` (guards against writing a ``.com``
-    URL to a UK registration), and then mirrors ``discover_asin``'s tail
-    dual-branch write: existing ``(brand, model)`` → append marketplace
-    mapping; new product → register + map. Notes are tagged
+    ``.../dp/<10-char>/...`` or ``.../gp/product/<10-char>/...`` URL,
+    verifies that the URL host matches the target marketplace's
+    ``amazon_domain`` (rejects wrong-TLD writes AND phishing lookalikes
+    like ``fakeamazon.co.uk``), and mirrors ``discover_asin``'s dual-branch
+    tail write: existing ``(brand, model)`` → append marketplace mapping;
+    new product → register + map. Notes are tagged
     ``discovered via web_search`` so the source can be audited later.
 
     Does NOT consume Keepa tokens. Does NOT launch a browser.
@@ -1692,19 +1696,28 @@ def register_asin_from_url(
     the ``existing`` branch and fills in the missing ASIN mapping.
     """
     try:
-        match = _DP_ASIN_RE.search(amazon_url)
-        if not match:
-            return _envelope(
-                False,
-                error="No ASIN found in URL (expected /dp/<10-char>)",
-            )
-        asin = match.group(1)
-
         # urlparse treats bare "amazon.de/..." as a path, not a URL — prepend
-        # scheme so `.netloc` is populated for the host check below.
+        # scheme so ``.hostname`` / ``.path`` populate correctly.
         url_for_parse = amazon_url
         if not url_for_parse.startswith(("http://", "https://")):
             url_for_parse = "https://" + url_for_parse
+        parsed = urlparse(url_for_parse)
+
+        # Search ONLY the path — ``/dp/`` strings inside query or fragment
+        # (e.g. refinement filters, tracking params, redirect URLs from
+        # search-result pages) would otherwise poison the match.
+        match = _ASIN_URL_RE.search(parsed.path)
+        if not match:
+            return _envelope(
+                False,
+                error=(
+                    f"No ASIN found in URL path {parsed.path!r} "
+                    "(expected /dp/<ASIN> or /gp/product/<ASIN>, 10-char ASIN)"
+                ),
+            )
+        # Amazon ASINs are canonical-uppercase; normalize so the DB key is
+        # stable regardless of how the URL was captured.
+        asin = match.group(1).upper()
 
         mp_path = CONFIG_DIR / "marketplaces.yaml"
         if not mp_path.exists():
@@ -1722,7 +1735,9 @@ def register_asin_from_url(
         # ``fakeamazon.co.uk`` pass when marketplace is UK — phishing
         # lookalikes must be rejected even though Anthropic's web_search
         # ``allowed_domains`` already filters upstream (defense in depth).
-        host = urlparse(url_for_parse).netloc.lower()
+        # ``.hostname`` drops userinfo / port and lowercases; ``.rstrip(".")``
+        # normalizes the legitimate trailing-dot root-FQDN form.
+        host = (parsed.hostname or "").rstrip(".")
         expected = mp_config.amazon_domain.lower()
         if host != expected and not host.endswith("." + expected):
             return _envelope(
@@ -1749,7 +1764,13 @@ def register_asin_from_url(
                 )
                 is_new = False
             else:
-                pid, _ = register_product(conn, "", brand, model, f"{brand} {model}")
+                # Respect register_product's real ``is_new`` flag — the
+                # conflict-fallback branch returns False when a concurrent
+                # caller already inserted the same (brand_key, model_key),
+                # and lying about ``new_product`` would mislead the LLM / user.
+                pid, is_new = register_product(
+                    conn, "", brand, model, f"{brand} {model}"
+                )
                 register_asin(
                     conn,
                     pid,
@@ -1757,7 +1778,6 @@ def register_asin_from_url(
                     asin,
                     notes="discovered via web_search",
                 )
-                is_new = True
     except Exception as e:
         logger.exception("register_asin_from_url failed")
         return _envelope(False, error=str(e))
@@ -1769,7 +1789,6 @@ def register_asin_from_url(
             "model": model,
             "marketplace": site,
             "asin": asin,
-            "product_id": pid,
             "registered": True,
             "new_product": is_new,
         },

@@ -42,6 +42,41 @@ def _strip_cache_control_from_prior_tool_results(history: list[dict]) -> None:
                 block.pop("cache_control", None)
 
 
+def _log_server_tool_errors(resp_content: list) -> None:
+    """Surface ``web_search_tool_result`` error payloads to operator logs.
+
+    Anthropic's server-side web_search returns structured error blocks
+    (``error_code`` ∈ {``max_uses_exceeded``, ``too_many_requests``,
+    ``unavailable``, ``invalid_input``}) alongside normal content. The
+    tool-use loop forwards these to the model verbatim so it can recover,
+    but without this scan the operator sees only ``pause_turn received``
+    in logs and has no signal that web_search itself is failing.
+    """
+    for block in resp_content:
+        if getattr(block, "type", None) != "web_search_tool_result":
+            continue
+        content = getattr(block, "content", None)
+        tool_use_id = getattr(block, "tool_use_id", None)
+        if isinstance(content, dict) and content.get("type") == "web_search_tool_result_error":
+            logger.error(
+                "web_search error: code=%s (tool_use_id=%s)",
+                content.get("error_code"),
+                tool_use_id,
+            )
+        elif getattr(block, "is_error", False):
+            logger.error(
+                "web_search returned is_error=True (tool_use_id=%s)",
+                tool_use_id,
+            )
+
+
+def _count_blocks(history: list[dict]) -> int:
+    """Sum content-block count across all messages in history."""
+    return sum(
+        len(m["content"]) if isinstance(m.get("content"), list) else 1 for m in history
+    )
+
+
 async def run_chat_turn(history: list[dict]) -> tuple[str, list[dict]]:
     """Run one chat turn with tool use until the model is done.
 
@@ -53,6 +88,11 @@ async def run_chat_turn(history: list[dict]) -> tuple[str, list[dict]]:
         text block and updated_history includes the full tool-use round-trip.
     """
     max_iterations = 10  # safety limit to prevent runaway tool calls
+    # Baseline for per-turn block-growth detection. Counting only blocks
+    # ADDED during this call avoids false-positive spam that would fire on
+    # every long-running conversation (the sum across N prior user/assistant
+    # pairs crosses any fixed threshold regardless of cache-miss risk).
+    base_blocks = _count_blocks(history)
     for i in range(max_iterations):
         resp = _client.messages.create(
             model=MODEL_ID,
@@ -62,6 +102,7 @@ async def run_chat_turn(history: list[dict]) -> tuple[str, list[dict]]:
             messages=history,
         )
         logger.info("usage: %s", resp.usage.model_dump())
+        _log_server_tool_errors(resp.content)
 
         # Append the assistant turn to history (preserve typed content blocks).
         # Convert the SDK's Pydantic objects to dicts for history consistency.
@@ -110,20 +151,17 @@ async def run_chat_turn(history: list[dict]) -> tuple[str, list[dict]]:
         # at a time keeps us under Anthropic's 4-block-per-request limit.
         _strip_cache_control_from_prior_tool_results(history)
 
-        # 20-block lookback guard: each cache_control breakpoint walks
-        # back at most 20 content blocks. Server tools (web_search)
-        # produce multiple blocks per call (server_tool_use +
-        # web_search_tool_result [+ filtered text]), so a turn that
-        # chains search → register_asin_from_url → re-query can approach
-        # the limit. >15 gives a 5-block buffer before cache misses.
-        total_blocks = sum(
-            len(m["content"]) if isinstance(m.get("content"), list) else 1 for m in history
-        )
-        if total_blocks > 15:
+        # Per-turn block-growth guard. Empirical signal — a single turn that
+        # chains web_search → register_asin_from_url → re-query can produce
+        # many blocks, and cache hits have been observed to degrade once a
+        # turn grows past ~15 new blocks. Compare against resp.usage's
+        # ``cache_read_input_tokens`` to confirm when this fires.
+        turn_blocks = _count_blocks(history) - base_blocks
+        if turn_blocks > 15:
             logger.warning(
-                "history total_blocks=%d approaching 20-block cache lookback limit "
-                "(web_search + register_asin_from_url chain may cause cache miss next turn)",
-                total_blocks,
+                "run_chat_turn turn_blocks=%d — chained server-tool + tool_use "
+                "rounds may cause prompt-cache miss next turn (check resp.usage)",
+                turn_blocks,
             )
 
         if tool_results:

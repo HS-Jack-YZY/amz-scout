@@ -1024,12 +1024,31 @@ class TestWebSearchTool:
         assert tool["name"] == "web_search", (
             "Anthropic requires the name literal 'web_search'"
         )
+        # Pin the full allowed_domains set. The list is declared static
+        # specifically to keep the tool-schema hash stable for prompt
+        # caching (see _AMAZON_DOMAINS comment in webapp/tools.py); a
+        # silent drop would break web_search for the affected marketplace
+        # AND invalidate every cache entry, so the whole set is guarded.
         allowed = set(tool.get("allowed_domains", []))
-        for required in ("amazon.com", "amazon.de", "amazon.co.uk", "amazon.co.jp"):
-            assert required in allowed, (
-                f"allowed_domains must cover {required} — missing means "
-                f"web_search can't reach that marketplace"
-            )
+        expected = {
+            "amazon.com",
+            "amazon.co.uk",
+            "amazon.de",
+            "amazon.fr",
+            "amazon.it",
+            "amazon.es",
+            "amazon.nl",
+            "amazon.ca",
+            "amazon.com.mx",
+            "amazon.in",
+            "amazon.com.br",
+            "amazon.co.jp",
+            "amazon.com.au",
+        }
+        assert allowed == expected, (
+            f"allowed_domains drift: missing={expected - allowed}, "
+            f"extra={allowed - expected}"
+        )
 
     def test_no_code_execution_tool_declared(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Decision regression guard.
@@ -1185,6 +1204,7 @@ class TestPauseTurnHandling:
         text_final = _Block(type="text", text="found it")
 
         call_count = {"n": 0}
+        captured_messages: list[list[dict]] = []
         responses = [
             _Resp([server_tool_use_block], "pause_turn"),
             _Resp([text_final], "end_turn"),
@@ -1194,6 +1214,10 @@ class TestPauseTurnHandling:
             call_count["n"] += 1
             idx = call_count["n"] - 1
             assert idx < len(responses), "messages.create invoked too many times"
+            # Snapshot the messages payload at call time so the resume
+            # invariant (server_tool_use is the signal, not a fake
+            # "Continue" user msg) can be inspected after the run.
+            captured_messages.append([dict(m) for m in kwargs["messages"]])
             return responses[idx]
 
         monkeypatch.setattr(webapp_llm._client.messages, "create", _fake_create)
@@ -1205,6 +1229,23 @@ class TestPauseTurnHandling:
         assert call_count["n"] == 2, (
             "Expected exactly 2 calls to messages.create: initial + resume. "
             f"Got {call_count['n']}."
+        )
+
+        # The resume call MUST carry the server_tool_use block as the
+        # trailing assistant turn — that block IS Anthropic's continuation
+        # signal. A regression that strips or rewrites the block would
+        # still pass a pure "call count" assertion, so inspect payload.
+        resume_payload = captured_messages[1]
+        assert resume_payload[-1]["role"] == "assistant", (
+            "Resume must end with the assistant turn, not a new user turn"
+        )
+        trailing_blocks = resume_payload[-1].get("content") or []
+        assert isinstance(trailing_blocks, list) and any(
+            isinstance(b, dict) and b.get("type") == "server_tool_use"
+            for b in trailing_blocks
+        ), (
+            "Resume payload must preserve the server_tool_use block; "
+            "that block is the continuation signal."
         )
 
         # Guard: no fake "Continue" user message was injected between the
@@ -1220,13 +1261,16 @@ class TestPauseTurnHandling:
 
 @pytest.mark.unit
 class TestBlockCountMonitor:
-    """The 20-block lookback limit on prompt-cache breakpoints means long
-    turns (web_search + register + re-query) can silently cache-miss.
-    webapp/llm.py emits a warning once history exceeds 15 blocks so ops
-    can catch drift.
+    """Per-turn block-growth warning. A single turn that chains many tool
+    rounds (web_search → register → re-query) can degrade prompt caching;
+    webapp/llm.py warns when the blocks ADDED during the current turn
+    grow past 15 so ops can correlate with cache_read_input_tokens.
+
+    Deliberately scoped to per-turn — a whole-history counter would fire
+    on every long conversation regardless of cache-miss risk.
     """
 
-    def test_history_block_count_warning_logged(
+    def test_turn_block_growth_warning_logged(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
         _set_fake_env(monkeypatch)
@@ -1250,12 +1294,23 @@ class TestBlockCountMonitor:
                 self.stop_reason = stop_reason
                 self.usage = _Usage()
 
-        tool_use = _Block(type="tool_use", id="toolu_X", name="keepa_budget", input={})
-        text = _Block(type="text", text="done")
-
-        responses = iter([_Resp([tool_use], "tool_use"), _Resp([text], "end_turn")])
+        # Drive the loop through MANY tool_use rounds so each round
+        # appends blocks to history. One tool_use → one tool_result
+        # block per round; after ~8 rounds the per-turn block count
+        # crosses the >15 threshold.
+        rounds = 10
+        responses: list[_Resp] = []
+        for i in range(rounds):
+            responses.append(
+                _Resp(
+                    [_Block(type="tool_use", id=f"toolu_{i}", name="keepa_budget", input={})],
+                    "tool_use",
+                )
+            )
+        responses.append(_Resp([_Block(type="text", text="done")], "end_turn"))
+        it = iter(responses)
         monkeypatch.setattr(
-            webapp_llm._client.messages, "create", lambda **_k: next(responses)
+            webapp_llm._client.messages, "create", lambda **_k: next(it)
         )
 
         async def _fake_dispatch(_name: str, _args: dict) -> dict:
@@ -1263,25 +1318,65 @@ class TestBlockCountMonitor:
 
         monkeypatch.setattr(webapp_llm, "dispatch_tool", _fake_dispatch)
 
-        # Prime history with > 15 content blocks so the warning fires on the
-        # first tool_use round. A single user message with 16 text blocks
-        # gets us over the threshold.
-        primer_content = [
-            {"type": "text", "text": f"block {i}"} for i in range(16)
-        ]
+        # Empty starting history — the warning is scoped to THIS turn only.
+        history: list[dict] = [{"role": "user", "content": "go"}]
+
+        with caplog.at_level("WARNING", logger=webapp_llm.logger.name):
+            asyncio.run(webapp_llm.run_chat_turn(history))
+
+        warnings = [r for r in caplog.records if "turn_blocks=" in r.getMessage()]
+        assert warnings, (
+            "Expected a warning containing 'turn_blocks=' once the per-turn "
+            "block count crosses the 15-block threshold"
+        )
+
+    def test_long_history_alone_does_not_warn(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Regression guard: a long prior conversation (many past turns)
+        must NOT trigger the warning on its own — only new blocks added
+        during the CURRENT turn count. Previous semantics (whole-history
+        sum) spammed every long session.
+        """
+        _set_fake_env(monkeypatch)
+        _reset_webapp_modules()
+        from webapp import llm as webapp_llm
+
+        class _Block:
+            def __init__(self, **kw):
+                self.__dict__.update(kw)
+
+            def model_dump(self) -> dict:
+                return dict(self.__dict__)
+
+        class _Usage:
+            def model_dump(self) -> dict:
+                return {}
+
+        class _Resp:
+            def __init__(self, content: list, stop_reason: str):
+                self.content = content
+                self.stop_reason = stop_reason
+                self.usage = _Usage()
+
+        responses = iter([_Resp([_Block(type="text", text="ok")], "end_turn")])
+        monkeypatch.setattr(
+            webapp_llm._client.messages, "create", lambda **_k: next(responses)
+        )
+
+        # 40-block prior history (well past any fixed threshold) but the
+        # current turn only produces one assistant text block.
+        primer_content = [{"type": "text", "text": f"block {i}"} for i in range(40)]
         history: list[dict] = [{"role": "user", "content": primer_content}]
 
         with caplog.at_level("WARNING", logger=webapp_llm.logger.name):
             asyncio.run(webapp_llm.run_chat_turn(history))
 
-        warnings = [r for r in caplog.records if "total_blocks=" in r.getMessage()]
-        assert warnings, (
-            "Expected a warning containing 'total_blocks=' when history "
-            "exceeds the 15-block threshold"
+        warnings = [r for r in caplog.records if "turn_blocks=" in r.getMessage()]
+        assert warnings == [], (
+            "Long prior history alone must not trigger the warning — the "
+            "per-turn scope is the whole point of the new semantics"
         )
-        assert any(
-            "20-block cache lookback" in r.getMessage() for r in warnings
-        ), "Warning should name the 20-block lookback limit for ops clarity"
 
 
 @pytest.mark.unit

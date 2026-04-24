@@ -348,8 +348,8 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "required": ["brand", "model", "marketplace", "amazon_url"],
         },
         # Cache_control on the LAST tool only — caches all preceding tool
-        # definitions together. Moved here from query_trends when
-        # register_asin_from_url was appended.
+        # definitions together. If a new tool is appended after this one,
+        # move the marker to the new tail.
         "cache_control": {"type": "ephemeral"},
     },
 ]
