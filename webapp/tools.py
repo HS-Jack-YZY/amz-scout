@@ -208,9 +208,9 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "name": "query_deals",
         "description": (
             "Deal/promotion/discount history per marketplace. For '促销'/'折扣'/'deals'. "
-            "Auto-fetches Keepa (LAZY, 0 tokens if cached); ≥6-token batches return "
-            "phase='needs_confirmation' — surface it and ask user to confirm. "
-            "Returns summary + xlsx."
+            "Auto-fetches Keepa (LAZY, 0 tokens if cached). For an explicit refresh "
+            "that respects the token-batch gate, route through the `ensure_keepa_data` "
+            "tool. Returns summary + xlsx."
         ),
         "input_schema": {
             "type": "object",
@@ -564,6 +564,36 @@ async def _step_register_asin_from_url(
     )
 
 
+def _fetch_failed_envelope(error: str) -> ApiResponse:
+    return {
+        "ok": False,
+        "data": {},
+        "error": error,
+        "meta": {"phase": "fetch_failed"},
+    }
+
+
+def _extract_proceed(response: object) -> bool | None:
+    """Decode the ``proceed`` flag from an ``AskActionMessage.send()`` result.
+
+    Chainlit ``>=2.7,<3`` returns ``AskActionResponse`` (a TypedDict, dict
+    at runtime). Accept attribute access too, so a future minor-version
+    shape change (Pydantic / dataclass / ``cl.Action``) does not silently
+    flip a Confirm into a Cancel. Returns ``None`` when the shape is
+    unrecognized so the caller can fail loud.
+    """
+    payload = (
+        response.get("payload")
+        if isinstance(response, dict)
+        else getattr(response, "payload", None)
+    )
+    if isinstance(payload, dict):
+        return bool(payload.get("proceed"))
+    if payload is not None and hasattr(payload, "proceed"):
+        return bool(getattr(payload, "proceed"))
+    return None
+
+
 @cl.step(type="tool", name="ensure_keepa_data")
 async def _step_ensure_keepa_data(
     marketplace: str | None = None,
@@ -576,12 +606,30 @@ async def _step_ensure_keepa_data(
 
     The api layer's contract returns ``phase="needs_confirmation"`` without
     fetching when estimated tokens ≥ ``_BATCH_TOKEN_THRESHOLD`` (6). We
-    consume that envelope: show an ``AskActionMessage``, and re-call with
-    ``confirm=True`` on OK, or return a cancel envelope on abort/timeout.
+    consume that envelope and surface an ``AskActionMessage``. Branches:
 
-    ``confirm`` is deliberately NOT exposed in the tool schema — only the UI
-    path sets it.
+      - confirm clicked → re-call api with ``confirm=True`` and return its result.
+      - cancel clicked → return ``phase="cancelled_by_user"`` envelope.
+      - ``send()`` returns ``None`` (timeout / tab close / ws drop) →
+        return ``phase="dialog_timeout"`` envelope (truthful, distinct
+        from explicit cancel).
+      - dialog returns a shape we do not recognize → ``phase="fetch_failed"``
+        envelope with ``logger.exception``.
+      - any raw exception from the api layer → caught and returned as
+        ``phase="fetch_failed"`` envelope (defense-in-depth; ``api.py``
+        already wraps its own body, but a transport / import error
+        outside that body would otherwise crash the chat turn).
+
+    ``confirm`` is deliberately NOT exposed in the tool schema — only this
+    UI path sets it.
     """
+    fetch_kwargs: dict[str, Any] = {
+        "marketplace": marketplace,
+        "product": product,
+        "strategy": strategy,
+        "max_age_days": max_age_days,
+        "detailed": detailed,
+    }
     logger.info(
         "ensure_keepa_data called: marketplace=%s product=%s strategy=%s "
         "max_age_days=%s detailed=%s",
@@ -591,18 +639,20 @@ async def _step_ensure_keepa_data(
         max_age_days,
         detailed,
     )
-    first = await asyncio.to_thread(
-        _api_ensure_keepa_data,
-        marketplace=marketplace,
-        product=product,
-        strategy=strategy,
-        max_age_days=max_age_days,
-        detailed=detailed,
-        confirm=False,
-    )
+
+    try:
+        first = await asyncio.to_thread(
+            _api_ensure_keepa_data, **fetch_kwargs, confirm=False
+        )
+    except Exception as exc:  # defense-in-depth: api.py already wraps its body
+        logger.exception("ensure_keepa_data: api gate call raised")
+        return _fetch_failed_envelope(str(exc))
 
     meta = first.get("meta") or {}
-    if not (first.get("ok") and meta.get("phase") == "needs_confirmation"):
+    if not first.get("ok"):
+        logger.warning("ensure_keepa_data api error: %s", first.get("error"))
+        return first
+    if meta.get("phase") != "needs_confirmation":
         return first
 
     estimated_tokens = meta.get("estimated_tokens", "?")
@@ -623,9 +673,10 @@ async def _step_ensure_keepa_data(
     content = (
         f"⚠️ **Keepa fetch confirmation**\n\n"
         f"- Products to fetch: **{products_to_fetch}**\n"
-        f"- Estimated token cost: **{estimated_tokens}** / 60 available\n"
+        f"- Estimated token cost: **{estimated_tokens}** / 60 cap "
+        f"(shared bucket, 1/min refill — current balance not shown)\n"
         f"- Strategy: `{strategy}`\n\n"
-        f"This will consume Keepa API tokens (shared budget, 1/min refill)."
+        f"This will consume Keepa API tokens."
     )
     response = await cl.AskActionMessage(
         content=content,
@@ -633,17 +684,46 @@ async def _step_ensure_keepa_data(
         timeout=120,
     ).send()
 
-    proceed = False
-    if response is not None:
-        payload = response.get("payload") if isinstance(response, dict) else None
-        if isinstance(payload, dict):
-            proceed = bool(payload.get("proceed"))
+    if response is None:
+        logger.warning("ensure_keepa_data dialog timed out after 120s")
+        return {
+            "ok": True,
+            "data": {"cancelled": True, "reason": "timeout"},
+            "error": None,
+            "meta": {
+                "phase": "dialog_timeout",
+                "message": (
+                    "No response within 120s; fetch not started — "
+                    "re-run if you still want it."
+                ),
+            },
+        }
+
+    try:
+        proceed = _extract_proceed(response)
+    except Exception:
+        logger.exception(
+            "ensure_keepa_data: error decoding dialog response of type %s",
+            type(response).__name__,
+        )
+        return _fetch_failed_envelope(
+            "Confirmation dialog returned an unexpected shape; fetch aborted.",
+        )
+
+    if proceed is None:
+        logger.error(
+            "ensure_keepa_data: unrecognized AskActionMessage response shape: %s",
+            type(response).__name__,
+        )
+        return _fetch_failed_envelope(
+            "Confirmation dialog returned an unexpected shape; fetch aborted.",
+        )
 
     if not proceed:
         logger.info("ensure_keepa_data cancelled by user")
         return {
             "ok": True,
-            "data": {"cancelled": True},
+            "data": {"cancelled": True, "reason": "user_cancel"},
             "error": None,
             "meta": {
                 "phase": "cancelled_by_user",
@@ -652,15 +732,13 @@ async def _step_ensure_keepa_data(
         }
 
     logger.info("ensure_keepa_data confirmed; proceeding with fetch")
-    return await asyncio.to_thread(
-        _api_ensure_keepa_data,
-        marketplace=marketplace,
-        product=product,
-        strategy=strategy,
-        max_age_days=max_age_days,
-        detailed=detailed,
-        confirm=True,
-    )
+    try:
+        return await asyncio.to_thread(
+            _api_ensure_keepa_data, **fetch_kwargs, confirm=True
+        )
+    except Exception as exc:
+        logger.exception("ensure_keepa_data: post-confirm fetch raised")
+        return _fetch_failed_envelope(str(exc))
 
 
 async def dispatch_tool(name: str, args: dict) -> ApiResponse:
