@@ -176,6 +176,7 @@ class TestToolDispatch:
             "query_trends",
             "web_search",
             "register_asin_from_url",
+            "ensure_keepa_data",
         }
         assert names == expected, f"Missing or extra tools: {names ^ expected}"
 
@@ -213,6 +214,7 @@ class TestToolDispatch:
 
         for attr in (
             "_api_check_freshness",
+            "_api_ensure_keepa_data",
             "_api_keepa_budget",
             "_api_query_availability",
             "_api_query_compare",
@@ -974,6 +976,7 @@ class TestAsyncThreadOffload:
 
         for attr in (
             "_api_check_freshness",
+            "_api_ensure_keepa_data",
             "_api_keepa_budget",
             "_api_query_availability",
             "_api_query_compare",

@@ -61,6 +61,10 @@ Industry research (Berkeley BFCL, Promethium enterprise benchmarks) shows LLM fr
 | Company SSO (Google Workspace OAuth) | Email whitelist is sufficient for MVP. SSO is v1.1+ if use case expands. |
 | Anthropic Zero Data Retention (ZDR) application | **Deferred, not canceled**. Tracked in project memory for post-MVP reminder. |
 | Additional query result caching beyond existing `amz_scout.api` DB cache | Premature optimization — observe real usage first. |
+| 浏览器版 `discover_asin` UI 包装 | **Council B− (2026-04-24)**: 已被 Anthropic `web_search_20260209` 替代（PR #21）；CLI 代码保留作 fallback，不在 Chainlit UI 中暴露入口 |
+| 管理工具 UI 包装（`list_products` / `add_product` / `remove_product_by_model` / `update_product_asin` / `register_market_asins` / `import_yaml`） | **Council B− (2026-04-24)**: 小李等 PM 用户不需要在 chat 里管理注册表；Jack 作为工具作者用 `amz_scout.api` 直接调用成本可接受；deferred-to-v1.1 |
+| `batch_discover` / `sync_registry` 的 UI 包装 | **Council B− (2026-04-24)**: MVP 6 用户规模无人需要在 UI 里触发这类批量操作；Jack 用 API 直接调；deferred-to-v1.1 |
+| Multi-sheet xlsx per product × market（在 Alpha 反馈前） | **Council B− (2026-04-24) — defer-pending-alpha-feedback**: 改用"跟访 > 预访谈"，根据小李第 1-2 次真实研究任务中是否手动拆分单表 / 是否主动要求，决定是否回补（xlsx 管道可在 1-2h 内改造） |
 
 **Note**: "Non-router product categories" is **not** in Out of Scope. Since the LLM is a general analysis engine with no router-specific prompting, the tool is inherently category-agnostic and naturally supports 小李's new-product exploration across any category.
 
@@ -78,11 +82,12 @@ Industry research (Berkeley BFCL, Promethium enterprise benchmarks) shows LLM fr
 
 - [ ] **Q1 — LLM translation accuracy**: Can Sonnet 4.6 with the tool definitions in this PRD stably translate queries like "Slate 7 在德国上周的价格" into `query_trends(product="Slate 7", marketplace="DE", days=7)`? Risk: Medium. Answer by: W1 D3 end-to-end validation.
 - [ ] **Q2 — browser-use on AWS headless Linux**: Any unexpected pitfalls when running browser-use CLI + Chromium inside Lightsail Docker (download slowness, RAM, font issues)? Risk: Medium. Answer by: W2 D5 deployment test.
-- [ ] **Q3 — 小李's Excel export format preference**: Single sheet or multi-sheet? Formulas, pivot tables, conditional formatting needed? Risk: Low-Medium. Answer by: W1 D1 — 30 min interview with 小李.
+- [ ] **Q3 — 小李's Excel export format preference**: ~~Single sheet or multi-sheet? Formulas, pivot tables, conditional formatting needed? Risk: Low-Medium. Answer by: W1 D1 — 30 min interview with 小李.~~ **Revised 2026-04-24 per council B−**: 方法从"预访谈"改为 Alpha 首周 30min 跟访（行为 > 陈述）。Answer by: Phase 7 Alpha 的第 1-2 次真实研究任务之后。Risk: Low-Medium.
 - [ ] **Q4 — Other 4 colleagues' real use cases**: Are they actually aligned with 小李 (scenario 1), or does anyone actually need scenario 2 (daily monitoring)? If the latter, MVP won't meet the substitution metric. Risk: **High** — could invalidate metric 1. Recommended action: 10-minute interview with each of the other 4 **before** W3 Beta launch (total cost ~40 minutes; potential savings ~3 days of rework).
 - [ ] **Q5 — Real Keepa token burn rate**: With 6 real concurrent users, what's the actual monthly token consumption? Risk: Low. Answer by: first 2 weeks post-launch monitoring.
 - [ ] **Q6 — Chainlit thumbs up/down response rate**: If users don't click, the quality metric is unmeasurable. Mitigation: Jack prompts 小李 during W3 Alpha to click feedback explicitly so habit forms. Risk: Low for indicator integrity.
 - [ ] **Q7 — Anthropic ZDR application**: Apply after MVP launch. Tracked in project memory (`project_web_deploy_zdr_todo.md`). Reminder trigger: when amz-scout web app goes to Beta or full internal rollout. Risk: Medium (sensitive competitive data exposure).
+- [ ] **Q8 — 浏览器抓取路线是否应降级**（新增 2026-04-24 per council B−）: `competitive_snapshots` 表中的独有字段，Keepa 是否能覆盖 ≥80%？若是 → 在 Decisions Log 正式标记浏览器路线为 `deprecated-candidate`，停止所有新投资。Risk: Low（审计本身很便宜；错误的答案代价是继续维护一条冗余路线）。Answer by: Phase 3.5 Part A（30min）。
 
 ---
 
@@ -128,8 +133,11 @@ The other 4 colleagues (PMs + market analysts). Their specific use cases are for
 | **Should** | `auto_fetch=True` on `query_trends/query_sellers/query_deals` so queries auto-refresh missing Keepa data | Makes the natural-language experience seamless |
 | **Should** | `cl.Step` progress display for long-running tools | Prevents "did it freeze?" misinterpretation |
 | **Should** | Chainlit built-in thumbs up/down feedback stored in SQLite | Required infrastructure to measure the <10% error rate |
-| **Could** | Wrap product registry tools (`list_products`, `add_product`, `remove_product_by_model`, `update_product_asin`, `register_market_asins`, `import_yaml`) | Jack chose "open all permissions" in MVP; register functions are safe and lightweight |
-| **Could** | Wrap high-risk tools (`ensure_keepa_data`, `batch_discover`, `discover_asin`, `sync_registry`) with explicit confirmation dialogs | Honor Jack's "open all permissions" MVP decision; protect users from accidental cost |
+| ~~Could~~ **Won't (MVP)** | Wrap product registry tools (`list_products`, `add_product`, `remove_product_by_model`, `update_product_asin`, `register_market_asins`, `import_yaml`) | **Council B− (2026-04-24)**: 对小李透明，Jack 用 `amz_scout.api` CLI 管理成本可接受；"open all permissions" 是对 API 完整性的承诺，不是对每个 API 都加 UI 的承诺。Deferred to v1.1 |
+| **Must (subset)** | `ensure_keepa_data` 确认对话框（Phase 3.5） | Council B− (2026-04-24): 唯一的 token 烧光风险点，Alpha 前必须堵上；消费 `amz_scout.api` 已有的 `phase="needs_confirmation"` 协议 |
+| ~~Could~~ **Won't (MVP)** | 浏览器版 `discover_asin` 的 UI 包装 | **Council B− (2026-04-24)**: 已被 Anthropic `web_search_20260209` 替代（PR #21）；CLI 代码保留作 fallback，不加 UI 入口；避免给待废路线加重 user-facing surface area |
+| ~~Could~~ **Won't (MVP)** | `batch_discover` / `sync_registry` 的 UI 包装 | **Council B− (2026-04-24)**: 6 用户规模无人需要在 UI 里触发批量操作；Jack 用 API 直接调成本可接受。Deferred to v1.1 |
+| **Won't (MVP)** | Multi-sheet xlsx per product × market | **Council B− (2026-04-24)**: defer-pending-alpha-feedback；改用"跟访 > 预访谈"，根据 Alpha 首周真实使用行为决定是否回补（xlsx 管道已就绪，1-2h 可改造） |
 | **Won't** | Scheduled monitoring (scenario 2) | Deferred to v1.1 |
 | **Won't** | Multi-tenant / per-user quotas | 6-user scale doesn't need it |
 | **Won't** | Mobile UI optimization | Company laptops only |
@@ -251,11 +259,12 @@ The other 4 colleagues (PMs + market analysts). Their specific use cases are for
 |---|---|---|---|---|---|---|
 | 1 | **Scaffolding** | `webapp/` module, Chainlit hello-world, password auth callback with `@gl-inet.com` whitelist, 1 tool (`query_latest`) wired end-to-end, local dev run verified | complete | - | - | [phase1-webapp-scaffolding.plan.md](../plans/completed/phase1-webapp-scaffolding.plan.md) |
 | 2 | **Query tools** | Wrap 9 read-only query functions as Chainlit tools with bilingual docstrings + `amz_scout.api` marketplace aliasing support | complete | with 3 | 1 | [phase2-query-tools.plan.md](../plans/completed/phase2-query-tools.plan.md) |
-| 3 | **Management tools** | Wrap 6 product registry functions (`list_products`, `add_product`, `remove_product_by_model`, `update_product_asin`, `register_market_asins`, `import_yaml`); honor `phase="needs_confirmation"` protocol in UI | pending | with 2 | 1 | - |
-| 4 | **High-risk tools + long task UX** | Wrap `ensure_keepa_data`, `batch_discover`, `discover_asin`, `sync_registry` with `cl.Step` progress + explicit confirmation dialogs for token-consuming / long-running operations. **Sub-scope (2026-04-24)**: non-browser ASIN discovery via Anthropic `web_search_20260209` + `register_asin_from_url` delivered as a separate path — see [webapp-anthropic-web-search-asin.plan.md](../plans/completed/webapp-anthropic-web-search-asin.plan.md). The browser-based `discover_asin` wrap is still pending. | pending | - | 2, 3 | - |
-| 5 | **Excel export layer** | 底层 xlsx 导出管道已随 slim-refactor Phase 3「查询直通模式」交付（`webapp/summaries.py::_rows_to_xlsx_bytes` + `cl.File` 附件通道；所有 row-emitting 工具自动附带单表 xlsx）。**剩余 scope**：(a) multi-sheet per query（product × market 分表）尚未实现 — 当前每个查询落成单表；(b) Q3 小李 Excel 格式访谈尚未进行，格式未针对性调优。 | partial | with 4 | 2 | inherited from [query-passthrough-mode.plan.md](../plans/completed/query-passthrough-mode.plan.md) |
+| 3 | **Management tools** | ~~Wrap 6 product registry functions~~ **Deferred to v1.1 per council B− (2026-04-24)** — 对小李透明；Jack 用 `amz_scout.api` / CLI 管理注册表成本可接受；MVP 不需要 UI 包装。 | deferred-to-v1.1 | - | - | - |
+| 3.5 | **Browser route audit + token safety gate** | **(新增 per council B−, 2026-04-24, ~2.5h)** (a) 30 分钟审计 `competitive_snapshots` 表每个字段的 Keepa 可覆盖率，产出 `docs/browser-route-audit.md`（含字段清单 + 覆盖率 + 降级建议）；(b) 为 `ensure_keepa_data` 添加 Chainlit 确认对话框，消费 `amz_scout.api` 已有的 `phase="needs_confirmation"` 协议。回答 Q8，堵 Alpha 前唯一的 token 烧光风险点。 | in-progress | - | 2 | [phase3.5-browser-audit-and-token-safety-gate.plan.md](../plans/completed/phase3.5-browser-audit-and-token-safety-gate.plan.md) |
+| 4 | ~~**High-risk tools + long task UX**~~ **Split / mostly cancelled per council B− (2026-04-24)** | 拆分：(a) `ensure_keepa_data` 确认对话 → **移入 Phase 3.5**；(b) 浏览器版 `discover_asin` 包装 → **cancelled**（已被 Anthropic `web_search_20260209` 替代，PR #21；CLI 代码保留作 fallback，不加 UI 入口）；(c) `batch_discover` / `sync_registry` UI 包装 → **deferred-to-v1.1**（Jack 用 API 直接调，6 用户规模无人需 UI）。Sub-scope Anthropic web_search ASIN 发现已交付。 | split | - | - | [webapp-anthropic-web-search-asin.plan.md](../plans/completed/webapp-anthropic-web-search-asin.plan.md) |
+| 5 | **Excel export layer** | 单表 xlsx pipeline 已随 slim-refactor Phase 3 交付（`webapp/summaries.py::_rows_to_xlsx_bytes` + `cl.File` 附件通道；所有 row-emitting 工具自动附带单表 xlsx）。**Multi-sheet per product × market + Q3 小李 Excel 格式访谈 → deferred-pending-alpha-feedback（council B−, 2026-04-24）**：改为 Phase 7 Alpha 首周 30min 跟访小李，用真实使用行为决定是否补 multi-sheet（xlsx 管道可在 1-2h 内改造）。 | partial | - | 2 | inherited from [query-passthrough-mode.plan.md](../plans/completed/query-passthrough-mode.plan.md) |
 | 6 | **Deployment** | Dockerfile (`python:3.12-slim-bookworm` + `pip install uv browser-use` + `browser-use install`), `docker-compose.yml`, AWS Lightsail provisioning, block storage mount, HTTP-only for rehearsal (HTTPS deferred until domain available), smoke test | complete | - | 1 | [phase6-deployment.plan.md](../plans/completed/phase6-deployment.plan.md) |
-| 7 | **Alpha (Jack + 小李)** | Internal test with 小李 as first real user; iterate on tool docstrings + prompts based on observed failures; measure one real research task end-to-end; confirm Excel export format | pending | - | 4, 5, 6 | - |
+| 7 | **Alpha (Jack + 小李)** | Internal test with 小李 as first real user; **Jack 30min 跟访观察 xlsx 使用行为 + 询问 Excel 格式偏好（回答 Q3，替代原预访谈）**; iterate on tool docstrings + prompts based on observed failures; measure one real research task end-to-end; 跟访结论决定是否回补 Phase 5 multi-sheet | pending | - | 3.5, 6 | - |
 | 8 | **Beta (full 5 colleagues)** | Roll out to remaining 4 colleagues with **Q4 interview done first**; establish feedback channel (Slack/Feishu); daily monitoring of error rate + token burn | pending | - | 7 | - |
 
 ### Phase Details
@@ -272,18 +281,26 @@ The other 4 colleagues (PMs + market analysts). Their specific use cases are for
 - **Success signal**: LLM can answer "compare Slate 7 and BE5400 in UK/DE/US past 6 months" by chaining multiple tool calls
 - **Runs in parallel with Phase 3**
 
-**Phase 3: Management tools** (~W2 D1-D2, 3h)
-- **Goal**: Honor "open all permissions" decision; product registry is manageable from UI
-- **Scope**: Wrap `list_products`, `add_product`, `remove_product_by_model`, `update_product_asin`, `register_market_asins`, `import_yaml`; build `phase="needs_confirmation"` consumer in the UI layer
-- **Success signal**: A user can add a new product registry entry via natural-language request
-- **Runs in parallel with Phase 2**
+**Phase 3: Management tools** — **Deferred to v1.1 per council B− (2026-04-24)**
+- 详见 Implementation Phases 表。理由：对小李透明；Jack 用 `amz_scout.api` / CLI 管理注册表成本可接受；属于"对 API 完整性而非用户价值的包装"。
 
-**Phase 4: High-risk tools + long-task UX** (~W2 D3, 3h)
-- **Goal**: All 25 `amz_scout.api` functions exposed; long-running ops don't confuse users
-- **Scope**: `ensure_keepa_data`, `batch_discover`, `discover_asin`, `sync_registry` with `cl.Step` + confirmation dialogs
-- **Success signal**: Triggering `ensure_keepa_data(fresh)` for 10 products shows step-by-step progress; `batch_discover` for 3 candidates shows per-candidate status
-- **Hard constraint**: `headed=True` is hard-wired OFF in the web layer — not exposed as a user toggle
-- **Sub-scope delivered (2026-04-24)**: Anthropic server-side `web_search_20260209` + client tool `register_asin_from_url` provide a non-browser ASIN-discovery path for webapp users without a Claude Code client. Lives alongside (not replacing) the still-pending browser-based `discover_asin` wrap. See [webapp-anthropic-web-search-asin.plan.md](../plans/completed/webapp-anthropic-web-search-asin.plan.md).
+**Phase 3.5: Browser route audit + token safety gate** (~2.5h, 新增 per council B−, 2026-04-24)
+- **Goal**: (1) 回答"浏览器抓取路线是否应继续投资"这个遗留问题；(2) 在 Alpha 前堵上唯一的 token 烧光风险点。
+- **Scope**:
+  - **Part A (30min)** — 审计 `competitive_snapshots` 表中的每个字段，对每个字段回答"Keepa 是否有等价数据？"。产出 `docs/browser-route-audit.md`，含：字段清单、Keepa 覆盖率百分比、降级建议（若 ≥80% 可覆盖则建议在 Decisions Log 补一条决策标记浏览器路线 `deprecated-candidate`）
+  - **Part B (~2h)** — 为 `ensure_keepa_data` 添加 Chainlit 确认对话框；消费 `amz_scout.api` 已有的 `phase="needs_confirmation"` 协议；提示用户即将花费的 token 数 + 预计耗时 + 确认/取消按钮
+- **Success signal**:
+  - Part A：审计文档合入 `main`；若结论为"路线可降级"，Decisions Log 追加一条 follow-up 决策
+  - Part B：手动触发"需要刷新 10 个产品"的自然语言请求，UI 显示确认对话框，取消后不消耗 token
+- **Depends on**: Phase 2
+- **Answers Open Question**: Q8（new）
+
+**Phase 4: High-risk tools + long-task UX** — **Split / mostly cancelled per council B− (2026-04-24)**
+- **4a** `ensure_keepa_data` 确认对话 → 移入 Phase 3.5
+- **4b** 浏览器版 `discover_asin` 包装 → **cancelled**（已被 Anthropic `web_search_20260209` 替代，PR #21；CLI 浏览器代码保留作 fallback，不加 UI 入口）
+- **4c** `batch_discover` / `sync_registry` UI 包装 → deferred-to-v1.1（Jack 用 API 直接调成本可接受）
+- **Hard constraint 保留**: `headed=True` 绝不暴露给用户
+- **Sub-scope delivered (2026-04-24)**: Anthropic server-side `web_search_20260209` + client tool `register_asin_from_url` provide a non-browser ASIN-discovery path for webapp users without a Claude Code client. See [webapp-anthropic-web-search-asin.plan.md](../plans/completed/webapp-anthropic-web-search-asin.plan.md).
 
 **Phase 5: Excel export** (~W2 D4, 3h) — **PARTIAL (底层管道已交付，2026-04-20)**
 - **Goal**: 小李's workflow terminator — queries return downloadable artifacts
@@ -293,11 +310,11 @@ The other 4 colleagues (PMs + market analysts). Their specific use cases are for
   - 所有 row-emitting 工具（`query_latest` / `query_trends` / `query_compare` / `query_ranking` / `query_availability` / `query_sellers` / `query_deals`）每次查询自动产出单表 xlsx 附件
   - 每个工具有独立 `sheet_name`（如 `latest_snapshot` / `compare` / `deals`）
   - `MAX_XLSX_ROWS = 50_000` 保护，超限时 summary 标 `xlsx_truncated=True`
-- **Remaining scope**:
-  - Multi-sheet per query（原 Golden Path 描述的「one sheet per product × market」）尚未实现 — 跨市场对比当前也是单表
-  - Q3 小李 Excel 格式访谈尚未进行 — 多表 / 单表 / pivot / 条件格式等偏好未确认
+- **Remaining scope (deferred-pending-alpha-feedback per council B−, 2026-04-24)**:
+  - Multi-sheet per query（原 Golden Path 描述的「one sheet per product × market」）→ **延后**；真实使用 1-2 次后再决定。若 Alpha 跟访中小李明确要求或观察到他手动拆分单表 → 立即补做（xlsx 管道已在 `_rows_to_xlsx_bytes`，估时 1-2h）
+  - Q3 小李 Excel 格式访谈 → **改为 Alpha 首周 30min 跟访**，用真实使用行为替代预访谈推断
 - **Success signal (original)**: Every query tool reply includes a `cl.File` attachment rendering as a download button ✅ 已达成
-- **Runs in parallel with Phase 4**; depends on Phase 2 (query tools must exist first)
+- **Depends on Phase 2** (query tools must exist first)
 
 **Phase 6: Deployment** (~W2 D5 – W3 D1, 6h)
 - **Goal**: Production URL accessible via HTTPS with whitelisted login
@@ -306,9 +323,10 @@ The other 4 colleagues (PMs + market analysts). Their specific use cases are for
 - **Answers Open Question Q2**
 
 **Phase 7: Alpha (Jack + 小李)** (~W3 D2-D3, 6h)
-- **Goal**: First real user validates the MVP hypothesis on a real task
-- **Scope**: 小李 completes 1 real pricing research task; Jack observes, logs gaps, iterates on tool docstrings/prompts/LLM errors
-- **Success signal**: 小李 reports "this worked, I'd use it again"; at least 1 real research task completed end-to-end; thumbs up/down actively used
+- **Goal**: First real user validates the MVP hypothesis on a real task; **answers Q3 via 跟访 instead of pre-interview (council B−, 2026-04-24)**
+- **Scope**: 小李 completes ≥1 real pricing research task; **Jack 跟访 30min 观察 xlsx 使用行为 + 询问 Excel 格式偏好（原 Q3）**; Jack logs gaps, iterates on tool docstrings/prompts/LLM errors
+- **Success signal**: 小李 reports "this worked, I'd use it again"; at least 1 real research task completed end-to-end; **跟访结论明确是否需要回补 Phase 5 multi-sheet**; thumbs up/down actively used
+- **Answers Open Question**: Q3（方法改为跟访）
 
 **Phase 8: Beta (full rollout)** (~W3 D4-D5, 6h)
 - **Goal**: MVP validation gate — 3 real tasks, ≥2 by 小李 independently, metric collection begins
@@ -318,11 +336,14 @@ The other 4 colleagues (PMs + market analysts). Their specific use cases are for
 
 ### Parallelism Notes
 
-- **Phases 2 and 3** run in parallel (both depend only on Phase 1 scaffolding and touch non-overlapping tool subsets).
-- **Phases 4 and 5** run in parallel (Phase 4 adds long-running tools; Phase 5 adds export format; no file conflict).
-- **Phase 6 (deployment)** can start early (after Phase 1) and be iteratively updated as new tools land.
-- **Critical path**: `1 → (2 ∥ 3) → (4 ∥ 5) → 7 → 8`, with 6 running beside.
-- **Total estimate**: ~45 hours / 3 weeks at 3 hours/day.
+**Post-council B− revision (2026-04-24)**:
+
+- ~~Phases 2 and 3 run in parallel~~ → Phase 3 deferred-to-v1.1
+- ~~Phases 4 and 5 run in parallel~~ → Phase 4 split/cancelled; Phase 5 剩余 deferred-pending-alpha-feedback
+- **Phase 3.5** (new) depends only on Phase 2 and is the single remaining pre-Alpha work unit
+- **Phase 6 (deployment)** already complete; runs beside
+- **New critical path**: `1 → 2 → 3.5 → 7 → 8`，with 6 complete beside
+- **Revised total estimate**: **~17.5h remaining**（Phase 3.5 ~2.5h + Phase 7 Alpha ~6h + Phase 8 Beta ~6h + Q4 interviews ~40min + buffer），相比原 PRD ~45h 剩余估算砍掉约 60%
 
 ---
 
@@ -342,6 +363,7 @@ The other 4 colleagues (PMs + market analysts). Their specific use cases are for
 | Anthropic ZDR deferred | Apply post-MVP | Apply before MVP | Don't block MVP on 1-week ZDR approval; reminder stored in project memory |
 | Not in Out-of-Scope: non-router categories | Tool is category-agnostic | Exclude non-router categories | LLM is general, no router-specific prompting, so categorical exclusion is artificial |
 | Baseline metric gap accepted | Mark "Jack's monthly requests" baseline as TBD | Block PRD on getting exact number | 2-week pre-launch observation is sufficient; don't let perfect data block the PRD |
+| **议会 B− 裁决 (council, 2026-04-24)** | 砍 Phase 3 / 浏览器版 `discover_asin` / multi-sheet；只留 `ensure_keepa_data` 确认对话；Q3 改跟访；新增 Phase 3.5 浏览器路线审计 | 方案 A（按原 PRD 全做完 ~9h）/ 方案 C（全砍直接 Alpha 0h） | 剩余 9h 工作全是假设驱动；真实使用 1-2 次的信息价值 > 3h 做 multi-sheet 的工程价值；浏览器路线 ROI 存疑（Anthropic `web_search` 已胜出），不应加重 UI 投资；但 token 安全门必留（防 60 tokens 一次烧光）。B− 估时 ~2.5h，相比方案 A 省 72%；相比方案 C 保留最小必要安全网。 |
 
 ---
 
@@ -368,5 +390,7 @@ The other 4 colleagues (PMs + market analysts). Their specific use cases are for
 ---
 
 *Generated: 2026-04-13*
-*Status: IN PROGRESS — 3/8 phases complete + 1 partial (Phase 1 scaffolding #3, Phase 2 query tools #4, Phase 6 deployment #6 all merged 2026-04-13; Phase 5 Excel export — xlsx 底层管道已随 slim-refactor Phase 3 间接交付 2026-04-20，multi-sheet + Q3 访谈仍待做). Phase 3/4/7/8 still pending; awaiting pre-launch baseline + Q3/Q4 interviews before W3 Beta rollout.*
-*Drift reconciled: 2026-04-21 — Phase 1 status corrected from `in-progress` to `complete` (PR #3 merged 2026-04-13; plan moved to `plans/completed/`); Phase 5 status corrected from `pending` to `partial` (xlsx pipeline delivered via slim-refactor Phase 3 query-passthrough-mode, 2026-04-20).*
+*Status: IN PROGRESS — Phase 1/2/6 complete, Phase 5 partial, Phase 3.5/7/8 pending. Phase 3 & Phase 4 (mostly) cancelled/deferred per council B− (2026-04-24).*
+*Scope revisions:*
+  *- 2026-04-21 — Drift reconciled: Phase 1 → complete, Phase 5 → partial.*
+  *- 2026-04-24 — Council B− amendment: Phase 3 deferred-to-v1.1; Phase 4 split (4a `ensure_keepa_data` confirm → 并入 3.5; 4b 浏览器版 `discover_asin` cancelled; 4c `batch_discover` / `sync_registry` deferred); Phase 5 multi-sheet + Q3 interview deferred-pending-alpha-feedback; new Phase 3.5 inserted (browser route audit + token safety gate, ~2.5h). Revised critical path: `1 → 2 → 3.5 → 7 → 8`, revised remaining estimate ~17.5h (was ~45h).*
