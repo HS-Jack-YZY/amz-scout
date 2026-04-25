@@ -30,7 +30,8 @@ Covers ``_step_ensure_keepa_data`` and its routing through ``dispatch_tool``:
 Conventions (mirror ``tests/test_webapp_smoke.py``):
   - Wrap async code in ``asyncio.run(...)`` rather than
     ``@pytest.mark.asyncio``. The repo does not install ``pytest-asyncio``,
-    so the marker would silently skip.
+    so that marker requires ``pytest-asyncio`` (or a similar async pytest
+    plugin) to run async tests.
   - Patch ``cl.step`` to a no-op decorator BEFORE (re)importing
     ``webapp.tools`` — the real decorator requires an active Chainlit
     session context (``context.session.thread_id`` lookup), which does

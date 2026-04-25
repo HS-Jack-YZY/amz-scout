@@ -40,19 +40,21 @@ Zero `amz_scout.api` changes — entire Phase 3.5 Part B is webapp-layer consump
 
 ## Files Changed
 
-| File | Action | Lines | Purpose |
-|---|---|---|---|
-| `docs/browser-route-audit.md` | CREATED | +186 | Part A deliverable — Q8 answered |
-| `webapp/tools.py` | UPDATED | +151 / -0 | Schema + `_step_ensure_keepa_data` + dispatch branch + one import alias |
-| `tests/test_ensure_keepa_data_confirm.py` | CREATED | +166 | 4 tests for confirm-flow branches |
-| `tests/test_webapp_smoke.py` | UPDATED | +3 / -0 | Added `ensure_keepa_data` to 1 expected set + 2 `_api_*` patch lists |
-| `.claude/PRPs/prds/internal-amz-scout-web.prd.md` | UPDATED | +1 / -1 | Phase 3.5 row `pending` → `in-progress` + link to plan |
+| File | Action | Purpose |
+|---|---|---|
+| `docs/browser-route-audit.md` | CREATED | Part A deliverable — Q8 answered |
+| `webapp/tools.py` | UPDATED | Schema + `_step_ensure_keepa_data` + dispatch branch + one import alias |
+| `tests/test_ensure_keepa_data_confirm.py` | CREATED | 4 tests for confirm-flow branches |
+| `tests/test_webapp_smoke.py` | UPDATED | Added `ensure_keepa_data` to 1 expected set + 2 `_api_*` patch lists |
+| `.claude/PRPs/prds/internal-amz-scout-web.prd.md` | UPDATED | Phase 3.5 row `pending` → `in-progress` + link to plan |
+
+> Per-file line counts intentionally omitted; use `git diff --stat` for the authoritative numbers (which drift as the branch is updated).
 
 ## Deviations from Plan
 
 1. **`cl.Action(value=...)` removed** — Plan (following outdated Chainlit 2.x docs) called for `name`/`value`/`label`/`payload`. Actual installed `chainlit/action.py` source shows the dataclass signature is `(name, payload, label="", tooltip="", icon=None, forId=None, id=...)`. Pyright flagged the extra `value` kwarg. Removed; decision bus remains `response["payload"]["proceed"]` per plan ASK_ACTION_MESSAGE_PATTERN rule #3, so the fix is semantically identical.
 
-2. **Test convention `asyncio.run()` vs `@pytest.mark.asyncio`** — Plan's TEST_STRUCTURE section prescribed `@pytest.mark.asyncio`, but the codebase (`tests/test_webapp_smoke.py`) uses `asyncio.run()` directly. `pytest-asyncio` is not installed, so the marker would silently skip the tests. Followed the codebase convention instead (which is the stronger rule per STEP_WRAPPER_PATTERN "Mirror patterns exactly").
+2. **Test convention `asyncio.run()` vs `@pytest.mark.asyncio`** — Plan's TEST_STRUCTURE section prescribed `@pytest.mark.asyncio`, but the codebase (`tests/test_webapp_smoke.py`) uses `asyncio.run()` directly. `pytest-asyncio` is not installed, so that marker would require an async pytest plugin to actually run the tests. Followed the codebase convention instead (which is the stronger rule per STEP_WRAPPER_PATTERN "Mirror patterns exactly").
 
 3. **Extra edits in `tests/test_webapp_smoke.py`** — Plan's Risks table predicted "schema count assertion in existing tests may break" as Medium likelihood. It did: `test_all_expected_tools_present` had a hardcoded `expected` set, and `test_dispatcher_routes_all_known_tools` + `test_every_step_wrapper_uses_asyncio_to_thread` each had an `_api_*` patch tuple. 3 single-line additions to unblock regression.
 
