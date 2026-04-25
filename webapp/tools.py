@@ -671,12 +671,12 @@ async def _step_ensure_keepa_data(
         ),
     ]
     content = (
-        f"⚠️ **Keepa fetch confirmation**\n\n"
+        "⚠️ **Keepa fetch confirmation**\n\n"
         f"- Products to fetch: **{products_to_fetch}**\n"
         f"- Estimated token cost: **{estimated_tokens}** / 60 cap "
-        f"(shared bucket, 1/min refill — current balance not shown)\n"
+        "(shared bucket, 1/min refill — current balance not shown)\n"
         f"- Strategy: `{strategy}`\n\n"
-        f"This will consume Keepa API tokens."
+        "This will consume Keepa API tokens."
     )
     response = await cl.AskActionMessage(
         content=content,

@@ -43,6 +43,7 @@ from __future__ import annotations
 import asyncio
 import sys
 from types import ModuleType
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -94,7 +95,7 @@ def _gate_envelope(*, estimated_tokens: int = 8, products_to_fetch: int = 8) -> 
     }
 
 
-def _ok_envelope(meta: dict | None = None) -> dict:
+def _ok_envelope(meta: dict[str, Any] | None = None) -> dict[str, Any]:
     return {
         "ok": True,
         "data": {"outcomes": ["..."]},
@@ -113,7 +114,7 @@ def _ask_mock(send_return: object) -> MagicMock:
 # All non-default kwargs used to verify full param threading. Distinct from
 # the function signature defaults so a regression that swaps in a default
 # would visibly break.
-_FULL_KWARGS: dict = {
+_FULL_KWARGS: dict[str, Any] = {
     "marketplace": "DE",
     "product": "Slate 7 Pro",
     "strategy": "fresh",
