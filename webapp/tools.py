@@ -36,6 +36,7 @@ from amz_scout._llm_trim import (
 )
 from amz_scout.api import ApiResponse
 from amz_scout.api import check_freshness as _api_check_freshness
+from amz_scout.api import ensure_keepa_data as _api_ensure_keepa_data
 from amz_scout.api import keepa_budget as _api_keepa_budget
 from amz_scout.api import query_availability as _api_query_availability
 from amz_scout.api import query_compare as _api_query_compare
@@ -312,6 +313,49 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "ensure_keepa_data",
+        "description": (
+            "Refresh/top-up Keepa cache for products × marketplaces. For "
+            "'刷新'/'更新数据'/'refresh Keepa'. Consumes Keepa tokens (shared, 60 "
+            "max, 1/min refill). Strategies: 'lazy' (fetch only if missing, "
+            "default), 'fresh' (force refresh), 'max_age' (refresh if older "
+            "than max_age_days), 'offline' (no fetch). Batches ≥6 tokens "
+            "surface a confirmation dialog to the user — the UI handles it; "
+            "the LLM does NOT need to prompt 'proceed?'."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "marketplace": {
+                    "type": "string",
+                    "description": f"{_MARKETPLACE_DESC} Omit for all.",
+                },
+                "product": {
+                    "type": "string",
+                    "description": "Optional product filter. Omit for all.",
+                },
+                "strategy": {
+                    "type": "string",
+                    "description": "Fetch strategy. Default 'lazy'.",
+                    "enum": ["lazy", "offline", "max_age", "fresh"],
+                },
+                "max_age_days": {
+                    "type": "integer",
+                    "description": "For max_age strategy. Default 7.",
+                    "minimum": 1,
+                },
+                "detailed": {
+                    "type": "boolean",
+                    "description": (
+                        "Fetch deep history (6 tokens/ASIN) vs basic "
+                        "(1 token/ASIN). Default false."
+                    ),
+                },
+            },
+            "required": [],
+        },
+    },
+    {
         "name": "register_asin_from_url",
         "description": (
             "Register a product's ASIN into the registry by parsing an Amazon "
@@ -520,6 +564,105 @@ async def _step_register_asin_from_url(
     )
 
 
+@cl.step(type="tool", name="ensure_keepa_data")
+async def _step_ensure_keepa_data(
+    marketplace: str | None = None,
+    product: str | None = None,
+    strategy: str = "lazy",
+    max_age_days: int = 7,
+    detailed: bool = False,
+) -> ApiResponse:
+    """Run ensure_keepa_data; if batch gate fires, surface a Chainlit confirm dialog.
+
+    The api layer's contract returns ``phase="needs_confirmation"`` without
+    fetching when estimated tokens ≥ ``_BATCH_TOKEN_THRESHOLD`` (6). We
+    consume that envelope: show an ``AskActionMessage``, and re-call with
+    ``confirm=True`` on OK, or return a cancel envelope on abort/timeout.
+
+    ``confirm`` is deliberately NOT exposed in the tool schema — only the UI
+    path sets it.
+    """
+    logger.info(
+        "ensure_keepa_data called: marketplace=%s product=%s strategy=%s "
+        "max_age_days=%s detailed=%s",
+        marketplace,
+        product,
+        strategy,
+        max_age_days,
+        detailed,
+    )
+    first = await asyncio.to_thread(
+        _api_ensure_keepa_data,
+        marketplace=marketplace,
+        product=product,
+        strategy=strategy,
+        max_age_days=max_age_days,
+        detailed=detailed,
+        confirm=False,
+    )
+
+    meta = first.get("meta") or {}
+    if not (first.get("ok") and meta.get("phase") == "needs_confirmation"):
+        return first
+
+    estimated_tokens = meta.get("estimated_tokens", "?")
+    products_to_fetch = meta.get("products_to_fetch", "?")
+
+    actions = [
+        cl.Action(
+            name="confirm",
+            label="✓ Confirm & fetch",
+            payload={"proceed": True},
+        ),
+        cl.Action(
+            name="cancel",
+            label="✗ Cancel",
+            payload={"proceed": False},
+        ),
+    ]
+    content = (
+        f"⚠️ **Keepa fetch confirmation**\n\n"
+        f"- Products to fetch: **{products_to_fetch}**\n"
+        f"- Estimated token cost: **{estimated_tokens}** / 60 available\n"
+        f"- Strategy: `{strategy}`\n\n"
+        f"This will consume Keepa API tokens (shared budget, 1/min refill)."
+    )
+    response = await cl.AskActionMessage(
+        content=content,
+        actions=actions,
+        timeout=120,
+    ).send()
+
+    proceed = False
+    if response is not None:
+        payload = response.get("payload") if isinstance(response, dict) else None
+        if isinstance(payload, dict):
+            proceed = bool(payload.get("proceed"))
+
+    if not proceed:
+        logger.info("ensure_keepa_data cancelled by user")
+        return {
+            "ok": True,
+            "data": {"cancelled": True},
+            "error": None,
+            "meta": {
+                "phase": "cancelled_by_user",
+                "message": "User cancelled the Keepa batch fetch.",
+            },
+        }
+
+    logger.info("ensure_keepa_data confirmed; proceeding with fetch")
+    return await asyncio.to_thread(
+        _api_ensure_keepa_data,
+        marketplace=marketplace,
+        product=product,
+        strategy=strategy,
+        max_age_days=max_age_days,
+        detailed=detailed,
+        confirm=True,
+    )
+
+
 async def dispatch_tool(name: str, args: dict) -> ApiResponse:
     """Route a tool call from the LLM to the right Python function.
 
@@ -590,6 +733,14 @@ async def dispatch_tool(name: str, args: dict) -> ApiResponse:
             model=args["model"],
             marketplace=args["marketplace"],
             amazon_url=args["amazon_url"],
+        )
+    if name == "ensure_keepa_data":
+        return await _step_ensure_keepa_data(
+            marketplace=args.get("marketplace"),
+            product=args.get("product"),
+            strategy=args.get("strategy", "lazy"),
+            max_age_days=args.get("max_age_days", 7),
+            detailed=args.get("detailed", False),
         )
 
     # Unknown tool — return an envelope-shaped error so the LLM can recover
